@@ -175,3 +175,7 @@ cython_debug/
 
 # Conda
 .conda/
+
+# Data Indices
+bm25_index.pkl
+sbert_index.pt
