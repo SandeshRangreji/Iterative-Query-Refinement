@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import pickle
 import random
@@ -271,88 +272,207 @@ def search_documents(
         raise ValueError(f"Unknown method: {method}. Use 'bm25', 'sbert', or 'hybrid'.")
 
 
+def build_qrels_dict(qrels_dataset):
+    """
+    Convert qrels_dataset into a dictionary of form:
+      relevant_docs_by_query[query_id] = set of relevant doc_ids
+    Only includes docs with score > 0 (relevant).
+    """
+    relevant_docs_by_query = defaultdict(set)
+    for qid, cid, score in zip(qrels_dataset["query-id"],
+                               qrels_dataset["corpus-id"],
+                               qrels_dataset["score"]):
+        # TREC-COVID: a score > 0 indicates relevance
+        if score > 0:
+            relevant_docs_by_query[qid].add(cid)
+    return relevant_docs_by_query
+
+
+def evaluate_retrieval_on_queries(
+    queries_dataset,
+    qrels_dataset,
+    bm25,
+    corpus_texts,
+    corpus_ids,
+    sbert_model,
+    doc_embeddings,
+    method="bm25",
+    top_k=10,
+    use_mmr=False,
+    mmr_lambda=0.5
+):
+    """
+    Runs retrieval on all queries, computes average Precision and Recall.
+    Only queries that appear in qrels are evaluated.
+
+    :param queries_dataset: HF dataset with fields "_id" and "text" for queries
+    :param qrels_dataset: HF dataset with "query-id", "corpus-id", "score"
+    :param bm25: The BM25Okapi object
+    :param corpus_texts: list of doc texts (same order as corpus_ids)
+    :param corpus_ids: list of doc IDs (same order as corpus_texts)
+    :param sbert_model: SentenceTransformer model
+    :param doc_embeddings: SBERT doc embeddings
+    :param method: "bm25", "sbert", or "hybrid"
+    :param top_k: number of docs to retrieve per query
+    :param use_mmr: whether to apply MMR
+    :param mmr_lambda: MMR lambda param
+    :return: (avg_precision, avg_recall, num_evaluated_queries)
+    """
+    # 1) Build dictionary of relevant docs
+    relevant_docs_by_query = build_qrels_dict(qrels_dataset)
+
+    all_precisions = []
+    all_recalls = []
+    num_evaluated = 0
+
+    # 2) Iterate over each query in queries_dataset
+    for query_item in queries_dataset:
+        query_id = int(query_item["_id"])  # TREC-COVID query ID
+        query_text = query_item["text"]
+
+        # Only evaluate if this query ID is in the Qrels
+        if query_id not in relevant_docs_by_query:
+            continue
+
+        # Retrieve top documents
+        results = search_documents(
+            query=query_text,
+            bm25=bm25,
+            corpus_texts=corpus_texts,
+            corpus_ids=corpus_ids,
+            sbert_model=sbert_model,
+            doc_embeddings=doc_embeddings,
+            top_k=top_k,
+            method=method,
+            use_mmr=use_mmr,
+            mmr_lambda=mmr_lambda
+        )
+        # 'results' is a list of (doc_id, score)
+        retrieved_docs = [doc_id for doc_id, _score in results]
+
+        # 3) Compute precision & recall
+        relevant_set = relevant_docs_by_query[query_id]
+        retrieved_set = set(retrieved_docs)
+
+        num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
+        precision = num_relevant_retrieved / len(retrieved_docs) if len(retrieved_docs) > 0 else 0.0
+        recall = num_relevant_retrieved / len(relevant_set) if len(relevant_set) > 0 else 0.0
+
+        all_precisions.append(precision)
+        all_recalls.append(recall)
+        num_evaluated += 1
+
+    if num_evaluated == 0:
+        return 0.0, 0.0, 0
+
+    avg_precision = sum(all_precisions) / num_evaluated
+    avg_recall = sum(all_recalls) / num_evaluated
+    return avg_precision, avg_recall, num_evaluated
+
 # ===============================
 # 5) DEMO in main
 # ===============================
 if __name__ == "__main__":
+    # (Same dataset loading & index building as before)
     print("Loading datasets...")
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
     queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     print("Datasets loaded.")
 
-    # Step A: Build/Load BM25 index
-    bm25_cache_path = "bm25_index.pkl"
     print("Building BM25 index...")
     bm25, corpus_texts, corpus_ids = build_bm25_index(
         corpus_dataset,
-        cache_path=bm25_cache_path,
-        force_reindex=False  # set True if you want to rebuild
+        cache_path="bm25_index.pkl",
+        force_reindex=False
     )
     print("BM25 index built.")
 
-    # Step B: Build/Load SBERT index
-    sbert_cache_path = "sbert_index.pt"
     print("Building SBERT index...")
     sbert_model, doc_embeddings = build_sbert_index(
         corpus_texts,
-        model_name="distilbert-base-nli-stsb-mean-tokens",
+        model_name="all-MiniLM-L6-v2",
         batch_size=64,
-        cache_path=sbert_cache_path,
-        force_reindex=False  # set True if you want to rebuild
+        cache_path="sbert_index.pt",
+        force_reindex=False
     )
     print("SBERT index built.")
 
-    example_query = "how does covid-19 spread"
-
-    # Step C: BM25 search
-    print("Running retrieval with BM25...")
-    results_bm25 = search_documents(
-        query=example_query,
+    # Evaluate BM25
+    bm25_precision, bm25_recall, bm25_count = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
         bm25=bm25,
         corpus_texts=corpus_texts,
         corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        top_k=10,
+        sbert_model=None,       # Not needed for pure BM25
+        doc_embeddings=None,    # Not needed for pure BM25
         method="bm25",
-        use_mmr=False  # or True for MMR
+        top_k=500,
+        use_mmr=False
     )
-    print("Retrieval done. Example BM25 results:")
-    print(results_bm25)
+    print(f"[BM25] Queries Evaluated: {bm25_count}, Avg Precision: {bm25_precision:.4f}, Avg Recall: {bm25_recall:.4f}")
 
-    # Step D: SBERT search
-    print("Running retrieval with SBERT...")
-    results_sbert = search_documents(
-        query=example_query,
-        bm25=None,  # not needed
+    # Evaluate SBERT (with or without MMR)
+    sbert_precision, sbert_recall, sbert_count = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
+        bm25=None,  # not used for SBERT
         corpus_texts=corpus_texts,
         corpus_ids=corpus_ids,
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
-        top_k=10,
         method="sbert",
-        use_mmr=True,      # Turn MMR on if you want diversity
+        top_k=500,
+        use_mmr=False,     # Evaluate with MMR
         mmr_lambda=0.7
     )
-    print("Retrieval done. Example SBERT results:")
-    print(results_sbert)
+    print(f"[SBERT] Queries Evaluated: {sbert_count}, Avg Precision: {sbert_precision:.4f}, Avg Recall: {sbert_recall:.4f}")
 
-    # Step E: Hybrid
-    print("Running retrieval with Hybrid (BM25 + SBERT)...")
-    results_hybrid = search_documents(
-        query=example_query,
+    # Evaluate SBERT (with or without MMR)
+    sbert_mmr_precision, sbert_mmr_recall, sbert_mmr_count = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
+        bm25=None,  # not used for SBERT
+        corpus_texts=corpus_texts,
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model,
+        doc_embeddings=doc_embeddings,
+        method="sbert",
+        top_k=500,
+        use_mmr=True,     # Evaluate with MMR
+        mmr_lambda=0.7
+    )
+    print(f"[SBERT + MMR] Queries Evaluated: {sbert_mmr_count}, Avg Precision: {sbert_mmr_precision:.4f}, Avg Recall: {sbert_mmr_recall:.4f}")
+
+    # Evaluate Hybrid (BM25 + SBERT) with MMR
+    hybrid_mmr_precision, hybrid_mmr_recall, hybrid_mmr_count = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
         bm25=bm25,
         corpus_texts=corpus_texts,
         corpus_ids=corpus_ids,
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
-        top_k=10,
         method="hybrid",
+        top_k=500,
         use_mmr=True,
-        mmr_lambda=0.5
+        mmr_lambda=0.7
     )
-    print("Retrieval done. Example Hybrid results:")
-    print(results_hybrid)
+    print(f"[Hybrid + MMR] Queries Evaluated: {hybrid_mmr_count}, Avg Precision: {hybrid_mmr_precision:.4f}, Avg Recall: {hybrid_mmr_recall:.4f}")
 
-    print("Step 1 code (with caching and negative-stride fix) is complete.")
+    # Evaluate Hybrid (BM25 + SBERT) with MMR
+    hybrid_precision, hybrid_recall, hybrid_count = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
+        bm25=bm25,
+        corpus_texts=corpus_texts,
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model,
+        doc_embeddings=doc_embeddings,
+        method="hybrid",
+        top_k=500,
+        use_mmr=False,
+        mmr_lambda=0.7
+    )
+    print(f"[Hybrid] Queries Evaluated: {hybrid_count}, Avg Precision: {hybrid_precision:.4f}, Avg Recall: {hybrid_recall:.4f}")
