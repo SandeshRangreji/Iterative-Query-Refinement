@@ -2,11 +2,29 @@ from collections import defaultdict
 import os
 import pickle
 import random
+import re
 import numpy as np
 import torch
 from rank_bm25 import BM25Okapi
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer, util
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+import nltk
+nltk.download('stopwords')
+
+stop_words = set(stopwords.words('english'))
+stemmer = PorterStemmer()
+
+# ===============================
+# 0) TEXT NORMALIZATION FUNCTION
+# ===============================
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    tokens = text.split()
+    filtered = [stemmer.stem(w) for w in tokens if w not in stop_words]
+    return filtered
 
 # ===============================
 # 1) BUILD BM25 INDEX (with caching)
@@ -16,35 +34,26 @@ def build_bm25_index(
     cache_path="bm25_index.pkl",
     force_reindex=False
 ):
-    """
-    Builds (or loads) a BM25Okapi index from the corpus.
-
-    :param corpus_dataset: Hugging Face dataset (a list of dicts with '_id', 'text', etc.)
-    :param cache_path: Path to a pickle file where we cache the BM25 index and doc info
-    :param force_reindex: If True, rebuild the index even if cache exists
-    :return: (bm25, corpus_texts, corpus_ids)
-    """
     if (not force_reindex) and os.path.exists(cache_path):
         print(f"[BM25] Loading BM25 index from cache: {cache_path}")
         with open(cache_path, "rb") as f:
             bm25, corpus_texts, corpus_ids = pickle.load(f)
         return bm25, corpus_texts, corpus_ids
-    
+
     print("[BM25] Building index from scratch...")
     corpus_texts = []
     corpus_ids = []
     for doc in corpus_dataset:
         corpus_texts.append(doc["text"])
         corpus_ids.append(doc["_id"])
-    
-    tokenized_corpus = [text.split() for text in corpus_texts]
-    bm25 = BM25Okapi(tokenized_corpus)
-    
-    # Cache results
+
+    tokenized_corpus = [preprocess_text(text) for text in corpus_texts]
+    bm25 = BM25Okapi(tokenized_corpus, b=0.5) # Defaults: k1=1.5, b=0.75, epsilon=0.25
+
     print(f"[BM25] Saving BM25 index to cache: {cache_path}")
     with open(cache_path, "wb") as f:
         pickle.dump((bm25, corpus_texts, corpus_ids), f)
-    
+
     return bm25, corpus_texts, corpus_ids
 
 # ===============================
@@ -52,43 +61,31 @@ def build_bm25_index(
 # ===============================
 def build_sbert_index(
     corpus_texts,
-    model_name="distilbert-base-nli-stsb-mean-tokens",
+    model_name="sentence-transformers/msmarco-MiniLM-L6-cos-v5",
     batch_size=64,
     cache_path="sbert_index.pt",
     force_reindex=False
 ):
-    """
-    Encodes all documents using a SentenceTransformer model (optionally loads a cache).
-
-    :param corpus_texts: list of document texts
-    :param model_name: name of the SBERT model
-    :param batch_size: encode in batches
-    :param cache_path: Path to a .pt file where we cache doc_embeddings
-    :param force_reindex: If True, rebuild embeddings even if cache exists
-    :return: (model, doc_embeddings)
-    """
     print("[SBERT] Initializing model...")
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, device='cpu')
 
     if (not force_reindex) and os.path.exists(cache_path):
         print(f"[SBERT] Loading SBERT embeddings from cache: {cache_path}")
         data = torch.load(cache_path)
         doc_embeddings = data["doc_embeddings"]
         return model, doc_embeddings
-    
+
     print("[SBERT] Encoding corpus from scratch...")
     doc_embeddings = model.encode(
         corpus_texts, 
         batch_size=batch_size, 
         convert_to_tensor=True
     )
-    # Ensure embeddings are on CPU and contiguous
     doc_embeddings = doc_embeddings.cpu().contiguous()
 
-    # Cache the embeddings
     print(f"[SBERT] Saving SBERT embeddings to cache: {cache_path}")
     torch.save({"doc_embeddings": doc_embeddings}, cache_path)
-    
+
     return model, doc_embeddings
 
 # ===============================
@@ -166,7 +163,7 @@ def search_documents(
 
     # =========== BM25 =============
     if method.lower() == "bm25":
-        tokenized_query = query.split()
+        tokenized_query = preprocess_text(query)
         scores = bm25.get_scores(tokenized_query)
         # Sort by BM25 descending
         sorted_indices = np.argsort(scores)[::-1][:top_k]
@@ -221,7 +218,7 @@ def search_documents(
             raise ValueError("SBERT model and doc_embeddings are required for method='hybrid'")
         
         # 1) BM25 top_k
-        tokenized_query = query.split()
+        tokenized_query = preprocess_text(query)
         bm25_scores = bm25.get_scores(tokenized_query)
         bm25_sorted_indices = np.argsort(bm25_scores)[::-1][:top_k]
         
@@ -297,44 +294,24 @@ def evaluate_retrieval_on_queries(
     sbert_model,
     doc_embeddings,
     method="bm25",
-    top_k=10,
+    top_k_p=20,
+    top_k_r=500,
     use_mmr=False,
     mmr_lambda=0.5
 ):
-    """
-    Runs retrieval on all queries, computes average Precision and Recall.
-    Only queries that appear in qrels are evaluated.
-
-    :param queries_dataset: HF dataset with fields "_id" and "text" for queries
-    :param qrels_dataset: HF dataset with "query-id", "corpus-id", "score"
-    :param bm25: The BM25Okapi object
-    :param corpus_texts: list of doc texts (same order as corpus_ids)
-    :param corpus_ids: list of doc IDs (same order as corpus_texts)
-    :param sbert_model: SentenceTransformer model
-    :param doc_embeddings: SBERT doc embeddings
-    :param method: "bm25", "sbert", or "hybrid"
-    :param top_k: number of docs to retrieve per query
-    :param use_mmr: whether to apply MMR
-    :param mmr_lambda: MMR lambda param
-    :return: (avg_precision, avg_recall, num_evaluated_queries)
-    """
-    # 1) Build dictionary of relevant docs
     relevant_docs_by_query = build_qrels_dict(qrels_dataset)
 
     all_precisions = []
     all_recalls = []
     num_evaluated = 0
 
-    # 2) Iterate over each query in queries_dataset
     for query_item in queries_dataset:
-        query_id = int(query_item["_id"])  # TREC-COVID query ID
+        query_id = int(query_item["_id"])
         query_text = query_item["text"]
 
-        # Only evaluate if this query ID is in the Qrels
         if query_id not in relevant_docs_by_query:
             continue
 
-        # Retrieve top documents
         results = search_documents(
             query=query_text,
             bm25=bm25,
@@ -342,21 +319,28 @@ def evaluate_retrieval_on_queries(
             corpus_ids=corpus_ids,
             sbert_model=sbert_model,
             doc_embeddings=doc_embeddings,
-            top_k=top_k,
+            top_k=max(top_k_p, top_k_r),  # retrieve more for recall
             method=method,
             use_mmr=use_mmr,
             mmr_lambda=mmr_lambda
         )
-        # 'results' is a list of (doc_id, score)
-        retrieved_docs = [doc_id for doc_id, _score in results]
 
-        # 3) Compute precision & recall
+        retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]  # precision@20
+        full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]  # recall@500
+
         relevant_set = relevant_docs_by_query[query_id]
         retrieved_set = set(retrieved_docs)
+        full_retrieved_set = set(full_retrieved_docs)
 
         num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-        precision = num_relevant_retrieved / len(retrieved_docs) if len(retrieved_docs) > 0 else 0.0
-        recall = num_relevant_retrieved / len(relevant_set) if len(relevant_set) > 0 else 0.0
+        num_relevant_total = len(relevant_set.intersection(full_retrieved_set))
+
+        retrieved_count = len(retrieved_docs)
+        if retrieved_count > 0:
+            precision = num_relevant_retrieved / retrieved_count
+        else:
+            precision = 0.0
+        recall = num_relevant_total / len(relevant_set) if len(relevant_set) > 0 else 0.0
 
         all_precisions.append(precision)
         all_recalls.append(recall)
@@ -384,14 +368,14 @@ if __name__ == "__main__":
     bm25, corpus_texts, corpus_ids = build_bm25_index(
         corpus_dataset,
         cache_path="bm25_index.pkl",
-        force_reindex=False
+        force_reindex=True
     )
     print("BM25 index built.")
 
     print("Building SBERT index...")
     sbert_model, doc_embeddings = build_sbert_index(
         corpus_texts,
-        model_name="all-MiniLM-L6-v2",
+        model_name="all-mpnet-base-v2",
         batch_size=64,
         cache_path="sbert_index.pt",
         force_reindex=False
@@ -408,7 +392,8 @@ if __name__ == "__main__":
         sbert_model=None,       # Not needed for pure BM25
         doc_embeddings=None,    # Not needed for pure BM25
         method="bm25",
-        top_k=500,
+        top_k_p=5,
+        top_k_r=1000,
         use_mmr=False
     )
     print(f"[BM25] Queries Evaluated: {bm25_count}, Avg Precision: {bm25_precision:.4f}, Avg Recall: {bm25_recall:.4f}")
@@ -423,43 +408,46 @@ if __name__ == "__main__":
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
         method="sbert",
-        top_k=500,
+        top_k_p=5,
+        top_k_r=1000,
         use_mmr=False,     # Evaluate with MMR
         mmr_lambda=0.7
     )
     print(f"[SBERT] Queries Evaluated: {sbert_count}, Avg Precision: {sbert_precision:.4f}, Avg Recall: {sbert_recall:.4f}")
 
-    # Evaluate SBERT (with or without MMR)
-    sbert_mmr_precision, sbert_mmr_recall, sbert_mmr_count = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=None,  # not used for SBERT
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="sbert",
-        top_k=500,
-        use_mmr=True,     # Evaluate with MMR
-        mmr_lambda=0.7
-    )
-    print(f"[SBERT + MMR] Queries Evaluated: {sbert_mmr_count}, Avg Precision: {sbert_mmr_precision:.4f}, Avg Recall: {sbert_mmr_recall:.4f}")
+    # # Evaluate SBERT (with or without MMR)
+    # sbert_mmr_precision, sbert_mmr_recall, sbert_mmr_count = evaluate_retrieval_on_queries(
+    #     queries_dataset=queries_dataset,
+    #     qrels_dataset=qrels_dataset,
+    #     bm25=None,  # not used for SBERT
+    #     corpus_texts=corpus_texts,
+    #     corpus_ids=corpus_ids,
+    #     sbert_model=sbert_model,
+    #     doc_embeddings=doc_embeddings,
+    #     method="sbert",
+    #     top_k_p=20,
+    #     top_k_r=500,
+    #     use_mmr=True,     # Evaluate with MMR
+    #     mmr_lambda=0.7
+    # )
+    # print(f"[SBERT + MMR] Queries Evaluated: {sbert_mmr_count}, Avg Precision: {sbert_mmr_precision:.4f}, Avg Recall: {sbert_mmr_recall:.4f}")
 
-    # Evaluate Hybrid (BM25 + SBERT) with MMR
-    hybrid_mmr_precision, hybrid_mmr_recall, hybrid_mmr_count = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=bm25,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="hybrid",
-        top_k=500,
-        use_mmr=True,
-        mmr_lambda=0.7
-    )
-    print(f"[Hybrid + MMR] Queries Evaluated: {hybrid_mmr_count}, Avg Precision: {hybrid_mmr_precision:.4f}, Avg Recall: {hybrid_mmr_recall:.4f}")
+    # # Evaluate Hybrid (BM25 + SBERT) with MMR
+    # hybrid_mmr_precision, hybrid_mmr_recall, hybrid_mmr_count = evaluate_retrieval_on_queries(
+    #     queries_dataset=queries_dataset,
+    #     qrels_dataset=qrels_dataset,
+    #     bm25=bm25,
+    #     corpus_texts=corpus_texts,
+    #     corpus_ids=corpus_ids,
+    #     sbert_model=sbert_model,
+    #     doc_embeddings=doc_embeddings,
+    #     method="hybrid",
+    #     top_k_p=20,
+    #     top_k_r=500,
+    #     use_mmr=True,
+    #     mmr_lambda=0.7
+    # )
+    # print(f"[Hybrid + MMR] Queries Evaluated: {hybrid_mmr_count}, Avg Precision: {hybrid_mmr_precision:.4f}, Avg Recall: {hybrid_mmr_recall:.4f}")
 
     # Evaluate Hybrid (BM25 + SBERT) with MMR
     hybrid_precision, hybrid_recall, hybrid_count = evaluate_retrieval_on_queries(
@@ -471,7 +459,8 @@ if __name__ == "__main__":
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
         method="hybrid",
-        top_k=500,
+        top_k_p=5,
+        top_k_r=1000,
         use_mmr=False,
         mmr_lambda=0.7
     )
