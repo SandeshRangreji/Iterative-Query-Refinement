@@ -269,20 +269,28 @@ def search_documents(
         raise ValueError(f"Unknown method: {method}. Use 'bm25', 'sbert', or 'hybrid'.")
 
 
-def build_qrels_dict(qrels_dataset):
+def build_qrels_dicts(qrels_dataset):
     """
-    Convert qrels_dataset into a dictionary of form:
-      relevant_docs_by_query[query_id] = set of relevant doc_ids
-    Only includes docs with score > 0 (relevant).
+    Convert qrels_dataset into dictionaries for different relevance levels:
+      - relevant_docs_by_query: judgment score >= 1
+      - highly_relevant_docs_by_query: judgment score == 2
+      - overall_relevant_docs_by_query: judgment score > 0
     """
     relevant_docs_by_query = defaultdict(set)
+    highly_relevant_docs_by_query = defaultdict(set)
+    overall_relevant_docs_by_query = defaultdict(set)
+
     for qid, cid, score in zip(qrels_dataset["query-id"],
                                qrels_dataset["corpus-id"],
                                qrels_dataset["score"]):
-        # TREC-COVID: a score > 0 indicates relevance
-        if score > 0:
+        if score >= 1:
             relevant_docs_by_query[qid].add(cid)
-    return relevant_docs_by_query
+        if score == 2:
+            highly_relevant_docs_by_query[qid].add(cid)
+        if score > 0:
+            overall_relevant_docs_by_query[qid].add(cid)
+
+    return relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query
 
 
 def evaluate_retrieval_on_queries(
@@ -299,19 +307,19 @@ def evaluate_retrieval_on_queries(
     use_mmr=False,
     mmr_lambda=0.5
 ):
-    relevant_docs_by_query = build_qrels_dict(qrels_dataset)
+    # Build qrels dictionaries for different relevance levels
+    relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = build_qrels_dicts(qrels_dataset)
 
-    all_precisions = []
-    all_recalls = []
+    # Initialize lists to store precision and recall values for each relevance level
+    all_precisions = {'relevant': [], 'highly_relevant': [], 'overall': []}
+    all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
     num_evaluated = 0
 
     for query_item in queries_dataset:
         query_id = int(query_item["_id"])
         query_text = query_item["text"]
 
-        if query_id not in relevant_docs_by_query:
-            continue
-
+        # Retrieve documents using the specified method
         results = search_documents(
             query=query_text,
             bm25=bm25,
@@ -319,44 +327,66 @@ def evaluate_retrieval_on_queries(
             corpus_ids=corpus_ids,
             sbert_model=sbert_model,
             doc_embeddings=doc_embeddings,
-            top_k=max(top_k_p, top_k_r),  # retrieve more for recall
+            top_k=max(top_k_p, top_k_r),
             method=method,
             use_mmr=use_mmr,
             mmr_lambda=mmr_lambda
         )
 
-        retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]  # precision@20
-        full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]  # recall@500
+        retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]
+        full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]
 
-        relevant_set = relevant_docs_by_query[query_id]
-        retrieved_set = set(retrieved_docs)
-        full_retrieved_set = set(full_retrieved_docs)
+        # Function to calculate precision and recall
+        def calculate_precision_recall(relevant_set):
+            if not relevant_set:
+                return None, None
+            retrieved_set = set(retrieved_docs)
+            full_retrieved_set = set(full_retrieved_docs)
+            num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
+            num_relevant_total = len(relevant_set.intersection(full_retrieved_set))
+            precision = num_relevant_retrieved / top_k_p
+            recall = num_relevant_total / len(relevant_set)
+            return precision, recall
 
-        num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-        num_relevant_total = len(relevant_set.intersection(full_retrieved_set))
+        # Calculate for relevant documents
+        if query_id in relevant_docs_by_query:
+            precision, recall = calculate_precision_recall(relevant_docs_by_query[query_id])
+            if precision is not None:
+                all_precisions['relevant'].append(precision)
+                all_recalls['relevant'].append(recall)
 
-        retrieved_count = len(retrieved_docs)
-        if retrieved_count > 0:
-            precision = num_relevant_retrieved / retrieved_count
-        else:
-            precision = 0.0
-        recall = num_relevant_total / len(relevant_set) if len(relevant_set) > 0 else 0.0
+        # Calculate for highly relevant documents
+        if query_id in highly_relevant_docs_by_query:
+            precision, recall = calculate_precision_recall(highly_relevant_docs_by_query[query_id])
+            if precision is not None:
+                all_precisions['highly_relevant'].append(precision)
+                all_recalls['highly_relevant'].append(recall)
 
-        all_precisions.append(precision)
-        all_recalls.append(recall)
+        # Calculate for overall relevant documents
+        if query_id in overall_relevant_docs_by_query:
+            precision, recall = calculate_precision_recall(overall_relevant_docs_by_query[query_id])
+            if precision is not None:
+                all_precisions['overall'].append(precision)
+                all_recalls['overall'].append(recall)
+
         num_evaluated += 1
 
-    if num_evaluated == 0:
-        return 0.0, 0.0, 0
+    # Compute average precision and recall for each relevance level
+    avg_precisions = {level: (sum(precisions) / len(precisions)) if precisions else 0.0
+                      for level, precisions in all_precisions.items()}
+    avg_recalls = {level: (sum(recalls) / len(recalls)) if recalls else 0.0
+                   for level, recalls in all_recalls.items()}
 
-    avg_precision = sum(all_precisions) / num_evaluated
-    avg_recall = sum(all_recalls) / num_evaluated
-    return avg_precision, avg_recall, num_evaluated
+    return avg_precisions, avg_recalls, num_evaluated
+
 
 # ===============================
 # 5) DEMO in main
 # ===============================
 if __name__ == "__main__":
+    top_k_p = 20
+    top_k_r = 1000
+
     # (Same dataset loading & index building as before)
     print("Loading datasets...")
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
@@ -368,7 +398,7 @@ if __name__ == "__main__":
     bm25, corpus_texts, corpus_ids = build_bm25_index(
         corpus_dataset,
         cache_path="bm25_index.pkl",
-        force_reindex=True
+        force_reindex=False
     )
     print("BM25 index built.")
 
@@ -383,37 +413,42 @@ if __name__ == "__main__":
     print("SBERT index built.")
 
     # Evaluate BM25
-    bm25_precision, bm25_recall, bm25_count = evaluate_retrieval_on_queries(
+    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
         bm25=bm25,
         corpus_texts=corpus_texts,
         corpus_ids=corpus_ids,
-        sbert_model=None,       # Not needed for pure BM25
-        doc_embeddings=None,    # Not needed for pure BM25
-        method="bm25",
-        top_k_p=5,
-        top_k_r=1000,
+        sbert_model=None,
+        doc_embeddings=None,
+        method="bm25",  # or "sbert" or "hybrid"
+        top_k_p=top_k_p,
+        top_k_r=top_k_r,
         use_mmr=False
     )
-    print(f"[BM25] Queries Evaluated: {bm25_count}, Avg Precision: {bm25_precision:.4f}, Avg Recall: {bm25_recall:.4f}")
+
+    print(f"[BM25] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[BM25] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
     # Evaluate SBERT (with or without MMR)
-    sbert_precision, sbert_recall, sbert_count = evaluate_retrieval_on_queries(
+    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
-        bm25=None,  # not used for SBERT
+        bm25=None,
         corpus_texts=corpus_texts,
         corpus_ids=corpus_ids,
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
-        method="sbert",
-        top_k_p=5,
-        top_k_r=1000,
-        use_mmr=False,     # Evaluate with MMR
-        mmr_lambda=0.7
+        method="sbert",  # or "sbert" or "hybrid"
+        top_k_p=top_k_p,
+        top_k_r=top_k_r,
+        use_mmr=False
     )
-    print(f"[SBERT] Queries Evaluated: {sbert_count}, Avg Precision: {sbert_precision:.4f}, Avg Recall: {sbert_recall:.4f}")
+
+    print(f"[SBERT] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[SBERT] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
     # # Evaluate SBERT (with or without MMR)
     # sbert_mmr_precision, sbert_mmr_recall, sbert_mmr_count = evaluate_retrieval_on_queries(
@@ -450,7 +485,7 @@ if __name__ == "__main__":
     # print(f"[Hybrid + MMR] Queries Evaluated: {hybrid_mmr_count}, Avg Precision: {hybrid_mmr_precision:.4f}, Avg Recall: {hybrid_mmr_recall:.4f}")
 
     # Evaluate Hybrid (BM25 + SBERT) with MMR
-    hybrid_precision, hybrid_recall, hybrid_count = evaluate_retrieval_on_queries(
+    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
         bm25=bm25,
@@ -458,10 +493,12 @@ if __name__ == "__main__":
         corpus_ids=corpus_ids,
         sbert_model=sbert_model,
         doc_embeddings=doc_embeddings,
-        method="hybrid",
-        top_k_p=5,
-        top_k_r=1000,
-        use_mmr=False,
-        mmr_lambda=0.7
+        method="hybrid",  # or "sbert" or "hybrid"
+        top_k_p=top_k_p,
+        top_k_r=top_k_r,
+        use_mmr=False
     )
-    print(f"[Hybrid] Queries Evaluated: {hybrid_count}, Avg Precision: {hybrid_precision:.4f}, Avg Recall: {hybrid_recall:.4f}")
+
+    print(f"[Hybrid] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[Hybrid] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
