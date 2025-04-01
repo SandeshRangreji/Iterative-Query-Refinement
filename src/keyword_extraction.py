@@ -2,7 +2,7 @@ import os
 from collections import defaultdict
 
 from datasets import load_dataset
-from search import build_bm25_index, build_sbert_index, search_documents
+from search import build_bm25_index, build_sbert_index, search_documents, cross_encoder_model
 
 from rake_nltk import Rake
 import yake
@@ -88,7 +88,9 @@ def main():
             doc_embeddings=doc_embeddings,
             top_k=top_n_docs,
             method="hybrid",
-            use_mmr=False
+            use_mmr=False,
+            use_cross_encoder=True,
+            cross_encoder_model=cross_encoder_model,
         )
 
         # Get top documents

@@ -12,9 +12,12 @@ from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
 import nltk
 nltk.download('stopwords')
+from sentence_transformers import CrossEncoder
 
 stop_words = set(stopwords.words('english'))
 stemmer = PorterStemmer()
+# Initialize the cross-encoder model
+cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2', device="cpu")
 
 # ===============================
 # 0) TEXT NORMALIZATION FUNCTION
@@ -150,7 +153,9 @@ def search_documents(
     top_k=10,
     method="bm25",
     use_mmr=False,
-    mmr_lambda=0.5
+    mmr_lambda=0.5,
+    use_cross_encoder=False,
+    cross_encoder_model=None
 ):
     """
     Main search function that supports:
@@ -254,16 +259,22 @@ def search_documents(
         if use_mmr:
             candidate_indices = list(sorted_indices)
             candidate_embeddings = doc_embeddings[candidate_indices]
-            mmr_results = mmr_rerank(
+            results = mmr_rerank(
                 query_embedding, 
                 candidate_embeddings,
                 [corpus_ids[i] for i in candidate_indices],
                 top_k=top_k,
                 lambda_param=mmr_lambda
             )
-            return mmr_results
-        else:
-            return results
+        
+        # Apply Cross-Encoder re-ranking if specified
+        if use_cross_encoder and cross_encoder_model:
+            query_doc_pairs = [(query, corpus_texts[corpus_ids.index(doc_id)]) for doc_id, _ in results]
+            rerank_scores = cross_encoder_model.predict(query_doc_pairs)
+            results = [(doc_id, score) for (doc_id, _), score in zip(results, rerank_scores)]
+            results.sort(key=lambda x: x[1], reverse=True)
+
+        return results
 
     else:
         raise ValueError(f"Unknown method: {method}. Use 'bm25', 'sbert', or 'hybrid'.")
@@ -305,7 +316,9 @@ def evaluate_retrieval_on_queries(
     top_k_p=20,
     top_k_r=500,
     use_mmr=False,
-    mmr_lambda=0.5
+    mmr_lambda=0.5,
+    use_cross_encoder=False,
+    cross_encoder_model=None
 ):
     # Build qrels dictionaries for different relevance levels
     relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = build_qrels_dicts(qrels_dataset)
@@ -330,7 +343,9 @@ def evaluate_retrieval_on_queries(
             top_k=max(top_k_p, top_k_r),
             method=method,
             use_mmr=use_mmr,
-            mmr_lambda=mmr_lambda
+            mmr_lambda=mmr_lambda,
+            use_cross_encoder=use_cross_encoder,
+            cross_encoder_model=cross_encoder_model
         )
 
         retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]
@@ -431,7 +446,7 @@ if __name__ == "__main__":
     for level in ['relevant', 'highly_relevant', 'overall']:
         print(f"[BM25] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
-    # Evaluate SBERT (with or without MMR)
+    # Evaluate SBERT
     avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
@@ -450,41 +465,7 @@ if __name__ == "__main__":
     for level in ['relevant', 'highly_relevant', 'overall']:
         print(f"[SBERT] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
-    # # Evaluate SBERT (with or without MMR)
-    # sbert_mmr_precision, sbert_mmr_recall, sbert_mmr_count = evaluate_retrieval_on_queries(
-    #     queries_dataset=queries_dataset,
-    #     qrels_dataset=qrels_dataset,
-    #     bm25=None,  # not used for SBERT
-    #     corpus_texts=corpus_texts,
-    #     corpus_ids=corpus_ids,
-    #     sbert_model=sbert_model,
-    #     doc_embeddings=doc_embeddings,
-    #     method="sbert",
-    #     top_k_p=20,
-    #     top_k_r=500,
-    #     use_mmr=True,     # Evaluate with MMR
-    #     mmr_lambda=0.7
-    # )
-    # print(f"[SBERT + MMR] Queries Evaluated: {sbert_mmr_count}, Avg Precision: {sbert_mmr_precision:.4f}, Avg Recall: {sbert_mmr_recall:.4f}")
-
-    # # Evaluate Hybrid (BM25 + SBERT) with MMR
-    # hybrid_mmr_precision, hybrid_mmr_recall, hybrid_mmr_count = evaluate_retrieval_on_queries(
-    #     queries_dataset=queries_dataset,
-    #     qrels_dataset=qrels_dataset,
-    #     bm25=bm25,
-    #     corpus_texts=corpus_texts,
-    #     corpus_ids=corpus_ids,
-    #     sbert_model=sbert_model,
-    #     doc_embeddings=doc_embeddings,
-    #     method="hybrid",
-    #     top_k_p=20,
-    #     top_k_r=500,
-    #     use_mmr=True,
-    #     mmr_lambda=0.7
-    # )
-    # print(f"[Hybrid + MMR] Queries Evaluated: {hybrid_mmr_count}, Avg Precision: {hybrid_mmr_precision:.4f}, Avg Recall: {hybrid_mmr_recall:.4f}")
-
-    # Evaluate Hybrid (BM25 + SBERT) with MMR
+    # Evaluate Hybrid (BM25 + SBERT) without Cross-encoder
     avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
@@ -496,9 +477,32 @@ if __name__ == "__main__":
         method="hybrid",  # or "sbert" or "hybrid"
         top_k_p=top_k_p,
         top_k_r=top_k_r,
-        use_mmr=False
+        use_mmr=False,
+        use_cross_encoder=False,
+        cross_encoder_model=None
     )
 
     print(f"[Hybrid] Queries Evaluated: {num_evaluated}")
     for level in ['relevant', 'highly_relevant', 'overall']:
         print(f"[Hybrid] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+
+    # Evaluate Hybrid with Cross-Encoder
+    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
+        bm25=bm25,
+        corpus_texts=corpus_texts,
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model,
+        doc_embeddings=doc_embeddings,
+        method="hybrid",  # or "sbert" or "hybrid"
+        top_k_p=top_k_p,
+        top_k_r=top_k_r,
+        use_mmr=False,
+        use_cross_encoder=True,
+        cross_encoder_model=None
+    )
+
+    print(f"[Hybrid + Re-ranking] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[Hybrid + Re-ranking] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
