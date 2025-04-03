@@ -1,7 +1,7 @@
 import random
 import numpy as np
 from datasets import load_dataset
-from collections import Counter
+from collections import Counter, defaultdict
 
 # Load datasets from Hugging Face
 corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
@@ -23,7 +23,7 @@ random_doc = corpus_dataset[random_doc_idx]
 print("\nRandom Document Sample:")
 print(f"Document ID: {random_doc['_id']}")
 print(f"Title: {random_doc['title']}")
-print(f"Text (start): {random_doc['text']}...\n")  # Show first 200 characters
+print(f"Text (start): {random_doc['text']}...\n")
 
 # Compute query/document length statistics
 query_lengths = [len(query["text"].split()) for query in queries_dataset]
@@ -61,37 +61,57 @@ unique_docs_in_qrels = len(set(qrels_dataset["corpus-id"]))
 
 # Number of relevance judgments per query
 judgments_per_query = list(query_counts.values())
-
 min_judgments_per_query = min(judgments_per_query)
 max_judgments_per_query = max(judgments_per_query)
 median_judgments_per_query = np.median(judgments_per_query)
 
 # Number of relevance judgments per document
 judgments_per_doc = list(doc_counts.values())
-
 min_judgments_per_doc = min(judgments_per_doc)
 max_judgments_per_doc = max(judgments_per_doc)
 median_judgments_per_doc = np.median(judgments_per_doc)
 
-# Compute number of relevant documents per query correctly
-relevant_docs_per_query = Counter()
+# ================= Added: Fine-grained relevant doc counts =================
+relevant_score1_per_query = defaultdict(set)
+relevant_score2_per_query = defaultdict(set)
 
-# Iterate over qrels_dataset to count relevant documents per query
-for query_id, score in zip(qrels_dataset["query-id"], qrels_dataset["score"]):
-    if score > 0:  # Count only relevant documents (score > 0)
-        relevant_docs_per_query[query_id] += 1
+for qrel in qrels_dataset:
+    query_id = qrel["query-id"]
+    doc_id = qrel["corpus-id"]
+    score = qrel["score"]
 
-# Convert counts to a list for statistics
-relevant_docs_counts = list(relevant_docs_per_query.values())
+    if score == 1:
+        relevant_score1_per_query[query_id].add(doc_id)
+    elif score == 2:
+        relevant_score2_per_query[query_id].add(doc_id)
+
+# Get union and intersection per query
+all_query_ids = set(relevant_score1_per_query.keys()) | set(relevant_score2_per_query.keys())
+overall_relevant_counts = []
+intersection_counts = []
+score1_counts = []
+score2_counts = []
+
+for qid in all_query_ids:
+    s1 = relevant_score1_per_query.get(qid, set())
+    s2 = relevant_score2_per_query.get(qid, set())
+    score1_counts.append(len(s1))
+    score2_counts.append(len(s2))
+    overall_relevant_counts.append(len(s1 | s2))
+    intersection_counts.append(len(s1 & s2))
+
+# Compute statistics
+avg_score1_per_query = np.mean(score1_counts) if score1_counts else 0
+avg_score2_per_query = np.mean(score2_counts) if score2_counts else 0
+avg_overall_per_query = np.mean(overall_relevant_counts) if overall_relevant_counts else 0
+avg_intersection_per_query = np.mean(intersection_counts) if intersection_counts else 0
 
 # Compute percentiles
-percentiles = np.percentile(relevant_docs_counts, [25, 50, 75, 90]) if relevant_docs_counts else [0, 0, 0, 0]
-
-# Percentage of queries with at least one relevant document
-queries_with_relevant_docs = sum(1 for count in relevant_docs_counts if count > 0)
+percentiles = np.percentile(overall_relevant_counts, [25, 50, 75, 90]) if overall_relevant_counts else [0, 0, 0, 0]
+queries_with_relevant_docs = sum(1 for count in overall_relevant_counts if count > 0)
 percent_queries_with_relevant = (queries_with_relevant_docs / num_queries) * 100 if num_queries > 0 else 0
 
-# Print all results
+# ================= Print All Results =================
 print("\n=================== Query and Document Statistics ===================")
 print(f"Average query length (words): {avg_query_length:.2f}")
 print(f"Median query length (words): {median_query_length:.2f}")
@@ -116,7 +136,7 @@ for length, count in doc_length_counts:
 print("\n=================== Relevance Judgment Statistics ===================")
 print(f"Total number of query-document relevance judgments: {total_judgments}")
 print(f"Average number of judgments per query: {avg_judgments_per_query:.1f}")
-print(f"Average number of relevant documents per query: {avg_relevant_per_query:.1f}")
+print(f"Average number of relevant documents per query (score > 0): {avg_relevant_per_query:.1f}")
 
 print(f"Total unique queries in qrels: {unique_queries_in_qrels}")
 print(f"Total unique documents in qrels: {unique_docs_in_qrels}")
@@ -129,6 +149,11 @@ for score_value in sorted(score_counts.keys()):
     print(f"  {score_value}: {score_counts[score_value]}")
 
 print("\n=================== Relevant Document Distribution ===================")
+print(f"Average number of relevant documents per query (score = 1): {avg_score1_per_query:.2f}")
+print(f"Average number of highly relevant documents per query (score = 2): {avg_score2_per_query:.2f}")
+print(f"Average number of relevant documents per query (score > 0): {avg_overall_per_query:.2f}")
+print(f"Average intersection size per query (score=1 ∩ score=2): {avg_intersection_per_query:.2f}")
+
 print("Distribution of relevant documents per query (percentiles):")
 print(f"  25th percentile: {percentiles[0]:.1f}")
 print(f"  50th percentile (median): {percentiles[1]:.1f}")
