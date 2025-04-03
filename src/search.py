@@ -17,7 +17,7 @@ from sentence_transformers import CrossEncoder
 stop_words = set(stopwords.words('english'))
 stemmer = PorterStemmer()
 # Initialize the cross-encoder model
-cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2', device="cpu")
+cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2', device="mps")
 
 # ===============================
 # 0) TEXT NORMALIZATION FUNCTION
@@ -271,7 +271,8 @@ def search_documents(
         if use_cross_encoder and cross_encoder_model:
             query_doc_pairs = [(query, corpus_texts[corpus_ids.index(doc_id)]) for doc_id, _ in results]
             rerank_scores = cross_encoder_model.predict(query_doc_pairs)
-            results = [(doc_id, score) for (doc_id, _), score in zip(results, rerank_scores)]
+            doc_ids_only = [doc_id for doc_id, _ in results]
+            results = [(doc_id, score) for doc_id, score in zip(doc_ids_only, rerank_scores)]
             results.sort(key=lambda x: x[1], reverse=True)
 
         return results
@@ -294,7 +295,7 @@ def build_qrels_dicts(qrels_dataset):
     for qid, cid, score in zip(qrels_dataset["query-id"],
                                qrels_dataset["corpus-id"],
                                qrels_dataset["score"]):
-        if score >= 1:
+        if score == 1:
             relevant_docs_by_query[qid].add(cid)
         if score == 2:
             highly_relevant_docs_by_query[qid].add(cid)
@@ -355,12 +356,18 @@ def evaluate_retrieval_on_queries(
         def calculate_precision_recall(relevant_set):
             if not relevant_set:
                 return None, None
-            retrieved_set = set(retrieved_docs)
-            full_retrieved_set = set(full_retrieved_docs)
+
+            # Top-k precision (top_k_p)
+            retrieved_set = set(retrieved_docs)  # top_k_p docs
             num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-            num_relevant_total = len(relevant_set.intersection(full_retrieved_set))
             precision = num_relevant_retrieved / top_k_p
-            recall = num_relevant_total / len(relevant_set)
+
+            # Recall over up to top_k_r docs (handle case when < top_k_r results returned)
+            top_k_r_subset = full_retrieved_docs[:top_k_r]
+            top_k_r_set = set(top_k_r_subset)
+            num_relevant_in_top_r = len(relevant_set.intersection(top_k_r_set))
+            recall = num_relevant_in_top_r / len(relevant_set)
+
             return precision, recall
 
         # Calculate for relevant documents
@@ -500,7 +507,7 @@ if __name__ == "__main__":
         top_k_r=top_k_r,
         use_mmr=False,
         use_cross_encoder=True,
-        cross_encoder_model=None
+        cross_encoder_model=cross_encoder_model
     )
 
     print(f"[Hybrid + Re-ranking] Queries Evaluated: {num_evaluated}")
