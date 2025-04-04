@@ -70,7 +70,7 @@ def build_sbert_index(
     force_reindex=False
 ):
     print("[SBERT] Initializing model...")
-    model = SentenceTransformer(model_name, device='cpu')
+    model = SentenceTransformer(model_name, device='mps')
 
     if (not force_reindex) and os.path.exists(cache_path):
         print(f"[SBERT] Loading SBERT embeddings from cache: {cache_path}")
@@ -494,22 +494,22 @@ if __name__ == "__main__":
         print(f"[Hybrid] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
     # Evaluate Hybrid with Cross-Encoder
-    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=bm25,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="hybrid",  # or "sbert" or "hybrid"
-        top_k_p=top_k_p,
-        top_k_r=top_k_r,
-        use_mmr=False,
-        use_cross_encoder=True,
-        cross_encoder_model=cross_encoder_model
-    )
+    # avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
+    #     queries_dataset=queries_dataset,
+    #     qrels_dataset=qrels_dataset,
+    #     bm25=bm25,
+    #     corpus_texts=corpus_texts,
+    #     corpus_ids=corpus_ids,
+    #     sbert_model=sbert_model,
+    #     doc_embeddings=doc_embeddings,
+    #     method="hybrid",  # or "sbert" or "hybrid"
+    #     top_k_p=top_k_p,
+    #     top_k_r=top_k_r,
+    #     use_mmr=False,
+    #     use_cross_encoder=True,
+    #     cross_encoder_model=cross_encoder_model
+    # )
 
-    print(f"[Hybrid + Re-ranking] Queries Evaluated: {num_evaluated}")
-    for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[Hybrid + Re-ranking] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+    # print(f"[Hybrid + Re-ranking] Queries Evaluated: {num_evaluated}")
+    # for level in ['relevant', 'highly_relevant', 'overall']:
+    #     print(f"[Hybrid + Re-ranking] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
