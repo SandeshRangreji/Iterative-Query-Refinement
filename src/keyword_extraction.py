@@ -106,8 +106,8 @@ def main():
             top_k=top_n_docs,
             method="hybrid",
             use_mmr=False,
-            use_cross_encoder=True,
-            cross_encoder_model=cross_encoder_model,
+            use_cross_encoder=False,
+            cross_encoder_model=None,
         )
 
         top_docs = [corpus_texts[corpus_ids.index(doc_id)] for doc_id, _ in results]
