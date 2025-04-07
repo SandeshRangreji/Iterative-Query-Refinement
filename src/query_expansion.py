@@ -1,19 +1,17 @@
 import os
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datasets import load_dataset
 from search import build_bm25_index, build_sbert_index, search_documents, cross_encoder_model
 from keyword_extraction import remove_stopwords, extract_keywords_keybert_filtered
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 
-
-def weighted_rrf_fusion(rankings, weights, k=60):
+def reciprocal_rank_fusion(rankings, k=60):
     scores = defaultdict(float)
-    for rank_list, weight in zip(rankings, weights):
+    for rank_list in rankings:
         for rank, (doc_id, _) in enumerate(rank_list):
-            scores[doc_id] += weight / (k + rank + 1)
+            scores[doc_id] += 1 / (k + rank + 1)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
 
 def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k_r=1000):
     from search import build_qrels_dicts
@@ -58,12 +56,11 @@ def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k
     avg_recalls = {lvl: sum(vals)/len(vals) if vals else 0.0 for lvl, vals in all_recalls.items()}
     return avg_precisions, avg_recalls, num_evaluated
 
-
 def main():
     top_n_docs = 10
     top_k_keywords = 5
     top_k_results = 1000
-    original_query_weight = 0.75  # importance given to original query's results
+    original_query_weight = 0.7
 
     print("[Loading datasets]")
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
@@ -92,7 +89,6 @@ def main():
             query_embedding=query_embedding
         )
 
-        # Original query search
         original_results = search_documents(
             query=query_text,
             bm25=bm25,
@@ -103,18 +99,19 @@ def main():
             top_k=top_k_results,
             method="hybrid",
             use_mmr=False,
-            use_cross_encoder=False,
-            cross_encoder_model=None,
+            use_cross_encoder=True,
+            cross_encoder_model=cross_encoder_model,
         )
+
         all_query_results_original.append({
             "query_id": query_id,
             "query_text": query_text,
             "results": original_results
         })
 
-        # Keyword queries
         keyword_results = []
-        print(f"[Keywords]: {keywords}")
+        overlap_counter = Counter()
+
         for kw in keywords:
             kw_results = search_documents(
                 query=kw,
@@ -124,17 +121,22 @@ def main():
                 sbert_model=sbert_model,
                 doc_embeddings=doc_embeddings,
                 top_k=top_k_results,
-                method="bm25",
+                method="hybrid",
                 use_mmr=False,
                 use_cross_encoder=False,
                 cross_encoder_model=None,
             )
             keyword_results.append(kw_results)
+            overlap = set(doc_id for doc_id, _ in kw_results).intersection(doc_id for doc_id, _ in original_results)
+            overlap_counter[kw] = len(overlap)
 
-        # WRRF fusion
-        weights = [original_query_weight] + [(1 - original_query_weight) / len(keyword_results)] * len(keyword_results)
-        all_rankings = [original_results] + keyword_results
-        combined_results = weighted_rrf_fusion(all_rankings, weights)
+        print("[Keyword Overlap with Original Query Results]:")
+        for kw in keywords:
+            print(f" - '{kw}': {overlap_counter[kw]} overlapping docs")
+
+        weighted_original = [(doc_id, score * original_query_weight) for doc_id, score in original_results]
+        all_rankings = [weighted_original] + keyword_results
+        combined_results = reciprocal_rank_fusion(all_rankings)
 
         all_query_results_rrf.append({
             "query_id": query_id,
@@ -160,14 +162,14 @@ def main():
         top_k_p=20,
         top_k_r=1000,
     )
-    print(f"[Query Expansion + WRRF] Queries Evaluated: {num_evaluated}")
+
+    print(f"[Query Expansion + RRF] Queries Evaluated: {num_evaluated}")
     for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[Query Expansion + WRRF] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
-    
+        print(f"[Query Expansion + RRF] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+
     original_ids = set(doc_id for doc_id, _ in original_results[:top_k_results])
     expanded_ids = set(doc_id for doc_id, _ in combined_results[:top_k_results])
     print(f"Recall gain: {len(expanded_ids - original_ids)} new docs added")
-
 
 if __name__ == "__main__":
     main()

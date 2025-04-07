@@ -47,7 +47,7 @@ def build_bm25_index(
     corpus_texts = []
     corpus_ids = []
     for doc in corpus_dataset:
-        corpus_texts.append(doc["text"])
+        corpus_texts.append(doc["title"] + "/n/n" + doc["text"])
         corpus_ids.append(doc["_id"])
 
     tokenized_corpus = [preprocess_text(text) for text in corpus_texts]
@@ -70,7 +70,7 @@ def build_sbert_index(
     force_reindex=False
 ):
     print("[SBERT] Initializing model...")
-    model = SentenceTransformer(model_name, device='mps')
+    model = SentenceTransformer(model_name, device='cpu')
 
     if (not force_reindex) and os.path.exists(cache_path):
         print(f"[SBERT] Loading SBERT embeddings from cache: {cache_path}")
