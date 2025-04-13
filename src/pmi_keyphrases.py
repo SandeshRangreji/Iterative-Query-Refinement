@@ -82,7 +82,7 @@ if __name__ == "__main__":
         corpus_texts, model_name="all-mpnet-base-v2", batch_size=64, cache_path="sbert_index.pt", force_reindex=False
     )
 
-    for query_item in queries_dataset.select(range(1)):  # Only first query for demo
+    for query_item in queries_dataset.select(range(5)):  # Only first query for demo
         query_id = int(query_item["_id"])
         query_text = query_item["text"]
         print(f"\n[Query ID: {query_id}] {query_text}")

@@ -3,8 +3,10 @@ from collections import defaultdict, Counter
 from datasets import load_dataset
 from search import build_bm25_index, build_sbert_index, search_documents, cross_encoder_model
 from keyword_extraction import remove_stopwords, extract_keywords_keybert_filtered
+from pmi_keyphrases import extract_keywords_pmi, extract_keywords_second_order_pmi
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
+
 
 def reciprocal_rank_fusion(rankings, k=60):
     scores = defaultdict(float)
@@ -12,6 +14,7 @@ def reciprocal_rank_fusion(rankings, k=60):
         for rank, (doc_id, _) in enumerate(rank_list):
             scores[doc_id] += 1 / (k + rank + 1)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
 
 def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k_r=1000):
     from search import build_qrels_dicts
@@ -56,7 +59,10 @@ def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k
     avg_recalls = {lvl: sum(vals)/len(vals) if vals else 0.0 for lvl, vals in all_recalls.items()}
     return avg_precisions, avg_recalls, num_evaluated
 
+
 def main():
+    expansion_method = "pmi"  # Options: "keybert", "pmi", "second_order_pmi"
+
     top_n_docs = 10
     top_k_keywords = 5
     top_k_results = 1000
@@ -80,15 +86,6 @@ def main():
         query_text = query_item["text"]
         print(f"\n[Query ID: {query_id}] {query_text}")
 
-        seed_keywords = remove_stopwords(query_text)
-        query_embedding = sbert_model.encode(query_text, convert_to_tensor=True)
-        keywords = extract_keywords_keybert_filtered(
-            keybert_model, sbert_model,
-            [corpus_dataset[i]["text"] for i in range(top_n_docs)],
-            seed_keywords, top_k_keywords,
-            query_embedding=query_embedding
-        )
-
         original_results = search_documents(
             query=query_text,
             bm25=bm25,
@@ -108,6 +105,27 @@ def main():
             "query_text": query_text,
             "results": original_results
         })
+
+        top_docs = [corpus_texts[corpus_ids.index(doc_id)] for doc_id, _ in original_results[:top_n_docs]]
+        query_embedding = sbert_model.encode(query_text, convert_to_tensor=True)
+
+        if expansion_method == "keybert":
+            seed_keywords = remove_stopwords(query_text)
+            keywords = extract_keywords_keybert_filtered(
+                keybert_model, sbert_model,
+                top_docs, seed_keywords,
+                top_k=top_k_keywords,
+                query_embedding=query_embedding
+            )
+
+        elif expansion_method == "pmi":
+            keywords = extract_keywords_pmi(query_text, top_docs, top_k=top_k_keywords)
+
+        elif expansion_method == "second_order_pmi":
+            keywords = extract_keywords_second_order_pmi(query_text, top_docs, top_k=top_k_keywords)
+
+        else:
+            raise ValueError(f"Unsupported expansion method: {expansion_method}")
 
         keyword_results = []
         overlap_counter = Counter()
@@ -170,6 +188,7 @@ def main():
     original_ids = set(doc_id for doc_id, _ in original_results[:top_k_results])
     expanded_ids = set(doc_id for doc_id, _ in combined_results[:top_k_results])
     print(f"Recall gain: {len(expanded_ids - original_ids)} new docs added")
+
 
 if __name__ == "__main__":
     main()
