@@ -103,41 +103,37 @@ def mmr_rerank(
 ):
     """
     Perform Maximal Marginal Relevance (MMR) on the top retrieved documents
-    to diversify the results.
+    to diversify the results. Optimized with precomputed pairwise similarities.
     """
-    # Compute cosine similarity (N,)
-    cos_sim = util.cos_sim(query_embedding, doc_embeddings)[0]  # shape = [N]
-    cos_sim = cos_sim.cpu().numpy()
+    # Compute cosine similarity between query and all docs
+    query_sim = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
+
+    # Precompute pairwise similarities between all doc embeddings
+    doc_sims = util.cos_sim(doc_embeddings, doc_embeddings).cpu().numpy()
 
     selected_indices = []
     candidate_indices = list(range(len(doc_ids)))
 
     for _ in range(min(top_k, len(candidate_indices))):
         mmr_scores = []
+
         for idx in candidate_indices:
-            relevance = cos_sim[idx]
-            if len(selected_indices) == 0:
-                diversity = 0
+            relevance = query_sim[idx]
+            if not selected_indices:
+                diversity_penalty = 0
             else:
-                # compute similarity to all chosen docs, take max
-                sim_to_selected = util.cos_sim(
-                    doc_embeddings[idx], 
-                    doc_embeddings[selected_indices]
-                )
-                max_sim_to_selected = torch.max(sim_to_selected).item()
-                diversity = max_sim_to_selected
-            
-            mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity
+                # Max similarity to any selected doc (precomputed)
+                diversity_penalty = max(doc_sims[idx][j] for j in selected_indices)
+
+            mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
             mmr_scores.append((idx, mmr_score))
-        
-        # Sort by MMR score descending
-        mmr_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        best_idx = mmr_scores[0][0]
+
+        # Select doc with highest MMR score
+        best_idx = max(mmr_scores, key=lambda x: x[1])[0]
         selected_indices.append(best_idx)
         candidate_indices.remove(best_idx)
 
-    results = [(doc_ids[idx], cos_sim[idx]) for idx in selected_indices]
+    results = [(doc_ids[idx], query_sim[idx]) for idx in selected_indices]
     return results
 
 # ===============================
@@ -493,23 +489,23 @@ if __name__ == "__main__":
     for level in ['relevant', 'highly_relevant', 'overall']:
         print(f"[Hybrid] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
-    # Evaluate Hybrid with Cross-Encoder
-    # avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
-    #     queries_dataset=queries_dataset,
-    #     qrels_dataset=qrels_dataset,
-    #     bm25=bm25,
-    #     corpus_texts=corpus_texts,
-    #     corpus_ids=corpus_ids,
-    #     sbert_model=sbert_model,
-    #     doc_embeddings=doc_embeddings,
-    #     method="hybrid",  # or "sbert" or "hybrid"
-    #     top_k_p=top_k_p,
-    #     top_k_r=top_k_r,
-    #     use_mmr=False,
-    #     use_cross_encoder=True,
-    #     cross_encoder_model=cross_encoder_model
-    # )
+    # Evaluate Hybrid with MMR
+    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
+        bm25=bm25,
+        corpus_texts=corpus_texts,
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model,
+        doc_embeddings=doc_embeddings,
+        method="hybrid",  # or "sbert" or "hybrid"
+        top_k_p=top_k_p,
+        top_k_r=top_k_r,
+        use_mmr=True,
+        use_cross_encoder=False,
+        cross_encoder_model=cross_encoder_model
+    )
 
-    # print(f"[Hybrid + Re-ranking] Queries Evaluated: {num_evaluated}")
-    # for level in ['relevant', 'highly_relevant', 'overall']:
-    #     print(f"[Hybrid + Re-ranking] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+    print(f"[Hybrid + MMR] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[Hybrid + MMR] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
