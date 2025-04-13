@@ -1,0 +1,183 @@
+query_id,original_query,expanded_query
+1,what is the origin of COVID-19,"where did the coronavirus that causes COVID-19 originate?
+how was the source of SARS-CoV-2 traced back?
+what evidence exists about the origins of the virus causing COVID-19?
+who are the scientists researching the virus's origins?
+what theories exist regarding the virus's source?"
+2,how does the coronavirus respond to changes in the weather,
+3,will SARS-CoV2 infected people develop immunity? Is cross protection possible?,
+4,what causes death from Covid-19?,"factors leading to fatal outcomes from covid
+understanding causes of death related to coronavirus
+exploring reasons for severe outcomes in covid cases
+what are the contributing factors to dying from covid?
+reasons behind fatalities due to covid-19 infections"
+5,what drugs have been active against SARS-CoV or SARS-CoV-2 in animal studies?,"which antiviral agents show promise against SARS-CoV or SARS-CoV-2 in animal models?
+what research suggests potential drug treatments for SARS-CoV or SARS-CoV-2 in animals?
+can you list drugs tested against SARS-CoV or SARS"
+6,what types of rapid testing for Covid-19 have been developed?,
+7,are there serological tests that detect antibodies to coronavirus?,
+8,how has lack of testing availability led to underreporting of true incidence of Covid-19?,
+9,how has COVID-19 affected Canada,
+10,has social distancing had an impact on slowing the spread of COVID-19?,"how has social distancing affected the spread of coronavirus?
+what evidence exists regarding the effectiveness of social distancing in controlling covid-19?
+can you provide data on"
+11,what are the guidelines for triaging patients infected with coronavirus?,
+12,what are best practices in hospitals and at home in maintaining quarantine?,"how should i ensure safety during quarantine?
+what are effective quarantining procedures?
+how can i maintain hygiene while in quarantine?
+what guidelines exist for successful quarantine?
+how do i follow best practices for isolation?"
+13,what are the transmission routes of coronavirus?,
+14,what evidence is there related to COVID-19 super spreaders,"proofs about super spreader events in COVID-19
+signs of widespread transmission among super spreaders
+understanding the dynamics of super spreaders in COVID-19
+examples of super spreaders during the pandemic
+research on identifying super spreaders in COVID-19 scenarios"
+15,how long can the coronavirus live outside the body,"what is the typical survival time of the coronavirus on surfaces?
+how does the lifespan of the coronavirus vary by surface type?
+what factors affect how long the coronavirus remains viable outside a host?
+how long can the coronavirus persist in different environments?
+what conditions allow the coronavirus to survive longer outside the body?"
+16,how long does coronavirus remain stable  on surfaces?,
+17,are there any clinical trials available for the coronavirus,"where to find current coronavirus vaccine trials?
+clinical research opportunities related to the coronavirus
+updates on ongoing studies for coronavirus treatments
+how to participate in coronavirus-related research?
+information on coronavirus clinical trial openings"
+18,what are the best masks for preventing infection by Covid-19?,"what face masks effectively prevent coronavirus?
+best protection masks against covid-19
+highest rated masks to stop infection
+top choices for preventing corona transmission
+effective coverings for protecting from coronavirus"
+19,what type of hand sanitizer is needed to destroy Covid-19?,"how effective are different hand sanitizers against coronavirus?
+which alcohol-based sanitizers kill the novel coronavirus?
+what should i look for in a hand sanitizer to prevent covid?
+can any hand sanitizer effectively eliminate the virus?
+what ingredients ensure a hand sanitizer fights the coronavirus?"
+20,are patients taking Angiotensin-converting enzyme inhibitors (ACE) at increased risk for COVID-19?,"risk factors associated with acei use and covid-19
+impact of taking ace inhibitors on coronavirus risk
+how does acei influence susceptibility to covid-19
+is there a link between ace"
+21,what are the mortality rates overall and in specific populations,"definition of mortality rates and their significance
+importance of analyzing mortality trends across populations
+how to interpret differences in mortality rates
+examples of factors influencing population mortality
+debates surrounding the measurement and reporting of mortality data"
+22,are cardiac complications likely in patients with COVID-19?,"risk of heart issues for those with COVID-19
+likelihood of cardiovascular problems post-COVID
+chances of cardiac events following a COVID infection
+possibility of long-term heart effects from COVID"
+23,what kinds of complications related to COVID-19 are associated with hypertension?,"definition of complications arising from hypertension and co-infection with COVID-19
+importance of managing blood pressure for patients with comorbidities
+how hypertension exacerbates the severity of COVID-19 outcomes
+user insights on managing both conditions simultaneously
+debates surrounding the interaction between hypertension and viral infections"
+24,what kinds of complications related to COVID-19 are associated with diabetes,"understanding diabetes-related complications from COVID-19
+how does diabetes affect outcomes from coronavirus?
+diabetes patients at risk due to COVID-19
+impact of diabetes on severe cases of COVID-19
+what issues arise for diabetics with COVID-19?"
+25,which biomarkers predict the severe clinical course of 2019-nCOV infection?,
+26,what are the initial symptoms of Covid-19?,
+27,what is known about those infected with Covid-19 but are asymptomatic?,"how do asymptomatic coronavirus cases present?
+understanding asymptomatic spread of coronavirus
+signs of coronavirus infection without symptoms
+what to know about asymptomatic carriers of coronavirus?
+information on asympt"
+28,what evidence is there for the value of hydroxychloroquine in treating Covid-19?,"how effective is hydroxychloroquine in managing covid-19?
+research on hydroxychloroquine's role against coronavirus
+what studies show about hydroxychloroquine for covid treatment
+understanding hydro"
+29,which SARS-CoV-2 proteins-human proteins interactions indicate potential for drug targets. Are there approved drugs that can be repurposed based on this information?,"viral protein-host interaction in sars-cov-2
+importance of target interactions for drug discovery
+what are promising sars-cov-2"
+30,is remdesivir an effective treatment for COVID-19,
+31,How does the coronavirus differ from seasonal flu?,"how are the symptoms of coronavirus vs flu?
+what makes the coronavirus unique compared to flu?
+differences between coronavirus and flu viruses
+how do the coronavirus and flu compare?
+why is the coronavirus considered distinct from flu?"
+32,"Does SARS-CoV-2 have any subtypes, and if so what are they?","definition of subtypes in sars-cov-2
+importance of identifying sars-cov-2 variants
+how to track sars-cov-2 mutations and subtypes
+user insights on sars-cov-2"
+33,What vaccine candidates are being tested for Covid-19?,"which vaccines are under development for coronavirus
+what research is happening with new corona vaccines
+vaccine candidates in clinical trials for covid
+updates on experimental vaccines for sars-cov-2
+latest information on vaccine progress for covid-19"
+34,What are the longer-term complications of those who recover from COVID-19?,"overview of long-term effects experienced by recovering patients
+importance of monitoring health after initial recovery
+how to address ongoing symptoms in post-COVID care
+user testimonials on recovery experiences
+debates surrounding the lasting impacts of COVID-19"
+35,What new public datasets are available related to COVID-19?,"sources of recent public data on coronavirus
+where to find current datasets about covid-19
+new government and research datasets related to the pandemic
+updates on publicly accessible information"
+36,What is the protein structure of the SARS-CoV-2 spike?,"definition of the spike protein in sars-cov-2
+importance of the spike protein for viral entry
+how to study protein structures like the spike
+user insights on spike protein research
+debates surrounding the evolution of viral proteins"
+37,What is the result of phylogenetic analysis of SARS-CoV-2 genome sequence?,"how does sars-cov-2's genome inform its evolutionary history?
+what insights arise from analyzing sars-cov-2's genetic makeup?
+what conclusions can be drawn about sars-cov-2's evolutionary"
+38,What is the mechanism of inflammatory response and pathogenesis of COVID-19 cases?,"how does inflammation contribute to covid-19 outcomes
+understanding the role of immune response in covid-19
+what are the key inflammatory processes in coronavirus illness
+mechanisms behind inflammation in covid-19 patients
+how does the"
+39,What is the mechanism of cytokine storm syndrome on the COVID-19?,"how does a cytokine storm affect patients with coronavirus
+role of cytokine storms in severe cases of covid-19
+understanding cytokine responses in coronavirus infections
+impact of cytokine storms on managing coronavirus conditions
+details on the"
+40,What are the observed mutations in the SARS-CoV-2 genome and how often do the mutations occur?,"overview of genetic changes seen in sars-cov-2
+importance of monitoring mutations for vaccine development
+how mutations affect virus transmission and severity
+user insights on sars-cov-2 evolution
+debates surrounding"
+41,What are the impacts of COVID-19 among African-Americans that differ from the rest of the U.S. population?,"how does covid-19 affect african american communities compared to others
+impact analysis of coronavirus on african american populations vs general population
+differences in covid outcomes between african americans and other demographics"
+42,Does Vitamin D impact COVID-19 prevention and treatment?,"how vitamin d influences covid outcomes
+impact of vitamin d on coronavirus management
+role of vitamin d in preventing or treating covid
+effects of vitamin d levels on covid prevention and care
+importance of vitamin d for managing covid-related issues"
+43,"How has the COVID-19 pandemic impacted violence in society, including violent crimes?","how does the pandemic influence societal violence
+impact of coronavirus on crime levels
+effects of the pandemic on violent behavior
+role of economic stressors in increasing violence
+how pandemic-related factors contribute to violence"
+44,How much impact do masks have on preventing the spread of the COVID-19?,"what role do face coverings play in stopping the spread of coronavirus?
+how effective are masks at preventing the transmission of COVID-19?
+what evidence supports the use of masks in reducing virus spread?
+how should masks be used to effectively prevent the"
+45,How has the COVID-19 pandemic impacted mental health?,"overview of how the pandemic affects mental health
+importance of addressing mental health during crises
+user experiences with pandemic-related stress
+how to support mental health initiatives post-pandemic
+debates surrounding long-term mental health impacts"
+46,what evidence is there for dexamethasone as a treatment for COVID-19?,"how does dexamethasone help in treating covid-19?
+what studies support the use of dexamethasone for coronavirus patients?
+can you explain the research on dexamethasone for covid care?
+what are"
+47,what are the health outcomes for children who contract COVID-19?,"definition of long-term effects of pediatric COVID-19
+importance of monitoring children with COVID-19
+how to manage complications in child patients
+user insights on children's recovery from coronavirus
+debates surrounding the impact of COVID-1"
+48,what are the benefits and risks of re-opening schools in the midst of the COVID-19 pandemic?,"how to safely reopen educational institutions during a pandemic
+importance of school reopening plans amid coronavirus
+what factors influence decisions on school reopening
+how does the risk of transmission affect school openings
+debates surrounding the health implications of reopening"
+49,"do individuals who recover from COVID-19 show sufficient immune response, including antibody levels and T-cell mediated immunity, to prevent re-infection?","how do recovered individuals' immune systems protect against future infections?
+what evidence exists regarding lasting immunity after recovering from COVID-19?
+can previous infection with COVID-19 confer long-term"
+50,what is known about an mRNA vaccine for the SARS-CoV-2 virus?,"overview of mRNA vaccines against sars-cov-2
+importance of mRNAs in developing vaccines
+how mRNA vaccines work to prevent sars-cov-2
+user testimonials on sars-cov-2 mRN"
