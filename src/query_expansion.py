@@ -61,7 +61,7 @@ def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k
 
 
 def main():
-    expansion_method = "pmi"  # Options: "keybert", "pmi", "second_order_pmi"
+    expansion_method = "keybert"  # Options: "keybert", "pmi", "second_order_pmi"
 
     top_n_docs = 10
     top_k_keywords = 5
@@ -80,12 +80,14 @@ def main():
     keybert_model = KeyBERT(model=sbert_model)
     all_query_results_rrf = []
     all_query_results_original = []
+    all_query_results_concatenated = []
 
     for query_item in queries_dataset:
         query_id = int(query_item["_id"])
         query_text = query_item["text"]
         print(f"\n[Query ID: {query_id}] {query_text}")
 
+        # --- Original Search ---
         original_results = search_documents(
             query=query_text,
             bm25=bm25,
@@ -127,6 +129,7 @@ def main():
         else:
             raise ValueError(f"Unsupported expansion method: {expansion_method}")
 
+        # --- RRF-based Expansion ---
         keyword_results = []
         overlap_counter = Counter()
 
@@ -162,6 +165,31 @@ def main():
             "results": combined_results
         })
 
+        # --- Concatenated Expansion ---
+        expanded_query_text = query_text + " " + " ".join(keywords)
+        print(f"[Expanded Query Text] {expanded_query_text}")
+
+        expanded_results = search_documents(
+            query=expanded_query_text,
+            bm25=bm25,
+            corpus_texts=corpus_texts,
+            corpus_ids=corpus_ids,
+            sbert_model=sbert_model,
+            doc_embeddings=doc_embeddings,
+            top_k=top_k_results,
+            method="hybrid",
+            use_mmr=False,
+            use_cross_encoder=True,
+            cross_encoder_model=cross_encoder_model,
+        )
+
+        all_query_results_concatenated.append({
+            "query_id": query_id,
+            "query_text": expanded_query_text,
+            "results": expanded_results
+        })
+
+    # --- Evaluation ---
     print("\n[Evaluating Original Query Only Results]")
     avg_precisions, avg_recalls, num_evaluated = evaluate_precomputed_results(
         query_results=all_query_results_original,
@@ -180,14 +208,28 @@ def main():
         top_k_p=20,
         top_k_r=1000,
     )
-
     print(f"[Query Expansion + RRF] Queries Evaluated: {num_evaluated}")
     for level in ['relevant', 'highly_relevant', 'overall']:
         print(f"[Query Expansion + RRF] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
+    print("\n[Evaluating Concatenated Expanded Query Results]")
+    avg_precisions, avg_recalls, num_evaluated = evaluate_precomputed_results(
+        query_results=all_query_results_concatenated,
+        qrels_dataset=qrels_dataset,
+        top_k_p=20,
+        top_k_r=1000,
+    )
+    print(f"[Concatenated Expansion] Queries Evaluated: {num_evaluated}")
+    for level in ['relevant', 'highly_relevant', 'overall']:
+        print(f"[Concatenated Expansion] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+
+    # --- Recall Gain Comparison ---
     original_ids = set(doc_id for doc_id, _ in original_results[:top_k_results])
     expanded_ids = set(doc_id for doc_id, _ in combined_results[:top_k_results])
-    print(f"Recall gain: {len(expanded_ids - original_ids)} new docs added")
+    concat_ids = set(doc_id for doc_id, _ in expanded_results[:top_k_results])
+
+    print(f"\nRecall gain from RRF Expansion: {len(expanded_ids - original_ids)} new docs added")
+    print(f"Recall gain from Concatenated Expansion: {len(concat_ids - original_ids)} new docs added")
 
 
 if __name__ == "__main__":
