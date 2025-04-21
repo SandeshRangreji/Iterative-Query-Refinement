@@ -16,6 +16,28 @@ def reciprocal_rank_fusion(rankings, k=60):
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
+def deduplicate_query_and_keywords(query_text, keywords):
+    seen = set()
+    all_tokens = []
+
+    # Add original query words first
+    for word in query_text.strip().split():
+        word_lower = word.lower()
+        if word_lower not in seen:
+            all_tokens.append(word)
+            seen.add(word_lower)
+
+    # Add words from keyword phrases
+    for phrase in keywords:
+        for word in phrase.strip().split():
+            word_lower = word.lower()
+            if word_lower not in seen:
+                all_tokens.append(word)
+                seen.add(word_lower)
+
+    return " ".join(all_tokens)
+
+
 def evaluate_precomputed_results(query_results, qrels_dataset, top_k_p=20, top_k_r=1000):
     from search import build_qrels_dicts
 
@@ -166,7 +188,7 @@ def main():
         })
 
         # --- Concatenated Expansion ---
-        expanded_query_text = query_text + " " + " ".join(keywords)
+        expanded_query_text = deduplicate_query_and_keywords(query_text, keywords)
         print(f"[Expanded Query Text] {expanded_query_text}")
 
         expanded_results = search_documents(

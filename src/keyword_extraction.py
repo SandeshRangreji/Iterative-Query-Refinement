@@ -107,26 +107,27 @@ def main():
             doc_embeddings=doc_embeddings,
             top_k=500,
             method="hybrid",
-            use_mmr=False,
+            use_mmr=True,
+            mmr_lambda=0.7,
             use_cross_encoder=False,
             cross_encoder_model=cross_encoder_model,
         )
-        results2 = search_documents(
-            query=query_text,
-            bm25=bm25,
-            corpus_texts=corpus_texts,
-            corpus_ids=corpus_ids,
-            sbert_model=sbert_model,
-            doc_embeddings=doc_embeddings,
-            top_k=500,
-            method="hybrid",
-            use_mmr=False,
-            use_cross_encoder=True,
-            cross_encoder_model=cross_encoder_model,
-        )
+        # results2 = search_documents(
+        #     query=query_text,
+        #     bm25=bm25,
+        #     corpus_texts=corpus_texts,
+        #     corpus_ids=corpus_ids,
+        #     sbert_model=sbert_model,
+        #     doc_embeddings=doc_embeddings,
+        #     top_k=500,
+        #     method="hybrid",
+        #     use_mmr=False,
+        #     use_cross_encoder=True,
+        #     cross_encoder_model=cross_encoder_model,
+        # )
 
         top_docs = [corpus_texts[corpus_ids.index(doc_id)] for doc_id, _ in results][:top_n_docs]
-        top_docs2 = [corpus_texts[corpus_ids.index(doc_id)] for doc_id, _ in results2][:top_n_docs]
+        # top_docs2 = [corpus_texts[corpus_ids.index(doc_id)] for doc_id, _ in results2][:top_n_docs]
 
         if keyword_method == "rake":
             keywords = extract_keywords_rake(top_docs, top_k_keywords)
@@ -138,16 +139,16 @@ def main():
             print(f"[Seed]: {seed_keywords}")
             query_embedding = sbert_model.encode(query_text, convert_to_tensor=True)
             keywords = extract_keywords_keybert_filtered(keybert_model, sbert_model, top_docs, seed_keywords, top_k_keywords, query_embedding=query_embedding)
-            keywords2 = extract_keywords_keybert_filtered(keybert_model, sbert_model, top_docs2, seed_keywords, top_k_keywords, query_embedding=query_embedding)
+            # keywords2 = extract_keywords_keybert_filtered(keybert_model, sbert_model, top_docs2, seed_keywords, top_k_keywords, query_embedding=query_embedding)
         else:
             raise ValueError("Invalid keyword method.")
 
         print("Top Keywords:")
         for kw in keywords:
             print("-", kw)
-        print("Top Keywords - Cross Encoder Re-ranking:")
-        for kw in keywords2:
-            print("-", kw)
+        # print("Top Keywords - Cross Encoder Re-ranking:")
+        # for kw in keywords2:
+        #     print("-", kw)
 
 
 if __name__ == "__main__":
