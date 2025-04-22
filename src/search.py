@@ -957,8 +957,8 @@ def main():
     
     for result in results:
         config_name = result["config"]["name"]
-        precision = result["avg_precisions"]["overall"]
-        recall = result["avg_recalls"]["overall"]
+        precision = result["avg_precisions"]["highly_relevant"]
+        recall = result["avg_recalls"]["highly_relevant"]
         logger.info(f"{config_name:<30} {precision:.4f}     {recall:.4f}")
     
     return results
