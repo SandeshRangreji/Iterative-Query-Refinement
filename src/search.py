@@ -1,511 +1,962 @@
-from collections import defaultdict
+# search.py
 import os
 import pickle
-import random
 import re
+import logging
 import numpy as np
 import torch
 from rank_bm25 import BM25Okapi
-from datasets import load_dataset
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
+from typing import List, Tuple, Dict, Set, Union, Optional
+import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
-import nltk
-nltk.download('stopwords')
-from sentence_transformers import CrossEncoder
+from collections import defaultdict
+from enum import Enum
 
-stop_words = set(stopwords.words('english'))
-stemmer = PorterStemmer()
-# Initialize the cross-encoder model
-cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2', device="mps")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# ===============================
-# 0) TEXT NORMALIZATION FUNCTION
-# ===============================
-def preprocess_text(text):
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    tokens = text.split()
-    filtered = [stemmer.stem(w) for w in tokens if w not in stop_words]
-    return filtered
+# Download NLTK resources if not already downloaded
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    logger.info("Downloading NLTK stopwords...")
+    nltk.download('stopwords', quiet=True)
 
-# ===============================
-# 1) BUILD BM25 INDEX (with caching)
-# ===============================
-def build_bm25_index(
-    corpus_dataset,
-    cache_path="bm25_index.pkl",
-    force_reindex=False
-):
-    if (not force_reindex) and os.path.exists(cache_path):
-        print(f"[BM25] Loading BM25 index from cache: {cache_path}")
-        with open(cache_path, "rb") as f:
-            bm25, corpus_texts, corpus_ids = pickle.load(f)
+# Constants and enums
+class RetrievalMethod(str, Enum):
+    BM25 = "bm25"
+    SBERT = "sbert"
+    HYBRID = "hybrid"
+
+class HybridStrategy(str, Enum):
+    SIMPLE_SUM = "simple_sum"
+    RRF = "rrf"  # Reciprocal Rank Fusion
+    WEIGHTED = "weighted"
+
+class TextPreprocessor:
+    """Class for text preprocessing and normalization operations"""
+    
+    def __init__(self):
+        self.stop_words = set(stopwords.words('english'))
+        self.stemmer = PorterStemmer()
+    
+    def preprocess_text(self, text: str) -> List[str]:
+        """
+        Preprocess text by lowercasing, removing punctuation,
+        and stemming non-stopwords.
+        
+        Args:
+            text: The input text to preprocess
+            
+        Returns:
+            List of preprocessed tokens
+        """
+        text = text.lower()
+        text = re.sub(r"[^\w\s]", "", text)
+        tokens = text.split()
+        filtered = [self.stemmer.stem(w) for w in tokens if w not in self.stop_words]
+        return filtered
+
+class IndexManager:
+    """Class for managing and building search indices"""
+    
+    def __init__(self, preprocessor: TextPreprocessor):
+        self.preprocessor = preprocessor
+    
+    def build_bm25_index(
+        self,
+        corpus_dataset,
+        cache_path: str = "bm25_index.pkl",
+        force_reindex: bool = False
+    ) -> Tuple[BM25Okapi, List[str], List[str]]:
+        """
+        Build or load a BM25 index for the corpus
+        
+        Args:
+            corpus_dataset: Dataset containing corpus documents
+            cache_path: Path to cache the built index
+            force_reindex: Whether to force rebuilding the index
+            
+        Returns:
+            Tuple of (BM25 index, corpus texts, corpus ids)
+        """
+        if (not force_reindex) and os.path.exists(cache_path):
+            logger.info(f"Loading BM25 index from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                bm25, corpus_texts, corpus_ids = pickle.load(f)
+            return bm25, corpus_texts, corpus_ids
+
+        logger.info("Building BM25 index from scratch...")
+        corpus_texts = []
+        corpus_ids = []
+        
+        for doc in corpus_dataset:
+            corpus_texts.append(doc["title"] + "\n\n" + doc["text"])
+            corpus_ids.append(doc["_id"])
+
+        tokenized_corpus = [self.preprocessor.preprocess_text(text) for text in corpus_texts]
+        # Allow for parameter tuning - b=0.5 has been found to work well for longer texts
+        bm25 = BM25Okapi(tokenized_corpus, b=0.5)  
+
+        logger.info(f"Saving BM25 index to cache: {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump((bm25, corpus_texts, corpus_ids), f)
+
         return bm25, corpus_texts, corpus_ids
+    
+    def build_sbert_index(
+        self,
+        corpus_texts: List[str],
+        model_name: str = "sentence-transformers/msmarco-MiniLM-L6-cos-v5",
+        batch_size: int = 64,
+        cache_path: str = "sbert_index.pt",
+        force_reindex: bool = False,
+        device: str = None
+    ) -> Tuple[SentenceTransformer, torch.Tensor]:
+        """
+        Build or load SBERT embeddings for the corpus
+        
+        Args:
+            corpus_texts: List of document texts
+            model_name: Name of the sentence transformer model
+            batch_size: Batch size for encoding
+            cache_path: Path to cache the embeddings
+            force_reindex: Whether to force recomputing embeddings
+            device: Device to use for encoding (None for auto-selection)
+            
+        Returns:
+            Tuple of (SBERT model, document embeddings tensor)
+        """
+        # Select device based on availability
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        
+        logger.info(f"Initializing SBERT model on {device}...")
+        model = SentenceTransformer(model_name, device=device)
 
-    print("[BM25] Building index from scratch...")
-    corpus_texts = []
-    corpus_ids = []
-    for doc in corpus_dataset:
-        corpus_texts.append(doc["title"] + "/n/n" + doc["text"])
-        corpus_ids.append(doc["_id"])
+        if (not force_reindex) and os.path.exists(cache_path):
+            logger.info(f"Loading SBERT embeddings from cache: {cache_path}")
+            data = torch.load(cache_path, map_location=device)
+            doc_embeddings = data["doc_embeddings"]
+            return model, doc_embeddings
 
-    tokenized_corpus = [preprocess_text(text) for text in corpus_texts]
-    bm25 = BM25Okapi(tokenized_corpus, b=0.5) # Defaults: k1=1.5, b=0.75, epsilon=0.25
+        logger.info(f"Encoding corpus from scratch with batch size {batch_size}...")
+        doc_embeddings = model.encode(
+            corpus_texts, 
+            batch_size=batch_size, 
+            convert_to_tensor=True,
+            show_progress_bar=True
+        )
+        
+        # Ensure embeddings are on CPU for storage
+        doc_embeddings = doc_embeddings.cpu().contiguous()
 
-    print(f"[BM25] Saving BM25 index to cache: {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump((bm25, corpus_texts, corpus_ids), f)
+        logger.info(f"Saving SBERT embeddings to cache: {cache_path}")
+        torch.save({"doc_embeddings": doc_embeddings}, cache_path)
 
-    return bm25, corpus_texts, corpus_ids
-
-# ===============================
-# 2) BUILD SBERT INDEX (with caching)
-# ===============================
-def build_sbert_index(
-    corpus_texts,
-    model_name="sentence-transformers/msmarco-MiniLM-L6-cos-v5",
-    batch_size=64,
-    cache_path="sbert_index.pt",
-    force_reindex=False
-):
-    print("[SBERT] Initializing model...")
-    model = SentenceTransformer(model_name, device='cpu')
-
-    if (not force_reindex) and os.path.exists(cache_path):
-        print(f"[SBERT] Loading SBERT embeddings from cache: {cache_path}")
-        data = torch.load(cache_path)
-        doc_embeddings = data["doc_embeddings"]
         return model, doc_embeddings
 
-    print("[SBERT] Encoding corpus from scratch...")
-    doc_embeddings = model.encode(
-        corpus_texts, 
-        batch_size=batch_size, 
-        convert_to_tensor=True
-    )
-    doc_embeddings = doc_embeddings.cpu().contiguous()
-
-    print(f"[SBERT] Saving SBERT embeddings to cache: {cache_path}")
-    torch.save({"doc_embeddings": doc_embeddings}, cache_path)
-
-    return model, doc_embeddings
-
-# ===============================
-# 3) MMR RERANKING
-# ===============================
-def mmr_rerank(
-    query_embedding, 
-    doc_embeddings, 
-    doc_ids, 
-    top_k=10, 
-    lambda_param=0.5
-):
-    """
-    Perform Maximal Marginal Relevance (MMR) on the top retrieved documents
-    to diversify the results. Optimized with precomputed pairwise similarities.
-    """
-    # Compute cosine similarity between query and all docs
-    query_sim = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
-
-    # Precompute pairwise similarities between all doc embeddings
-    doc_sims = util.cos_sim(doc_embeddings, doc_embeddings).cpu().numpy()
-
-    selected_indices = []
-    candidate_indices = list(range(len(doc_ids)))
-
-    for _ in range(min(top_k, len(candidate_indices))):
-        mmr_scores = []
-
-        for idx in candidate_indices:
-            relevance = query_sim[idx]
-            if not selected_indices:
-                diversity_penalty = 0
-            else:
-                # Max similarity to any selected doc (precomputed)
-                diversity_penalty = max(doc_sims[idx][j] for j in selected_indices)
-
-            mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
-            mmr_scores.append((idx, mmr_score))
-
-        # Select doc with highest MMR score
-        best_idx = max(mmr_scores, key=lambda x: x[1])[0]
-        selected_indices.append(best_idx)
-        candidate_indices.remove(best_idx)
-
-    results = [(doc_ids[idx], query_sim[idx]) for idx in selected_indices]
-    return results
-
-# ===============================
-# 4) SEARCH FUNCTION
-# ===============================
-def search_documents(
-    query,
-    bm25,
-    corpus_texts,
-    corpus_ids,
-    sbert_model=None,
-    doc_embeddings=None,
-    top_k=10,
-    method="bm25",
-    use_mmr=False,
-    mmr_lambda=0.5,
-    use_cross_encoder=False,
-    cross_encoder_model=None
-):
-    """
-    Main search function that supports:
-      - BM25-based search
-      - SBERT-based semantic search
-      - Hybrid search
-      - Optional MMR
-    """
-    results = []
-
-    # =========== BM25 =============
-    if method.lower() == "bm25":
-        tokenized_query = preprocess_text(query)
-        scores = bm25.get_scores(tokenized_query)
-        # Sort by BM25 descending
-        sorted_indices = np.argsort(scores)[::-1][:top_k]
-        for idx in sorted_indices:
-            results.append((corpus_ids[idx], scores[idx]))
+class SearchEngine:
+    """Main search engine implementing multiple retrieval methods"""
+    
+    def __init__(
+        self, 
+        preprocessor: TextPreprocessor,
+        cross_encoder_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+        device: str = None
+    ):
+        self.preprocessor = preprocessor
         
-        if use_mmr and sbert_model is not None and doc_embeddings is not None:
-            # MMR re-rank the top candidate docs
-            candidate_indices = sorted_indices.tolist()
-            candidate_embeddings = doc_embeddings[candidate_indices]  # Torch indexing
-            query_embedding = sbert_model.encode(query, convert_to_tensor=True)
-            doc_id_subset = [corpus_ids[i] for i in candidate_indices]
-            mmr_results = mmr_rerank(
-                query_embedding, 
-                candidate_embeddings, 
-                doc_id_subset, 
-                top_k=top_k, 
-                lambda_param=mmr_lambda
-            )
-            return mmr_results
+        # Select device based on availability if not specified
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
         else:
-            return results
-
-    # =========== SBERT =============
-    elif method.lower() == "sbert":
-        if not sbert_model or doc_embeddings is None:
-            raise ValueError("SBERT model and doc_embeddings are required for method='sbert'")
-
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True).cpu()
-        cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
-        sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
-        for idx in sorted_indices:
-            results.append((corpus_ids[idx], cos_scores[idx]))
-
-        if use_mmr:
+            self.device = device
+            
+        # Initialize cross-encoder if model name provided
+        if cross_encoder_model_name:
+            logger.info(f"Initializing cross-encoder model on {self.device}...")
+            self.cross_encoder = CrossEncoder(cross_encoder_model_name, device=self.device)
+        else:
+            self.cross_encoder = None
+    
+    def search(
+        self,
+        query: str,
+        bm25: Optional[BM25Okapi],
+        corpus_texts: List[str],
+        corpus_ids: List[str],
+        sbert_model: Optional[SentenceTransformer] = None,
+        doc_embeddings: Optional[torch.Tensor] = None,
+        top_k: int = 10,
+        method: RetrievalMethod = RetrievalMethod.BM25,
+        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+        hybrid_weight: float = 0.5,  # Weight for BM25 vs SBERT in weighted hybrid
+        use_mmr: bool = False,
+        mmr_lambda: float = 0.5,
+        use_cross_encoder: bool = False
+    ) -> List[Tuple[str, float]]:
+        """
+        Main search function supporting multiple retrieval methods
+        
+        Args:
+            query: Search query
+            bm25: BM25 index
+            corpus_texts: List of document texts
+            corpus_ids: List of document IDs
+            sbert_model: SentenceTransformer model
+            doc_embeddings: Document embeddings tensor
+            top_k: Number of results to return
+            method: Retrieval method (bm25, sbert, or hybrid)
+            hybrid_strategy: Strategy for combining BM25 and SBERT results
+            hybrid_weight: Weight for BM25 vs SBERT in weighted hybrid (0-1)
+            use_mmr: Whether to use Maximal Marginal Relevance
+            mmr_lambda: Lambda parameter for MMR (higher values favor relevance)
+            use_cross_encoder: Whether to use cross-encoder for reranking
+            
+        Returns:
+            List of tuples (document_id, score)
+        """
+        # Validate inputs based on method
+        if method == RetrievalMethod.BM25 and bm25 is None:
+            raise ValueError("BM25 index is required for method='bm25'")
+        
+        if (method == RetrievalMethod.SBERT or method == RetrievalMethod.HYBRID) and (sbert_model is None or doc_embeddings is None):
+            raise ValueError(f"SBERT model and embeddings are required for method='{method}'")
+            
+        if use_cross_encoder and self.cross_encoder is None:
+            raise ValueError("Cross-encoder was not initialized but use_cross_encoder=True")
+        
+        # Handle different retrieval methods
+        if method == RetrievalMethod.BM25:
+            return self._bm25_search(
+                query, bm25, corpus_texts, corpus_ids, 
+                sbert_model, doc_embeddings, top_k, 
+                use_mmr, mmr_lambda
+            )
+        
+        elif method == RetrievalMethod.SBERT:
+            return self._sbert_search(
+                query, corpus_texts, corpus_ids, 
+                sbert_model, doc_embeddings, top_k, 
+                use_mmr, mmr_lambda
+            )
+        
+        elif method == RetrievalMethod.HYBRID:
+            return self._hybrid_search(
+                query, bm25, corpus_texts, corpus_ids,
+                sbert_model, doc_embeddings, top_k,
+                hybrid_strategy, hybrid_weight,
+                use_mmr, mmr_lambda, use_cross_encoder
+            )
+        
+        else:
+            raise ValueError(f"Unknown retrieval method: {method}")
+    
+    def _bm25_search(
+        self,
+        query: str,
+        bm25: BM25Okapi,
+        corpus_texts: List[str],
+        corpus_ids: List[str],
+        sbert_model: Optional[SentenceTransformer], 
+        doc_embeddings: Optional[torch.Tensor],
+        top_k: int,
+        use_mmr: bool,
+        mmr_lambda: float
+    ) -> List[Tuple[str, float]]:
+        """BM25 search implementation"""
+        tokenized_query = self.preprocessor.preprocess_text(query)
+        scores = bm25.get_scores(tokenized_query)
+        
+        # Sort by BM25 score (descending)
+        sorted_indices = np.argsort(scores)[::-1][:top_k]
+        results = [(corpus_ids[idx], scores[idx]) for idx in sorted_indices]
+        
+        # Apply MMR if requested and SBERT is available
+        if use_mmr and sbert_model is not None and doc_embeddings is not None:
+            logger.info("Applying MMR reranking to BM25 results...")
+            query_embedding = sbert_model.encode(query, convert_to_tensor=True)
             candidate_indices = sorted_indices.tolist()
             candidate_embeddings = doc_embeddings[candidate_indices]
-            mmr_results = mmr_rerank(
-                query_embedding, 
+            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            
+            results = self._mmr_rerank(
+                query_embedding,
                 candidate_embeddings,
-                [corpus_ids[i] for i in candidate_indices],
+                candidate_ids,
+                [scores[i] for i in candidate_indices],
                 top_k=top_k,
                 lambda_param=mmr_lambda
             )
-            return mmr_results
-        else:
-            return results
-
-    # =========== HYBRID =============
-    elif method.lower() == "hybrid":
-        if not sbert_model or doc_embeddings is None:
-            raise ValueError("SBERT model and doc_embeddings are required for method='hybrid'")
         
-        # 1) BM25 top_k
-        tokenized_query = preprocess_text(query)
+        return results
+    
+    def _sbert_search(
+        self,
+        query: str,
+        corpus_texts: List[str],
+        corpus_ids: List[str],
+        sbert_model: SentenceTransformer,
+        doc_embeddings: torch.Tensor,
+        top_k: int,
+        use_mmr: bool,
+        mmr_lambda: float
+    ) -> List[Tuple[str, float]]:
+        """SBERT semantic search implementation"""
+        query_embedding = sbert_model.encode(query, convert_to_tensor=True)
+        cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
+        
+        # Sort by cosine similarity (descending)
+        sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
+        results = [(corpus_ids[idx], cos_scores[idx]) for idx in sorted_indices]
+        
+        # Apply MMR if requested
+        if use_mmr:
+            logger.info("Applying MMR reranking to SBERT results...")
+            candidate_indices = sorted_indices.tolist()
+            candidate_embeddings = doc_embeddings[candidate_indices]
+            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            
+            results = self._mmr_rerank(
+                query_embedding,
+                candidate_embeddings,
+                candidate_ids,
+                [cos_scores[i] for i in candidate_indices],
+                top_k=top_k,
+                lambda_param=mmr_lambda
+            )
+        
+        return results
+    
+    def _hybrid_search(
+        self,
+        query: str,
+        bm25: BM25Okapi,
+        corpus_texts: List[str],
+        corpus_ids: List[str],
+        sbert_model: SentenceTransformer,
+        doc_embeddings: torch.Tensor,
+        top_k: int,
+        hybrid_strategy: HybridStrategy,
+        hybrid_weight: float,
+        use_mmr: bool,
+        mmr_lambda: float,
+        use_cross_encoder: bool
+    ) -> List[Tuple[str, float]]:
+        """Hybrid search combining BM25 and SBERT results"""
+        # Get BM25 scores
+        tokenized_query = self.preprocessor.preprocess_text(query)
         bm25_scores = bm25.get_scores(tokenized_query)
         bm25_sorted_indices = np.argsort(bm25_scores)[::-1][:top_k]
         
-        # 2) SBERT top_k
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True).cpu()
+        # Get SBERT scores
+        query_embedding = sbert_model.encode(query, convert_to_tensor=True)
         cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
         sbert_sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
-
-        # Combine sets
-        combined_indices = list(set(bm25_sorted_indices) | set(sbert_sorted_indices))
-        bm25_max = max(bm25_scores[combined_indices]) if len(combined_indices) > 0 else 1e-9
-        cos_max = max(cos_scores[combined_indices]) if len(combined_indices) > 0 else 1e-9
-
-        doc_final_scores = {}
-        for idx in combined_indices:
-            # normalize BM25
-            bm25_score = bm25_scores[idx] / (bm25_max + 1e-9)
-            # normalize cos
-            cos_score = cos_scores[idx] / (cos_max + 1e-9)
-            # simple sum
-            final_score = bm25_score + cos_score
-            doc_final_scores[idx] = final_score
-
-        # sort combined by final_score
+        
+        # Apply hybrid strategy
+        if hybrid_strategy == HybridStrategy.SIMPLE_SUM:
+            # Combine sets of top-k from both methods
+            combined_indices = list(set(bm25_sorted_indices) | set(sbert_sorted_indices))
+            
+            # Normalize scores
+            bm25_max = max(bm25_scores[combined_indices]) if combined_indices else 1e-9
+            cos_max = max(cos_scores[combined_indices]) if combined_indices else 1e-9
+            
+            doc_final_scores = {}
+            for idx in combined_indices:
+                # Normalize scores
+                bm25_score = bm25_scores[idx] / (bm25_max + 1e-9)
+                cos_score = cos_scores[idx] / (cos_max + 1e-9)
+                # Simple sum of normalized scores
+                final_score = bm25_score + cos_score
+                doc_final_scores[idx] = final_score
+            
+        elif hybrid_strategy == HybridStrategy.WEIGHTED:
+            # Combine sets of top-k from both methods
+            combined_indices = list(set(bm25_sorted_indices) | set(sbert_sorted_indices))
+            
+            # Normalize scores
+            bm25_max = max(bm25_scores[combined_indices]) if combined_indices else 1e-9
+            cos_max = max(cos_scores[combined_indices]) if combined_indices else 1e-9
+            
+            doc_final_scores = {}
+            for idx in combined_indices:
+                # Normalize scores
+                bm25_score = bm25_scores[idx] / (bm25_max + 1e-9)
+                cos_score = cos_scores[idx] / (cos_max + 1e-9)
+                # Weighted combination
+                final_score = hybrid_weight * bm25_score + (1 - hybrid_weight) * cos_score
+                doc_final_scores[idx] = final_score
+        
+        elif hybrid_strategy == HybridStrategy.RRF:
+            # Reciprocal Rank Fusion
+            # Get ranks from both methods
+            bm25_ranks = {idx: rank + 1 for rank, idx in enumerate(bm25_sorted_indices)}
+            sbert_ranks = {idx: rank + 1 for rank, idx in enumerate(sbert_sorted_indices)}
+            
+            # Combine sets
+            combined_indices = list(set(bm25_sorted_indices) | set(sbert_sorted_indices))
+            
+            # RRF constant (typically 60)
+            k = 60
+            
+            doc_final_scores = {}
+            for idx in combined_indices:
+                # Get ranks (default to a large value if not in top-k)
+                bm25_rank = bm25_ranks.get(idx, len(corpus_ids) + 1)
+                sbert_rank = sbert_ranks.get(idx, len(corpus_ids) + 1)
+                
+                # RRF score = sum of 1/(rank + k) for each method
+                rrf_score = 1/(bm25_rank + k) + 1/(sbert_rank + k)
+                doc_final_scores[idx] = rrf_score
+        
+        else:
+            raise ValueError(f"Unknown hybrid strategy: {hybrid_strategy}")
+            
+        # Sort by final score
         sorted_indices = sorted(
             doc_final_scores.keys(), 
             key=lambda x: doc_final_scores[x], 
             reverse=True
         )[:top_k]
-
+        
         results = [(corpus_ids[i], doc_final_scores[i]) for i in sorted_indices]
-
+        
+        # Apply MMR if requested
         if use_mmr:
+            logger.info("Applying MMR reranking to hybrid results...")
             candidate_indices = list(sorted_indices)
             candidate_embeddings = doc_embeddings[candidate_indices]
-            results = mmr_rerank(
+            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            candidate_scores = [doc_final_scores[i] for i in candidate_indices]
+            
+            results = self._mmr_rerank(
                 query_embedding, 
                 candidate_embeddings,
-                [corpus_ids[i] for i in candidate_indices],
+                candidate_ids,
+                candidate_scores,
                 top_k=top_k,
                 lambda_param=mmr_lambda
             )
         
-        # Apply Cross-Encoder re-ranking if specified
-        if use_cross_encoder and cross_encoder_model:
-            query_doc_pairs = [(query, corpus_texts[corpus_ids.index(doc_id)]) for doc_id, _ in results]
-            rerank_scores = cross_encoder_model.predict(query_doc_pairs)
-            doc_ids_only = [doc_id for doc_id, _ in results]
-            results = [(doc_id, score) for doc_id, score in zip(doc_ids_only, rerank_scores)]
+        # Apply Cross-Encoder re-ranking if requested
+        if use_cross_encoder and self.cross_encoder:
+            logger.info("Applying Cross-Encoder reranking...")
+            doc_ids = [doc_id for doc_id, _ in results]
+            
+            # Create pairs of (query, document) for cross-encoder
+            query_doc_pairs = []
+            for doc_id in doc_ids:
+                # Find the document text for this ID
+                doc_idx = corpus_ids.index(doc_id)
+                query_doc_pairs.append((query, corpus_texts[doc_idx]))
+            
+            # Get cross-encoder scores
+            ce_scores = self.cross_encoder.predict(query_doc_pairs)
+            
+            # Create new results with cross-encoder scores
+            results = [(doc_id, score) for doc_id, score in zip(doc_ids, ce_scores)]
+            
+            # Sort by cross-encoder score
             results.sort(key=lambda x: x[1], reverse=True)
-
+        
         return results
+    
+    def _mmr_rerank(
+        self,
+        query_embedding: torch.Tensor,
+        doc_embeddings: torch.Tensor,
+        doc_ids: List[str],
+        scores: List[float],
+        top_k: int = 10,
+        lambda_param: float = 0.5
+    ) -> List[Tuple[str, float]]:
+        """
+        Perform Maximal Marginal Relevance (MMR) reranking to diversify results.
+        
+        Args:
+            query_embedding: Query embedding tensor
+            doc_embeddings: Document embeddings tensor
+            doc_ids: List of document IDs corresponding to doc_embeddings
+            scores: List of initial relevance scores
+            top_k: Number of results to return
+            lambda_param: MMR lambda parameter (0-1), higher values favor relevance
+            
+        Returns:
+            List of tuples (document_id, score)
+        """
+        # Ensure we have valid data
+        if len(doc_ids) == 0:
+            return []
+        
+        # Move to same device as query_embedding
+        device = query_embedding.device
+        if doc_embeddings.device != device:
+            doc_embeddings = doc_embeddings.to(device)
+        
+        # Compute similarity between query and docs
+        query_sim = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
+        
+        # Precompute pairwise similarities between docs
+        doc_sims = util.cos_sim(doc_embeddings, doc_embeddings).cpu().numpy()
+        
+        # MMR selection
+        selected_indices = []
+        remaining_indices = list(range(len(doc_ids)))
+        
+        for _ in range(min(top_k, len(doc_ids))):
+            if not remaining_indices:
+                break
+                
+            mmr_scores = []
+            
+            for i, idx in enumerate(remaining_indices):
+                # If we have no selected docs yet, MMR score is just relevance
+                if not selected_indices:
+                    mmr_scores.append((idx, query_sim[idx]))
+                    continue
+                
+                # Compute relevance and diversity components
+                relevance = query_sim[idx]
+                
+                # Find max similarity to any selected document
+                diversity_penalty = max(doc_sims[idx][j] for j in selected_indices)
+                
+                # Compute MMR score
+                mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
+                mmr_scores.append((idx, mmr_score))
+            
+            # Select document with highest MMR score
+            best_idx, _ = max(mmr_scores, key=lambda x: x[1])
+            
+            selected_indices.append(best_idx)
+            remaining_indices.remove(best_idx)
+        
+        # Return selected documents with their original scores
+        return [(doc_ids[idx], scores[idx]) for idx in selected_indices]
 
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'bm25', 'sbert', or 'hybrid'.")
+class EvaluationUtils:
+    """Utility class for evaluation metrics"""
+    
+    @staticmethod
+    def build_qrels_dicts(qrels_dataset):
+        """
+        Convert qrels dataset into dictionaries for different relevance levels
+        
+        Returns:
+            Tuple of dictionaries (relevant, highly_relevant, overall_relevant)
+        """
+        relevant_docs_by_query = defaultdict(set)
+        highly_relevant_docs_by_query = defaultdict(set)
+        overall_relevant_docs_by_query = defaultdict(set)
+
+        for qid, cid, score in zip(qrels_dataset["query-id"],
+                                qrels_dataset["corpus-id"],
+                                qrels_dataset["score"]):
+            if score == 1:
+                relevant_docs_by_query[qid].add(cid)
+            if score == 2:
+                highly_relevant_docs_by_query[qid].add(cid)
+            if score > 0:
+                overall_relevant_docs_by_query[qid].add(cid)
+
+        return relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query
+    
+    @staticmethod
+    def evaluate_retrieval(
+        queries_dataset,
+        qrels_dataset,
+        search_engine: SearchEngine,
+        bm25: Optional[BM25Okapi],
+        corpus_texts: List[str],
+        corpus_ids: List[str],
+        sbert_model: Optional[SentenceTransformer],
+        doc_embeddings: Optional[torch.Tensor],
+        method: RetrievalMethod = RetrievalMethod.BM25,
+        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+        hybrid_weight: float = 0.5,
+        top_k_p: int = 20,
+        top_k_r: int = 500,
+        use_mmr: bool = False,
+        mmr_lambda: float = 0.5,
+        use_cross_encoder: bool = False
+    ) -> Tuple[Dict[str, float], Dict[str, float], int]:
+        """
+        Evaluate retrieval performance on a query dataset
+        
+        Args:
+            queries_dataset: Dataset containing queries
+            qrels_dataset: Dataset containing relevance judgments
+            search_engine: SearchEngine instance
+            bm25: BM25 index
+            corpus_texts: List of document texts
+            corpus_ids: List of document IDs
+            sbert_model: SentenceTransformer model
+            doc_embeddings: Document embeddings tensor
+            method: Retrieval method to evaluate
+            hybrid_strategy: Strategy for hybrid retrieval
+            hybrid_weight: Weight for BM25 vs SBERT in weighted hybrid
+            top_k_p: Number of results to consider for precision
+            top_k_r: Number of results to consider for recall
+            use_mmr: Whether to use MMR reranking
+            mmr_lambda: Lambda parameter for MMR
+            use_cross_encoder: Whether to use cross-encoder reranking
+            
+        Returns:
+            Tuple of (avg_precisions, avg_recalls, num_evaluated)
+        """
+        # Build qrels dictionaries
+        relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = (
+            EvaluationUtils.build_qrels_dicts(qrels_dataset)
+        )
+
+        # Initialize metrics containers
+        all_precisions = {'relevant': [], 'highly_relevant': [], 'overall': []}
+        all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
+        num_evaluated = 0
+
+        for query_item in queries_dataset:
+            query_id = int(query_item["_id"])
+            query_text = query_item["text"]
+            
+            # Log progress
+            logger.debug(f"Evaluating query {query_id}: {query_text[:50]}...")
+
+            # Retrieve documents
+            results = search_engine.search(
+                query=query_text,
+                bm25=bm25,
+                corpus_texts=corpus_texts,
+                corpus_ids=corpus_ids,
+                sbert_model=sbert_model,
+                doc_embeddings=doc_embeddings,
+                top_k=max(top_k_p, top_k_r),
+                method=method,
+                hybrid_strategy=hybrid_strategy,
+                hybrid_weight=hybrid_weight,
+                use_mmr=use_mmr,
+                mmr_lambda=mmr_lambda,
+                use_cross_encoder=use_cross_encoder
+            )
+
+            # Extract document IDs
+            retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]
+            full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]
+
+            # Helper function to calculate precision and recall
+            def calculate_precision_recall(relevant_set):
+                if not relevant_set:
+                    return None, None
+
+                # Precision@k
+                retrieved_set = set(retrieved_docs)
+                num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
+                precision = num_relevant_retrieved / len(retrieved_docs) if retrieved_docs else 0
+
+                # Recall@k
+                full_retrieved_set = set(full_retrieved_docs)
+                num_relevant_in_full = len(relevant_set.intersection(full_retrieved_set))
+                recall = num_relevant_in_full / len(relevant_set) if relevant_set else 0
+
+                return precision, recall
+
+            # Calculate metrics for different relevance levels
+            if query_id in relevant_docs_by_query:
+                precision, recall = calculate_precision_recall(relevant_docs_by_query[query_id])
+                if precision is not None:
+                    all_precisions['relevant'].append(precision)
+                    all_recalls['relevant'].append(recall)
+
+            if query_id in highly_relevant_docs_by_query:
+                precision, recall = calculate_precision_recall(highly_relevant_docs_by_query[query_id])
+                if precision is not None:
+                    all_precisions['highly_relevant'].append(precision)
+                    all_recalls['highly_relevant'].append(recall)
+
+            if query_id in overall_relevant_docs_by_query:
+                precision, recall = calculate_precision_recall(overall_relevant_docs_by_query[query_id])
+                if precision is not None:
+                    all_precisions['overall'].append(precision)
+                    all_recalls['overall'].append(recall)
+
+            num_evaluated += 1
+
+        # Compute averages
+        avg_precisions = {
+            level: (sum(precisions) / len(precisions)) if precisions else 0.0
+            for level, precisions in all_precisions.items()
+        }
+        
+        avg_recalls = {
+            level: (sum(recalls) / len(recalls)) if recalls else 0.0
+            for level, recalls in all_recalls.items()
+        }
+
+        return avg_precisions, avg_recalls, num_evaluated
 
 
-def build_qrels_dicts(qrels_dataset):
-    """
-    Convert qrels_dataset into dictionaries for different relevance levels:
-      - relevant_docs_by_query: judgment score >= 1
-      - highly_relevant_docs_by_query: judgment score == 2
-      - overall_relevant_docs_by_query: judgment score > 0
-    """
-    relevant_docs_by_query = defaultdict(set)
-    highly_relevant_docs_by_query = defaultdict(set)
-    overall_relevant_docs_by_query = defaultdict(set)
-
-    for qid, cid, score in zip(qrels_dataset["query-id"],
-                               qrels_dataset["corpus-id"],
-                               qrels_dataset["score"]):
-        if score == 1:
-            relevant_docs_by_query[qid].add(cid)
-        if score == 2:
-            highly_relevant_docs_by_query[qid].add(cid)
-        if score > 0:
-            overall_relevant_docs_by_query[qid].add(cid)
-
-    return relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query
-
-
-def evaluate_retrieval_on_queries(
+def run_evaluation(
+    corpus_dataset,
     queries_dataset,
     qrels_dataset,
-    bm25,
-    corpus_texts,
-    corpus_ids,
-    sbert_model,
-    doc_embeddings,
-    method="bm25",
-    top_k_p=20,
-    top_k_r=500,
-    use_mmr=False,
-    mmr_lambda=0.5,
-    use_cross_encoder=False,
-    cross_encoder_model=None
+    force_reindex: bool = False,
+    top_k_p: int = 20,
+    top_k_r: int = 1000,
+    sbert_model_name: str = "all-mpnet-base-v2",
+    cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    evaluation_methods: List[Dict] = None
 ):
-    # Build qrels dictionaries for different relevance levels
-    relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = build_qrels_dicts(qrels_dataset)
-
-    # Initialize lists to store precision and recall values for each relevance level
-    all_precisions = {'relevant': [], 'highly_relevant': [], 'overall': []}
-    all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
-    num_evaluated = 0
-
-    for query_item in queries_dataset:
-        query_id = int(query_item["_id"])
-        query_text = query_item["text"]
-
-        # Retrieve documents using the specified method
-        results = search_documents(
-            query=query_text,
+    """
+    Run the full evaluation pipeline
+    
+    Args:
+        corpus_dataset: Dataset containing the corpus
+        queries_dataset: Dataset containing the queries
+        qrels_dataset: Dataset containing relevance judgments
+        force_reindex: Whether to force rebuilding indices
+        top_k_p: Number of results to consider for precision
+        top_k_r: Number of results to consider for recall
+        sbert_model_name: Name of the sentence transformer model
+        cross_encoder_model_name: Name of the cross-encoder model
+        evaluation_methods: List of configurations to evaluate
+    """
+    # Initialize components
+    preprocessor = TextPreprocessor()
+    index_manager = IndexManager(preprocessor)
+    
+    # Build indices
+    logger.info("Building BM25 index...")
+    bm25, corpus_texts, corpus_ids = index_manager.build_bm25_index(
+        corpus_dataset,
+        cache_path="bm25_index.pkl",
+        force_reindex=force_reindex
+    )
+    
+    logger.info("Building SBERT index...")
+    sbert_model, doc_embeddings = index_manager.build_sbert_index(
+        corpus_texts,
+        model_name=sbert_model_name,
+        batch_size=64,
+        cache_path="sbert_index.pt",
+        force_reindex=force_reindex
+    )
+    
+    # Initialize search engine
+    search_engine = SearchEngine(preprocessor, cross_encoder_model_name)
+    
+    # Default evaluation methods if none provided
+    if evaluation_methods is None:
+        evaluation_methods = [
+            {
+                "name": "BM25",
+                "method": RetrievalMethod.BM25,
+                "use_mmr": False,
+                "use_cross_encoder": False
+            },
+            {
+                "name": "SBERT",
+                "method": RetrievalMethod.SBERT,
+                "use_mmr": False,
+                "use_cross_encoder": False
+            },
+            {
+                "name": "Hybrid (Simple Sum)",
+                "method": RetrievalMethod.HYBRID,
+                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+                "use_mmr": False,
+                "use_cross_encoder": False
+            },
+            {
+                "name": "Hybrid (RRF)",
+                "method": RetrievalMethod.HYBRID,
+                "hybrid_strategy": HybridStrategy.RRF,
+                "use_mmr": False,
+                "use_cross_encoder": False
+            },
+            {
+                "name": "Hybrid + MMR",
+                "method": RetrievalMethod.HYBRID,
+                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+                "use_mmr": True,
+                "mmr_lambda": 0.5,
+                "use_cross_encoder": False
+            },
+            {
+                "name": "Hybrid + CrossEncoder",
+                "method": RetrievalMethod.HYBRID,
+                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+                "use_mmr": False,
+                "use_cross_encoder": True
+            }
+        ]
+    
+    # Run evaluations
+    results = []
+    for config in evaluation_methods:
+        logger.info(f"Evaluating method: {config['name']}")
+        
+        # Extract parameters from config with defaults
+        method = config.get("method", RetrievalMethod.BM25)
+        hybrid_strategy = config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM)
+        hybrid_weight = config.get("hybrid_weight", 0.5)
+        use_mmr = config.get("use_mmr", False)
+        mmr_lambda = config.get("mmr_lambda", 0.5)
+        use_cross_encoder = config.get("use_cross_encoder", False)
+        
+        # Run evaluation
+        avg_precisions, avg_recalls, num_evaluated = EvaluationUtils.evaluate_retrieval(
+            queries_dataset=queries_dataset,
+            qrels_dataset=qrels_dataset,
+            search_engine=search_engine,
             bm25=bm25,
             corpus_texts=corpus_texts,
             corpus_ids=corpus_ids,
             sbert_model=sbert_model,
             doc_embeddings=doc_embeddings,
-            top_k=max(top_k_p, top_k_r),
             method=method,
+            hybrid_strategy=hybrid_strategy,
+            hybrid_weight=hybrid_weight,
+            top_k_p=top_k_p,
+            top_k_r=top_k_r,
             use_mmr=use_mmr,
             mmr_lambda=mmr_lambda,
-            use_cross_encoder=use_cross_encoder,
-            cross_encoder_model=cross_encoder_model
+            use_cross_encoder=use_cross_encoder
         )
-
-        retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]
-        full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]
-
-        # Function to calculate precision and recall
-        def calculate_precision_recall(relevant_set):
-            if not relevant_set:
-                return None, None
-
-            # Top-k precision (top_k_p)
-            retrieved_set = set(retrieved_docs)  # top_k_p docs
-            num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-            precision = num_relevant_retrieved / top_k_p
-
-            # Recall over up to top_k_r docs (handle case when < top_k_r results returned)
-            top_k_r_subset = full_retrieved_docs[:top_k_r]
-            top_k_r_set = set(top_k_r_subset)
-            num_relevant_in_top_r = len(relevant_set.intersection(top_k_r_set))
-            recall = num_relevant_in_top_r / len(relevant_set)
-
-            return precision, recall
-
-        # Calculate for relevant documents
-        if query_id in relevant_docs_by_query:
-            precision, recall = calculate_precision_recall(relevant_docs_by_query[query_id])
-            if precision is not None:
-                all_precisions['relevant'].append(precision)
-                all_recalls['relevant'].append(recall)
-
-        # Calculate for highly relevant documents
-        if query_id in highly_relevant_docs_by_query:
-            precision, recall = calculate_precision_recall(highly_relevant_docs_by_query[query_id])
-            if precision is not None:
-                all_precisions['highly_relevant'].append(precision)
-                all_recalls['highly_relevant'].append(recall)
-
-        # Calculate for overall relevant documents
-        if query_id in overall_relevant_docs_by_query:
-            precision, recall = calculate_precision_recall(overall_relevant_docs_by_query[query_id])
-            if precision is not None:
-                all_precisions['overall'].append(precision)
-                all_recalls['overall'].append(recall)
-
-        num_evaluated += 1
-
-    # Compute average precision and recall for each relevance level
-    avg_precisions = {level: (sum(precisions) / len(precisions)) if precisions else 0.0
-                      for level, precisions in all_precisions.items()}
-    avg_recalls = {level: (sum(recalls) / len(recalls)) if recalls else 0.0
-                   for level, recalls in all_recalls.items()}
-
-    return avg_precisions, avg_recalls, num_evaluated
+        
+        # Log results
+        logger.info(f"[{config['name']}] Queries evaluated: {num_evaluated}")
+        for level in ['relevant', 'highly_relevant', 'overall']:
+            logger.info(f"[{config['name']}] [{level.capitalize()}] Precision@{top_k_p}: {avg_precisions[level]:.4f}, Recall@{top_k_r}: {avg_recalls[level]:.4f}")
+        
+        # Store results
+        results.append({
+            "config": config,
+            "avg_precisions": avg_precisions,
+            "avg_recalls": avg_recalls,
+            "num_evaluated": num_evaluated
+        })
+    
+    return results
 
 
-# ===============================
-# 5) DEMO in main
-# ===============================
-if __name__ == "__main__":
-    top_k_p = 20
-    top_k_r = 1000
-
-    # (Same dataset loading & index building as before)
-    print("Loading datasets...")
+def main():
+    """Main function to demonstrate functionality"""
+    # Define constants
+    FORCE_REINDEX = True
+    TOP_K_P = 20
+    TOP_K_R = 1000
+    SBERT_MODEL = 'all-mpnet-base-v2'
+    CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+    LOG_LEVEL = 'INFO'
+    
+    # Configure logging
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Load datasets
+    logger.info("Loading datasets...")
+    from datasets import load_dataset
+    
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
     queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
-    print("Datasets loaded.")
-
-    print("Building BM25 index...")
-    bm25, corpus_texts, corpus_ids = build_bm25_index(
-        corpus_dataset,
-        cache_path="bm25_index.pkl",
-        force_reindex=False
-    )
-    print("BM25 index built.")
-
-    print("Building SBERT index...")
-    sbert_model, doc_embeddings = build_sbert_index(
-        corpus_texts,
-        model_name="all-mpnet-base-v2",
-        batch_size=64,
-        cache_path="sbert_index.pt",
-        force_reindex=False
-    )
-    print("SBERT index built.")
-
-    # Evaluate BM25
-    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
+    logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
+    
+    # Print basic statistics
+    logger.info(f"Corpus size: {len(corpus_dataset)} documents")
+    logger.info(f"Query set size: {len(queries_dataset)} queries")
+    logger.info(f"QRels size: {len(qrels_dataset)} judgments")
+    
+    # Define evaluation methods
+    evaluation_methods = [
+        {
+            "name": "BM25",
+            "method": RetrievalMethod.BM25,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        {
+            "name": "SBERT",
+            "method": RetrievalMethod.SBERT,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        {
+            "name": "Hybrid (Simple Sum)",
+            "method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        {
+            "name": "Hybrid (RRF)",
+            "method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.RRF,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        {
+            "name": "Hybrid + MMR",
+            "method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": True,
+            "mmr_lambda": 0.5,
+            "use_cross_encoder": False
+        },
+        {
+            "name": "Hybrid + CrossEncoder",
+            "method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": False,
+            "use_cross_encoder": True
+        },
+        {
+            "name": "Hybrid + MMR + CrossEncoder",
+            "method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": True,
+            "mmr_lambda": 0.5,
+            "use_cross_encoder": True
+        }
+    ]
+    
+    # Run evaluation
+    results = run_evaluation(
+        corpus_dataset=corpus_dataset,
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
-        bm25=bm25,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=None,
-        doc_embeddings=None,
-        method="bm25",  # or "sbert" or "hybrid"
-        top_k_p=top_k_p,
-        top_k_r=top_k_r,
-        use_mmr=False
+        force_reindex=FORCE_REINDEX,
+        top_k_p=TOP_K_P,
+        top_k_r=TOP_K_R,
+        sbert_model_name=SBERT_MODEL,
+        cross_encoder_model_name=CROSS_ENCODER_MODEL,
+        evaluation_methods=evaluation_methods
     )
+    
+    # Print results summary
+    logger.info("\n===== EVALUATION RESULTS SUMMARY =====")
+    logger.info(f"{'Method':<30} {'P@'+str(TOP_K_P):<10} {'R@'+str(TOP_K_R):<10}")
+    logger.info("-" * 50)
+    
+    for result in results:
+        config_name = result["config"]["name"]
+        precision = result["avg_precisions"]["overall"]
+        recall = result["avg_recalls"]["overall"]
+        logger.info(f"{config_name:<30} {precision:.4f}     {recall:.4f}")
+    
+    return results
 
-    print(f"[BM25] Queries Evaluated: {num_evaluated}")
-    for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[BM25] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
 
-    # Evaluate SBERT
-    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=None,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="sbert",  # or "sbert" or "hybrid"
-        top_k_p=top_k_p,
-        top_k_r=top_k_r,
-        use_mmr=False
-    )
-
-    print(f"[SBERT] Queries Evaluated: {num_evaluated}")
-    for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[SBERT] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
-
-    # Evaluate Hybrid (BM25 + SBERT) without Cross-encoder
-    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=bm25,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="hybrid",  # or "sbert" or "hybrid"
-        top_k_p=top_k_p,
-        top_k_r=top_k_r,
-        use_mmr=False,
-        use_cross_encoder=False,
-        cross_encoder_model=None
-    )
-
-    print(f"[Hybrid] Queries Evaluated: {num_evaluated}")
-    for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[Hybrid] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
-
-    # Evaluate Hybrid with MMR
-    avg_precisions, avg_recalls, num_evaluated = evaluate_retrieval_on_queries(
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        bm25=bm25,
-        corpus_texts=corpus_texts,
-        corpus_ids=corpus_ids,
-        sbert_model=sbert_model,
-        doc_embeddings=doc_embeddings,
-        method="hybrid",  # or "sbert" or "hybrid"
-        top_k_p=top_k_p,
-        top_k_r=top_k_r,
-        use_mmr=True,
-        use_cross_encoder=False,
-        cross_encoder_model=cross_encoder_model
-    )
-
-    print(f"[Hybrid + MMR] Queries Evaluated: {num_evaluated}")
-    for level in ['relevant', 'highly_relevant', 'overall']:
-        print(f"[Hybrid + MMR] [{level.capitalize()}] Avg Precision: {avg_precisions[level]:.4f}, Avg Recall: {avg_recalls[level]:.4f}")
+# Execute main function if called directly
+if __name__ == "__main__":
+    main()
