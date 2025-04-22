@@ -282,7 +282,7 @@ class SearchEngine:
         # Apply MMR if requested and SBERT is available
         if use_mmr and sbert_model is not None and doc_embeddings is not None:
             logger.info("Applying MMR reranking to BM25 results...")
-            query_embedding = sbert_model.encode(query, convert_to_tensor=True)
+            query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
             candidate_indices = sorted_indices.tolist()
             candidate_embeddings = doc_embeddings[candidate_indices]
             candidate_ids = [corpus_ids[i] for i in candidate_indices]
@@ -310,7 +310,13 @@ class SearchEngine:
         mmr_lambda: float
     ) -> List[Tuple[str, float]]:
         """SBERT semantic search implementation"""
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True)
+        query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+
+        # Move to same device as query_embedding
+        device = query_embedding.device
+        if doc_embeddings.device != device:
+            doc_embeddings = doc_embeddings.to(device)
+
         cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
         
         # Sort by cosine similarity (descending)
@@ -357,7 +363,7 @@ class SearchEngine:
         bm25_sorted_indices = np.argsort(bm25_scores)[::-1][:top_k]
         
         # Get SBERT scores
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True)
+        query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
         cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
         sbert_sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
         
@@ -850,7 +856,7 @@ def run_evaluation(
 def main():
     """Main function to demonstrate functionality"""
     # Define constants
-    FORCE_REINDEX = True
+    FORCE_REINDEX = False
     TOP_K_P = 20
     TOP_K_R = 1000
     SBERT_MODEL = 'all-mpnet-base-v2'
