@@ -13,6 +13,7 @@ from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
 from collections import defaultdict
 from enum import Enum
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -194,7 +195,7 @@ class SearchEngine:
         corpus_ids: List[str],
         sbert_model: Optional[SentenceTransformer] = None,
         doc_embeddings: Optional[torch.Tensor] = None,
-        top_k: int = 10,
+        top_k: int = 1000,
         method: RetrievalMethod = RetrievalMethod.BM25,
         hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
         hybrid_weight: float = 0.5,  # Weight for BM25 vs SBERT in weighted hybrid
@@ -455,7 +456,7 @@ class SearchEngine:
         
         # Apply Cross-Encoder re-ranking if requested
         if use_cross_encoder and self.cross_encoder:
-            logger.info("Applying Cross-Encoder reranking...")
+            # logger.info("Applying Cross-Encoder reranking...")
             doc_ids = [doc_id for doc_id, _ in results]
             
             # Create pairs of (query, document) for cross-encoder
@@ -466,7 +467,7 @@ class SearchEngine:
                 query_doc_pairs.append((query, corpus_texts[doc_idx]))
             
             # Get cross-encoder scores
-            ce_scores = self.cross_encoder.predict(query_doc_pairs)
+            ce_scores = self.cross_encoder.predict(query_doc_pairs, show_progress_bar=False)
             
             # Create new results with cross-encoder scores
             results = [(doc_id, score) for doc_id, score in zip(doc_ids, ce_scores)]
@@ -482,8 +483,8 @@ class SearchEngine:
         doc_embeddings: torch.Tensor,
         doc_ids: List[str],
         scores: List[float],
-        top_k: int = 10,
-        lambda_param: float = 0.5
+        top_k: int = 1000,
+        lambda_param: float = 0.7
     ) -> List[Tuple[str, float]]:
         """
         Perform Maximal Marginal Relevance (MMR) reranking to diversify results.
@@ -590,9 +591,9 @@ class EvaluationUtils:
         hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
         hybrid_weight: float = 0.5,
         top_k_p: int = 20,
-        top_k_r: int = 500,
+        top_k_r: int = 1000,
         use_mmr: bool = False,
-        mmr_lambda: float = 0.5,
+        mmr_lambda: float = 0.7,
         use_cross_encoder: bool = False
     ) -> Tuple[Dict[str, float], Dict[str, float], int]:
         """
@@ -629,7 +630,7 @@ class EvaluationUtils:
         all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
         num_evaluated = 0
 
-        for query_item in queries_dataset:
+        for query_item in tqdm(queries_dataset, desc="Evaluating Queries"):
             query_id = int(query_item["_id"])
             query_text = query_item["text"]
             
@@ -911,14 +912,14 @@ def main():
             "use_mmr": False,
             "use_cross_encoder": False
         },
-        {
-            "name": "Hybrid + MMR",
-            "method": RetrievalMethod.HYBRID,
-            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-            "use_mmr": True,
-            "mmr_lambda": 0.5,
-            "use_cross_encoder": False
-        },
+        # {
+        #     "name": "Hybrid + MMR",
+        #     "method": RetrievalMethod.HYBRID,
+        #     "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+        #     "use_mmr": True,
+        #     "mmr_lambda": 0.5,
+        #     "use_cross_encoder": False
+        # },
         {
             "name": "Hybrid + CrossEncoder",
             "method": RetrievalMethod.HYBRID,
@@ -926,14 +927,14 @@ def main():
             "use_mmr": False,
             "use_cross_encoder": True
         },
-        {
-            "name": "Hybrid + MMR + CrossEncoder",
-            "method": RetrievalMethod.HYBRID,
-            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-            "use_mmr": True,
-            "mmr_lambda": 0.5,
-            "use_cross_encoder": True
-        }
+        # {
+        #     "name": "Hybrid + MMR + CrossEncoder",
+        #     "method": RetrievalMethod.HYBRID,
+        #     "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+        #     "use_mmr": True,
+        #     "mmr_lambda": 0.5,
+        #     "use_cross_encoder": True
+        # }
     ]
     
     # Run evaluation
