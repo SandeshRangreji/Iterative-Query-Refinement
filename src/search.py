@@ -14,6 +14,9 @@ from nltk.stem import PorterStemmer
 from collections import defaultdict
 from enum import Enum
 from tqdm import tqdm
+import json
+
+from search_viz import visualize_all_results
 
 # Configure logging
 logging.basicConfig(
@@ -710,6 +713,48 @@ class EvaluationUtils:
         return avg_precisions, avg_recalls, num_evaluated
 
 
+def save_evaluation_results(results, output_file="search_evaluation_results.json"):
+    """
+    Save evaluation results to a JSON file
+    """
+    # Convert results to a serializable format
+    serializable_results = []
+    for result in results:
+        serializable_result = {
+            "config": {
+                "name": result["config"]["name"],
+                "method": result["config"]["method"] if isinstance(result["config"]["method"], str) else result["config"]["method"].value,
+                "use_mmr": result["config"]["use_mmr"],
+                "use_cross_encoder": result["config"]["use_cross_encoder"]
+            },
+            "avg_precisions": result["avg_precisions"],
+            "avg_recalls": result["avg_recalls"],
+            "num_evaluated": result["num_evaluated"]
+        }
+        
+        # Add hybrid strategy if present
+        if "hybrid_strategy" in result["config"]:
+            serializable_result["config"]["hybrid_strategy"] = (
+                result["config"]["hybrid_strategy"] 
+                if isinstance(result["config"]["hybrid_strategy"], str) 
+                else result["config"]["hybrid_strategy"].value
+            )
+            
+        # Add other optional parameters if present
+        for param in ["mmr_lambda", "hybrid_weight"]:
+            if param in result["config"]:
+                serializable_result["config"][param] = result["config"][param]
+            
+        serializable_results.append(serializable_result)
+    
+    # Save to file
+    with open(output_file, "w") as f:
+        json.dump(serializable_results, f, indent=2)
+    
+    logger.info(f"Saved evaluation results to {output_file}")
+    return output_file
+
+
 def run_evaluation(
     corpus_dataset,
     queries_dataset,
@@ -719,7 +764,10 @@ def run_evaluation(
     top_k_r: int = 1000,
     sbert_model_name: str = "all-mpnet-base-v2",
     cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    evaluation_methods: List[Dict] = None
+    evaluation_methods: List[Dict] = None,
+    save_results: bool = True,
+    generate_plots: bool = True,
+    output_dir: str = "results"
 ):
     """
     Run the full evaluation pipeline
@@ -851,6 +899,26 @@ def run_evaluation(
             "num_evaluated": num_evaluated
         })
     
+    # Create output directory if needed
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save results to JSON if requested
+    if save_results:
+        results_file = os.path.join(output_dir, "evaluation_results.json")
+        save_evaluation_results(results, results_file)
+
+    # Generate visualization plots if requested
+    if generate_plots:
+        logger.info("Generating visualization plots...")
+        plots_dir = os.path.join(output_dir, "plots")
+        plot_paths = visualize_all_results(
+            results,
+            top_k_p=top_k_p,
+            top_k_r=top_k_r,
+            output_dir=plots_dir
+        )
+        logger.info(f"Generated {len(plot_paths)} visualization plots in {plots_dir}")
+    
     return results
 
 
@@ -863,6 +931,7 @@ def main():
     SBERT_MODEL = 'all-mpnet-base-v2'
     CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
     LOG_LEVEL = 'INFO'
+    OUTPUT_DIR = 'results'
     
     # Configure logging
     logging.basicConfig(
@@ -947,8 +1016,12 @@ def main():
         top_k_r=TOP_K_R,
         sbert_model_name=SBERT_MODEL,
         cross_encoder_model_name=CROSS_ENCODER_MODEL,
-        evaluation_methods=evaluation_methods
+        evaluation_methods=evaluation_methods,
+        save_results=True,
+        generate_plots=True,
+        output_dir=OUTPUT_DIR
     )
+    logger.info(f"\nResults and plots saved to {OUTPUT_DIR}")
     
     # Print results summary
     logger.info("\n===== EVALUATION RESULTS SUMMARY =====")
