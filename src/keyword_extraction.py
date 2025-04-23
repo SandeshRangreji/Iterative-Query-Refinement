@@ -2,6 +2,9 @@
 import logging
 import numpy as np
 import re
+import os
+import json
+import pickle
 from typing import List, Dict, Tuple, Set, Optional
 from collections import Counter, defaultdict
 import nltk
@@ -11,6 +14,9 @@ from nltk.util import ngrams
 import torch
 from keybert import KeyBERT
 import math
+from sentence_transformers import SentenceTransformer
+from sentence_transformers import util
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -35,7 +41,8 @@ class QueryExpander:
         corpus_texts: List[str],
         window_size: int = 10,
         min_count: int = 3,
-        keybert_model: str = 'all-mpnet-base-v2'
+        keybert_model: str = 'all-mpnet-base-v2',
+        cache_dir: str = 'cache'
     ):
         """
         Initialize query expander
@@ -44,15 +51,41 @@ class QueryExpander:
             corpus_texts: List of document texts for co-occurrence analysis
             window_size: Window size for co-occurrence counting
             min_count: Minimum count for terms to be considered
-            keybert_model: Model name for KeyBERT
+            keybert_model: Model name for KeyBERT or SentenceTransformer model
+            cache_dir: Directory to store cache files
         """
         self.corpus_texts = corpus_texts
         self.window_size = window_size
         self.min_count = min_count
         self.stop_words = set(stopwords.words('english'))
+        self.cache_dir = cache_dir
         
-        # Initialize KeyBERT
-        self.keybert = KeyBERT(model=keybert_model)
+        # Create cache directory if it doesn't exist
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Initialize KeyBERT with sbert model
+        if isinstance(keybert_model, str):
+            self.sbert_model = SentenceTransformer(keybert_model)
+            self.keybert = KeyBERT(model=self.sbert_model)
+        else:
+            # Assume it's already a SentenceTransformer model
+            self.sbert_model = keybert_model
+            self.keybert = KeyBERT(model=self.sbert_model)
+        
+        # Path for cooccurrence cache
+        self.cooccurrence_cache_path = os.path.join(
+            self.cache_dir, 
+            f"cooccurrence_w{window_size}_m{min_count}.pkl"
+        )
+        
+        # Path for expanded queries cache
+        self.expanded_queries_cache_path = os.path.join(
+            self.cache_dir,
+            "expanded_queries.json"
+        )
+        
+        # Load expanded queries cache if it exists
+        self.expanded_queries_cache = self._load_expanded_queries_cache()
         
         # Build co-occurrence stats (lazy initialization)
         self._cooccurrence_matrix = None
@@ -60,51 +93,147 @@ class QueryExpander:
         self._vocab = None
         self._word_to_idx = None
     
+    def _load_expanded_queries_cache(self) -> Dict:
+        """Load expanded queries cache"""
+        if os.path.exists(self.expanded_queries_cache_path):
+            try:
+                with open(self.expanded_queries_cache_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Error loading expanded queries cache: {e}")
+                return {}
+        return {}
+    
+    def _save_expanded_queries_cache(self):
+        """Save expanded queries cache"""
+        try:
+            with open(self.expanded_queries_cache_path, 'w') as f:
+                json.dump(self.expanded_queries_cache, f)
+        except Exception as e:
+            logger.warning(f"Error saving expanded queries cache: {e}")
+    
+    def _load_cooccurrence_cache(self) -> bool:
+        """Load co-occurrence statistics from cache if available"""
+        if os.path.exists(self.cooccurrence_cache_path):
+            try:
+                logger.info(f"Loading co-occurrence stats from cache: {self.cooccurrence_cache_path}")
+                with open(self.cooccurrence_cache_path, 'rb') as f:
+                    cache_data = pickle.load(f)
+                    self._cooccurrence_matrix = cache_data['matrix']
+                    self._word_counts = cache_data['word_counts']
+                    self._vocab = cache_data['vocab']
+                    self._word_to_idx = cache_data['word_to_idx']
+                return True
+            except Exception as e:
+                logger.warning(f"Error loading co-occurrence cache: {e}")
+                return False
+        return False
+    
+    def _save_cooccurrence_cache(self):
+        """Save co-occurrence statistics to cache"""
+        try:
+            logger.info(f"Saving co-occurrence stats to cache: {self.cooccurrence_cache_path}")
+            cache_data = {
+                'matrix': self._cooccurrence_matrix,
+                'word_counts': self._word_counts,
+                'vocab': self._vocab,
+                'word_to_idx': self._word_to_idx
+            }
+            with open(self.cooccurrence_cache_path, 'wb') as f:
+                pickle.dump(cache_data, f)
+        except Exception as e:
+            logger.warning(f"Error saving co-occurrence cache: {e}")
+    
+    def remove_stopwords(self, query: str) -> List[str]:
+        """Remove stopwords from query"""
+        words = word_tokenize(query)
+        words = [word for word in words if not all(char in '"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~' for char in word)]
+        filtered_words = [word for word in words if word.lower() not in self.stop_words]
+        return filtered_words
+    
+    def compute_idf(self, top_docs_keywords: List[List[str]], total_docs: int) -> Dict[str, float]:
+        """Compute IDF scores for keywords"""
+        df = defaultdict(int)
+        for kws in top_docs_keywords:
+            for kw in set(kws):
+                df[kw] += 1
+        idf = {kw: math.log(total_docs / (1 + freq)) for kw, freq in df.items()}
+        return idf
+    
     def expand_with_keybert(
         self, 
         query: str, 
         num_keywords: int = 5,
-        diversity: float = 0.5
+        diversity: float = 0.7,
+        query_embedding=None
     ) -> List[str]:
         """
-        Expand query using KeyBERT
+        Expand query using KeyBERT with filtering based on similarity and IDF
         
         Args:
             query: Original query
             num_keywords: Number of keywords to extract
             diversity: Diversity parameter for MMR (0-1)
+            query_embedding: Pre-computed query embedding
             
         Returns:
             List of expanded query terms
         """
         logger.info(f"Expanding query with KeyBERT: {query}")
         
+        # Use pre-computed query embedding or create one
+        if query_embedding is None:
+            query_embedding = self.sbert_model.encode(query, convert_to_tensor=True)
+        
+        # Use query as seed keyword for KeyBERT
+        seed_keywords = [query]
+        logger.info(f"Using seed keywords: {seed_keywords}")
+        
+        # For shorter queries, use documents from retrieval to extract keywords
+        # Since we don't have documents here, use the query itself but with larger ngram range
         # Extract keywords using KeyBERT with MMR for diversity
-        keywords = self.keybert.extract_keywords(
+        original_keywords = self.keybert.extract_keywords(
             query, 
-            keyphrase_ngram_range=(1, 2), 
+            keyphrase_ngram_range=(1, 3),  # Use shorter ngrams
             stop_words='english',
             use_mmr=True,
             diversity=diversity,
-            top_n=num_keywords
+            top_n=20,  # Get more candidates for filtering
+            nr_candidates=30  # Increase candidate pool
         )
         
-        # Extract just the keywords (not scores)
-        expanded_terms = [k for k, _ in keywords]
+        # Get just the keywords
+        original_keywords = [k for k, _ in original_keywords]
+        
+        # Filter out keywords that are substrings of the query or vice versa
+        filtered_keywords = []
+        query_lower = query.lower()
+        for kw in original_keywords:
+            kw_lower = kw.lower()
+            if kw_lower not in query_lower and query_lower not in kw_lower:
+                filtered_keywords.append(kw)
+        
+        # If we have at least some filtered keywords, use them
+        if filtered_keywords:
+            expanded_terms = filtered_keywords[:num_keywords]
+        else:
+            # Fall back to original keywords without filtering
+            expanded_terms = original_keywords[:num_keywords]
         
         logger.info(f"KeyBERT expansion: {expanded_terms}")
         return expanded_terms
     
     def _build_cooccurrence_stats(self):
         """Build co-occurrence statistics from corpus"""
-        if self._cooccurrence_matrix is not None:
+        # Try to load from cache first
+        if self._load_cooccurrence_cache():
             return
         
         logger.info("Building co-occurrence statistics from corpus...")
         
         # Tokenize and preprocess corpus
         tokenized_docs = []
-        for doc in self.corpus_texts:
+        for doc in tqdm(self.corpus_texts, desc="Tokenizing documents"):
             tokens = word_tokenize(doc.lower())
             # Filter stopwords and non-alphabetic tokens
             tokens = [t for t in tokens if t.isalpha() and t not in self.stop_words and len(t) > 2]
@@ -123,7 +252,7 @@ class QueryExpander:
         cooccurrence_matrix = np.zeros((len(vocab), len(vocab)), dtype=np.float32)
         
         # Count co-occurrences within window
-        for doc in tokenized_docs:
+        for doc in tqdm(tokenized_docs, desc="Building co-occurrence matrix"):
             for i, word in enumerate(doc):
                 if word not in word_to_idx:
                     continue
@@ -150,6 +279,9 @@ class QueryExpander:
         self._word_counts = word_counts
         self._vocab = vocab
         self._word_to_idx = word_to_idx
+        
+        # Save to cache
+        self._save_cooccurrence_cache()
         
         logger.info(f"Built co-occurrence statistics with {len(vocab)} terms")
     
@@ -336,27 +468,44 @@ class QueryExpander:
     def expand_query(
         self, 
         query: str,
+        query_id: Optional[str] = None,
         methods: List[str] = ["keybert", "pmi", "sopmi"],
         num_terms_per_method: int = 3,
-        deduplicate: bool = True
+        deduplicate: bool = True,
+        force_regenerate: bool = False
     ) -> str:
         """
-        Expand query using multiple methods
+        Expand query using multiple methods with caching
         
         Args:
             query: Original query
+            query_id: Query ID for caching (if None, the query text is used)
             methods: List of expansion methods to use
             num_terms_per_method: Number of terms to add per method
             deduplicate: Whether to remove duplicate terms
+            force_regenerate: Whether to force regeneration even if cached
             
         Returns:
             Expanded query string
         """
+        # Use query as cache key if no ID provided
+        cache_key = str(query_id) if query_id is not None else query
+        
+        # Check cache first if not forcing regeneration
+        if not force_regenerate and cache_key in self.expanded_queries_cache:
+            logger.info(f"Using cached expanded query for: {query}")
+            return self.expanded_queries_cache[cache_key]
+        
+        # Precompute query embedding for KeyBERT if needed
+        query_embedding = None
+        if "keybert" in methods:
+            query_embedding = self.sbert_model.encode(query, convert_to_tensor=True)
+        
         expanded_terms = []
         
         for method in methods:
             if method.lower() == "keybert":
-                terms = self.expand_with_keybert(query, num_terms_per_method)
+                terms = self.expand_with_keybert(query, num_terms_per_method, query_embedding=query_embedding)
             elif method.lower() == "pmi":
                 terms = self.expand_with_pmi(query, num_terms_per_method)
             elif method.lower() == "sopmi":
@@ -374,17 +523,63 @@ class QueryExpander:
         # Combine with original query
         expanded_query = f"{query} {' '.join(expanded_terms)}"
         
+        # Update cache
+        self.expanded_queries_cache[cache_key] = expanded_query
+        self._save_expanded_queries_cache()
+        
         logger.info(f"Final expanded query: {expanded_query}")
         return expanded_query
+    
+    def expand_queries_batch(
+        self,
+        queries_dataset,
+        methods: List[str] = ["keybert", "pmi", "sopmi"],
+        num_terms_per_method: int = 3,
+        deduplicate: bool = True,
+        force_regenerate: bool = False
+    ) -> Dict[str, str]:
+        """
+        Expand multiple queries and return a dictionary of expanded queries
+        
+        Args:
+            queries_dataset: Dataset containing queries with _id and text fields
+            methods: List of expansion methods to use
+            num_terms_per_method: Number of terms to add per method
+            deduplicate: Whether to remove duplicate terms
+            force_regenerate: Whether to force regeneration even if cached
+            
+        Returns:
+            Dictionary mapping query IDs to expanded queries
+        """
+        expanded_queries = {}
+        
+        # Use tqdm for the entire dataset instead of individual operations
+        for query_item in tqdm(queries_dataset, desc="Expanding queries", total=len(queries_dataset)):
+            query_id = str(query_item["_id"])
+            query_text = query_item["text"]
+            
+            expanded_query = self.expand_query(
+                query=query_text,
+                query_id=query_id,
+                methods=methods,
+                num_terms_per_method=num_terms_per_method,
+                deduplicate=deduplicate,
+                force_regenerate=force_regenerate
+            )
+            
+            expanded_queries[query_id] = expanded_query
+        
+        return expanded_queries
 
 
 # Example usage
 def main():
     """Main function to demonstrate query expansion functionality"""
     # Define constants
-    QUERY = "covid symptoms"
-    EXPANSION_METHODS = ["keybert", "pmi", "sopmi"]
-    TERMS_PER_METHOD = 3
+    EXPANSION_METHODS = ["keybert"] # ["keybert", "pmi", "sopmi"]
+    TERMS_PER_METHOD = 5
+    CACHE_DIR = "cache"
+    FORCE_REGENERATE = True
     LOG_LEVEL = 'INFO'
     
     # Configure logging
@@ -399,37 +594,33 @@ def main():
     from datasets import load_dataset
     
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
+    queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
+    
     corpus_texts = [doc["title"] + "\n\n" + doc["text"] for doc in corpus_dataset]
     
     # Initialize expander
     logger.info("Initializing query expander...")
-    expander = QueryExpander(corpus_texts)
-    
-    # Expand query
-    logger.info(f"Expanding query: {QUERY}")
-    expanded_query = expander.expand_query(
-        QUERY,
-        methods=EXPANSION_METHODS,
-        num_terms_per_method=TERMS_PER_METHOD
+    expander = QueryExpander(
+        corpus_texts,
+        cache_dir=CACHE_DIR
     )
     
-    print("\nOriginal query:", QUERY)
-    print("Expanded query:", expanded_query)
+    # Expand all queries
+    logger.info("Expanding all queries...")
+    expanded_queries = expander.expand_queries_batch(
+        queries_dataset,
+        methods=EXPANSION_METHODS,
+        num_terms_per_method=TERMS_PER_METHOD,
+        force_regenerate=FORCE_REGENERATE
+    )
     
-    # Demonstrate individual methods
-    print("\nExpansion by individual methods:")
-    
-    # KeyBERT expansion
-    keybert_terms = expander.expand_with_keybert(QUERY, TERMS_PER_METHOD)
-    print(f"KeyBERT: {', '.join(keybert_terms)}")
-    
-    # PMI expansion
-    pmi_terms = expander.expand_with_pmi(QUERY, TERMS_PER_METHOD)
-    print(f"PMI: {', '.join(pmi_terms)}")
-    
-    # Second-order PMI expansion
-    sopmi_terms = expander.expand_with_second_order_pmi(QUERY, TERMS_PER_METHOD)
-    print(f"Second-order PMI: {', '.join(sopmi_terms)}")
+    # Print some examples
+    logger.info("Example expansions:")
+    for i, (query_id, expanded) in enumerate(list(expanded_queries.items())[:5]):
+        original = queries_dataset[i]["text"]
+        print(f"[Query {query_id}] Original: {original}")
+        print(f"[Query {query_id}] Expanded: {expanded}")
+        print()
 
 
 # Execute main function if called directly
