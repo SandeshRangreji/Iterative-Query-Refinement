@@ -931,7 +931,7 @@ def main():
     SBERT_MODEL = 'all-mpnet-base-v2'
     CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
     LOG_LEVEL = 'INFO'
-    OUTPUT_DIR = 'results'
+    OUTPUT_DIR = 'results/search'
     
     # Configure logging
     logging.basicConfig(

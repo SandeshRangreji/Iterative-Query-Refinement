@@ -1,0 +1,91 @@
+[
+  {
+    "config": {
+      "name": "Baseline",
+      "method": "hybrid",
+      "use_mmr": false,
+      "use_cross_encoder": false,
+      "hybrid_strategy": "simple_sum"
+    },
+    "avg_precisions": {
+      "relevant": 0.152,
+      "highly_relevant": 0.643,
+      "overall": 0.795
+    },
+    "avg_recalls": {
+      "relevant": 0.43656335137230096,
+      "highly_relevant": 0.6071586238133138,
+      "overall": 0.5366263545095924
+    },
+    "num_evaluated": 50
+  },
+  {
+    "config": {
+      "name": "KeyBERT + Weighted RRF",
+      "method": "hybrid",
+      "use_mmr": false,
+      "use_cross_encoder": false,
+      "hybrid_strategy": "simple_sum",
+      "expansion_method": "keybert",
+      "combination_strategy": "weighted_rrf",
+      "num_keywords": 5
+    },
+    "avg_precisions": {
+      "relevant": 0.152,
+      "highly_relevant": 0.644,
+      "overall": 0.7959999999999999
+    },
+    "avg_recalls": {
+      "relevant": 0.42637454511459466,
+      "highly_relevant": 0.5989266305629409,
+      "overall": 0.5279345439801518
+    },
+    "num_evaluated": 50
+  },
+  {
+    "config": {
+      "name": "KeyBERT + Concatenated",
+      "method": "hybrid",
+      "use_mmr": false,
+      "use_cross_encoder": false,
+      "hybrid_strategy": "simple_sum",
+      "expansion_method": "keybert",
+      "combination_strategy": "concatenated",
+      "num_keywords": 5
+    },
+    "avg_precisions": {
+      "relevant": 0.131,
+      "highly_relevant": 0.575,
+      "overall": 0.706
+    },
+    "avg_recalls": {
+      "relevant": 0.3998235390984764,
+      "highly_relevant": 0.5802708661021562,
+      "overall": 0.505733924251414
+    },
+    "num_evaluated": 50
+  },
+  {
+    "config": {
+      "name": "KeyBERT + Concatenated + CrossEncoder",
+      "method": "hybrid",
+      "use_mmr": false,
+      "use_cross_encoder": true,
+      "hybrid_strategy": "simple_sum",
+      "expansion_method": "keybert",
+      "combination_strategy": "concatenated_reranked",
+      "num_keywords": 5
+    },
+    "avg_precisions": {
+      "relevant": 0.14800000000000002,
+      "highly_relevant": 0.5820000000000001,
+      "overall": 0.73
+    },
+    "avg_recalls": {
+      "relevant": 0.3998235390984764,
+      "highly_relevant": 0.5802708661021562,
+      "overall": 0.505733924251414
+    },
+    "num_evaluated": 50
+  }
+]
