@@ -180,5 +180,8 @@ cython_debug/
 bm25_index.pkl
 sbert_index.pt
 
+# Cache
+cache/
+
 # Mac Stuff
 .DS_Store
