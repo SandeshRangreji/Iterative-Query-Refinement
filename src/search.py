@@ -76,7 +76,7 @@ class IndexManager:
     def build_bm25_index(
         self,
         corpus_dataset,
-        cache_path: str = "bm25_index.pkl",
+        cache_path: str = "cache/bm25_index.pkl",
         force_reindex: bool = False
     ) -> Tuple[BM25Okapi, List[str], List[str]]:
         """
@@ -119,7 +119,7 @@ class IndexManager:
         corpus_texts: List[str],
         model_name: str = "sentence-transformers/msmarco-MiniLM-L6-cos-v5",
         batch_size: int = 64,
-        cache_path: str = "sbert_index.pt",
+        cache_path: str = "cache/sbert_index.pt",
         force_reindex: bool = False,
         device: str = None
     ) -> Tuple[SentenceTransformer, torch.Tensor]:
@@ -791,7 +791,7 @@ def run_evaluation(
     logger.info("Building BM25 index...")
     bm25, corpus_texts, corpus_ids = index_manager.build_bm25_index(
         corpus_dataset,
-        cache_path="bm25_index.pkl",
+        cache_path="cache/bm25_index.pkl",
         force_reindex=force_reindex
     )
     
@@ -800,7 +800,7 @@ def run_evaluation(
         corpus_texts,
         model_name=sbert_model_name,
         batch_size=64,
-        cache_path="sbert_index.pt",
+        cache_path="cache/sbert_index.pt",
         force_reindex=force_reindex
     )
     
