@@ -14,9 +14,6 @@ from nltk.stem import PorterStemmer
 from collections import defaultdict
 from enum import Enum
 from tqdm import tqdm
-import json
-
-from search_viz import visualize_all_results
 
 # Configure logging
 logging.basicConfig(
@@ -109,6 +106,7 @@ class IndexManager:
         bm25 = BM25Okapi(tokenized_corpus, b=0.5)  
 
         logger.info(f"Saving BM25 index to cache: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump((bm25, corpus_texts, corpus_ids), f)
 
@@ -162,6 +160,7 @@ class IndexManager:
         doc_embeddings = doc_embeddings.cpu().contiguous()
 
         logger.info(f"Saving SBERT embeddings to cache: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         torch.save({"doc_embeddings": doc_embeddings}, cache_path)
 
         return model, doc_embeddings
@@ -172,10 +171,33 @@ class SearchEngine:
     def __init__(
         self, 
         preprocessor: TextPreprocessor,
+        bm25: Optional[BM25Okapi] = None,
+        corpus_texts: Optional[List[str]] = None,
+        corpus_ids: Optional[List[str]] = None,
+        sbert_model: Optional[SentenceTransformer] = None, 
+        doc_embeddings: Optional[torch.Tensor] = None,
         cross_encoder_model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2',
         device: str = None
     ):
+        """
+        Initialize search engine with indices and models
+        
+        Args:
+            preprocessor: TextPreprocessor for query processing
+            bm25: BM25 index (optional)
+            corpus_texts: List of document texts (optional)
+            corpus_ids: List of document IDs (optional)
+            sbert_model: SentenceTransformer model (optional)
+            doc_embeddings: Document embeddings tensor (optional)
+            cross_encoder_model_name: Name of cross-encoder model to use
+            device: Device to use for models
+        """
         self.preprocessor = preprocessor
+        self.bm25 = bm25
+        self.corpus_texts = corpus_texts
+        self.corpus_ids = corpus_ids
+        self.sbert_model = sbert_model
+        self.doc_embeddings = doc_embeddings
         
         # Select device based on availability if not specified
         if device is None:
@@ -193,11 +215,6 @@ class SearchEngine:
     def search(
         self,
         query: str,
-        bm25: Optional[BM25Okapi],
-        corpus_texts: List[str],
-        corpus_ids: List[str],
-        sbert_model: Optional[SentenceTransformer] = None,
-        doc_embeddings: Optional[torch.Tensor] = None,
         top_k: int = 1000,
         method: RetrievalMethod = RetrievalMethod.BM25,
         hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
@@ -211,11 +228,6 @@ class SearchEngine:
         
         Args:
             query: Search query
-            bm25: BM25 index
-            corpus_texts: List of document texts
-            corpus_ids: List of document IDs
-            sbert_model: SentenceTransformer model
-            doc_embeddings: Document embeddings tensor
             top_k: Number of results to return
             method: Retrieval method (bm25, sbert, or hybrid)
             hybrid_strategy: Strategy for combining BM25 and SBERT results
@@ -228,10 +240,10 @@ class SearchEngine:
             List of tuples (document_id, score)
         """
         # Validate inputs based on method
-        if method == RetrievalMethod.BM25 and bm25 is None:
+        if method == RetrievalMethod.BM25 and self.bm25 is None:
             raise ValueError("BM25 index is required for method='bm25'")
         
-        if (method == RetrievalMethod.SBERT or method == RetrievalMethod.HYBRID) and (sbert_model is None or doc_embeddings is None):
+        if (method == RetrievalMethod.SBERT or method == RetrievalMethod.HYBRID) and (self.sbert_model is None or self.doc_embeddings is None):
             raise ValueError(f"SBERT model and embeddings are required for method='{method}'")
             
         if use_cross_encoder and self.cross_encoder is None:
@@ -240,23 +252,17 @@ class SearchEngine:
         # Handle different retrieval methods
         if method == RetrievalMethod.BM25:
             return self._bm25_search(
-                query, bm25, corpus_texts, corpus_ids, 
-                sbert_model, doc_embeddings, top_k, 
-                use_mmr, mmr_lambda
+                query, top_k, use_mmr, mmr_lambda
             )
         
         elif method == RetrievalMethod.SBERT:
             return self._sbert_search(
-                query, corpus_texts, corpus_ids, 
-                sbert_model, doc_embeddings, top_k, 
-                use_mmr, mmr_lambda
+                query, top_k, use_mmr, mmr_lambda
             )
         
         elif method == RetrievalMethod.HYBRID:
             return self._hybrid_search(
-                query, bm25, corpus_texts, corpus_ids,
-                sbert_model, doc_embeddings, top_k,
-                hybrid_strategy, hybrid_weight,
+                query, top_k, hybrid_strategy, hybrid_weight,
                 use_mmr, mmr_lambda, use_cross_encoder
             )
         
@@ -266,30 +272,36 @@ class SearchEngine:
     def _bm25_search(
         self,
         query: str,
-        bm25: BM25Okapi,
-        corpus_texts: List[str],
-        corpus_ids: List[str],
-        sbert_model: Optional[SentenceTransformer], 
-        doc_embeddings: Optional[torch.Tensor],
         top_k: int,
         use_mmr: bool,
         mmr_lambda: float
     ) -> List[Tuple[str, float]]:
-        """BM25 search implementation"""
+        """
+        BM25 search implementation
+        
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            use_mmr: Whether to use MMR for diversity
+            mmr_lambda: MMR lambda parameter
+            
+        Returns:
+            List of tuples (document_id, score)
+        """
         tokenized_query = self.preprocessor.preprocess_text(query)
-        scores = bm25.get_scores(tokenized_query)
+        scores = self.bm25.get_scores(tokenized_query)
         
         # Sort by BM25 score (descending)
         sorted_indices = np.argsort(scores)[::-1][:top_k]
-        results = [(corpus_ids[idx], scores[idx]) for idx in sorted_indices]
+        results = [(self.corpus_ids[idx], scores[idx]) for idx in sorted_indices]
         
         # Apply MMR if requested and SBERT is available
-        if use_mmr and sbert_model is not None and doc_embeddings is not None:
+        if use_mmr and self.sbert_model is not None and self.doc_embeddings is not None:
             logger.info("Applying MMR reranking to BM25 results...")
-            query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+            query_embedding = self.sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
             candidate_indices = sorted_indices.tolist()
-            candidate_embeddings = doc_embeddings[candidate_indices]
-            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            candidate_embeddings = self.doc_embeddings[candidate_indices]
+            candidate_ids = [self.corpus_ids[i] for i in candidate_indices]
             
             results = self._mmr_rerank(
                 query_embedding,
@@ -305,19 +317,27 @@ class SearchEngine:
     def _sbert_search(
         self,
         query: str,
-        corpus_texts: List[str],
-        corpus_ids: List[str],
-        sbert_model: SentenceTransformer,
-        doc_embeddings: torch.Tensor,
         top_k: int,
         use_mmr: bool,
         mmr_lambda: float
     ) -> List[Tuple[str, float]]:
-        """SBERT semantic search implementation"""
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+        """
+        SBERT semantic search implementation
+        
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            use_mmr: Whether to use MMR for diversity
+            mmr_lambda: MMR lambda parameter
+            
+        Returns:
+            List of tuples (document_id, score)
+        """
+        query_embedding = self.sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
 
         # Move to same device as query_embedding
         device = query_embedding.device
+        doc_embeddings = self.doc_embeddings
         if doc_embeddings.device != device:
             doc_embeddings = doc_embeddings.to(device)
 
@@ -325,14 +345,14 @@ class SearchEngine:
         
         # Sort by cosine similarity (descending)
         sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
-        results = [(corpus_ids[idx], cos_scores[idx]) for idx in sorted_indices]
+        results = [(self.corpus_ids[idx], cos_scores[idx]) for idx in sorted_indices]
         
         # Apply MMR if requested
         if use_mmr:
             logger.info("Applying MMR reranking to SBERT results...")
             candidate_indices = sorted_indices.tolist()
             candidate_embeddings = doc_embeddings[candidate_indices]
-            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            candidate_ids = [self.corpus_ids[i] for i in candidate_indices]
             
             results = self._mmr_rerank(
                 query_embedding,
@@ -348,11 +368,6 @@ class SearchEngine:
     def _hybrid_search(
         self,
         query: str,
-        bm25: BM25Okapi,
-        corpus_texts: List[str],
-        corpus_ids: List[str],
-        sbert_model: SentenceTransformer,
-        doc_embeddings: torch.Tensor,
         top_k: int,
         hybrid_strategy: HybridStrategy,
         hybrid_weight: float,
@@ -360,14 +375,35 @@ class SearchEngine:
         mmr_lambda: float,
         use_cross_encoder: bool
     ) -> List[Tuple[str, float]]:
-        """Hybrid search combining BM25 and SBERT results"""
+        """
+        Hybrid search combining BM25 and SBERT results
+        
+        Args:
+            query: Search query
+            top_k: Number of results to return
+            hybrid_strategy: Strategy for combining results
+            hybrid_weight: Weight for BM25 vs SBERT (0-1)
+            use_mmr: Whether to use MMR for diversity
+            mmr_lambda: MMR lambda parameter
+            use_cross_encoder: Whether to use cross-encoder reranking
+            
+        Returns:
+            List of tuples (document_id, score)
+        """
         # Get BM25 scores
         tokenized_query = self.preprocessor.preprocess_text(query)
-        bm25_scores = bm25.get_scores(tokenized_query)
+        bm25_scores = self.bm25.get_scores(tokenized_query)
         bm25_sorted_indices = np.argsort(bm25_scores)[::-1][:top_k]
         
         # Get SBERT scores
-        query_embedding = sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+        query_embedding = self.sbert_model.encode(query, convert_to_tensor=True, show_progress_bar=False)
+        
+        # Move to same device as query_embedding
+        device = query_embedding.device
+        doc_embeddings = self.doc_embeddings
+        if doc_embeddings.device != device:
+            doc_embeddings = doc_embeddings.to(device)
+            
         cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
         sbert_sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
         
@@ -421,8 +457,8 @@ class SearchEngine:
             doc_final_scores = {}
             for idx in combined_indices:
                 # Get ranks (default to a large value if not in top-k)
-                bm25_rank = bm25_ranks.get(idx, len(corpus_ids) + 1)
-                sbert_rank = sbert_ranks.get(idx, len(corpus_ids) + 1)
+                bm25_rank = bm25_ranks.get(idx, len(self.corpus_ids) + 1)
+                sbert_rank = sbert_ranks.get(idx, len(self.corpus_ids) + 1)
                 
                 # RRF score = sum of 1/(rank + k) for each method
                 rrf_score = 1/(bm25_rank + k) + 1/(sbert_rank + k)
@@ -438,14 +474,14 @@ class SearchEngine:
             reverse=True
         )[:top_k]
         
-        results = [(corpus_ids[i], doc_final_scores[i]) for i in sorted_indices]
+        results = [(self.corpus_ids[i], doc_final_scores[i]) for i in sorted_indices]
         
         # Apply MMR if requested
         if use_mmr:
             logger.info("Applying MMR reranking to hybrid results...")
             candidate_indices = list(sorted_indices)
             candidate_embeddings = doc_embeddings[candidate_indices]
-            candidate_ids = [corpus_ids[i] for i in candidate_indices]
+            candidate_ids = [self.corpus_ids[i] for i in candidate_indices]
             candidate_scores = [doc_final_scores[i] for i in candidate_indices]
             
             results = self._mmr_rerank(
@@ -459,15 +495,14 @@ class SearchEngine:
         
         # Apply Cross-Encoder re-ranking if requested
         if use_cross_encoder and self.cross_encoder:
-            # logger.info("Applying Cross-Encoder reranking...")
             doc_ids = [doc_id for doc_id, _ in results]
             
             # Create pairs of (query, document) for cross-encoder
             query_doc_pairs = []
             for doc_id in doc_ids:
                 # Find the document text for this ID
-                doc_idx = corpus_ids.index(doc_id)
-                query_doc_pairs.append((query, corpus_texts[doc_idx]))
+                doc_idx = self.corpus_ids.index(doc_id)
+                query_doc_pairs.append((query, self.corpus_texts[doc_idx]))
             
             # Get cross-encoder scores
             ce_scores = self.cross_encoder.predict(query_doc_pairs, show_progress_bar=False)
@@ -552,386 +587,151 @@ class SearchEngine:
         
         # Return selected documents with their original scores
         return [(doc_ids[idx], scores[idx]) for idx in selected_indices]
-
-class EvaluationUtils:
-    """Utility class for evaluation metrics"""
-    
-    @staticmethod
-    def build_qrels_dicts(qrels_dataset):
-        """
-        Convert qrels dataset into dictionaries for different relevance levels
         
-        Returns:
-            Tuple of dictionaries (relevant, highly_relevant, overall_relevant)
-        """
-        relevant_docs_by_query = defaultdict(set)
-        highly_relevant_docs_by_query = defaultdict(set)
-        overall_relevant_docs_by_query = defaultdict(set)
-
-        for qid, cid, score in zip(qrels_dataset["query-id"],
-                                qrels_dataset["corpus-id"],
-                                qrels_dataset["score"]):
-            if score == 1:
-                relevant_docs_by_query[qid].add(cid)
-            if score == 2:
-                highly_relevant_docs_by_query[qid].add(cid)
-            if score > 0:
-                overall_relevant_docs_by_query[qid].add(cid)
-
-        return relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query
-    
-    @staticmethod
-    def evaluate_retrieval(
-        queries_dataset,
-        qrels_dataset,
-        search_engine: SearchEngine,
-        bm25: Optional[BM25Okapi],
+    def load_indices(
+        self,
+        bm25: BM25Okapi,
         corpus_texts: List[str],
         corpus_ids: List[str],
-        sbert_model: Optional[SentenceTransformer],
-        doc_embeddings: Optional[torch.Tensor],
-        method: RetrievalMethod = RetrievalMethod.BM25,
-        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
-        hybrid_weight: float = 0.5,
-        top_k_p: int = 20,
-        top_k_r: int = 1000,
-        use_mmr: bool = False,
-        mmr_lambda: float = 0.7,
-        use_cross_encoder: bool = False
-    ) -> Tuple[Dict[str, float], Dict[str, float], int]:
+        sbert_model: Optional[SentenceTransformer] = None,
+        doc_embeddings: Optional[torch.Tensor] = None
+    ):
         """
-        Evaluate retrieval performance on a query dataset
+        Load indices and models into the search engine
         
         Args:
-            queries_dataset: Dataset containing queries
-            qrels_dataset: Dataset containing relevance judgments
-            search_engine: SearchEngine instance
             bm25: BM25 index
             corpus_texts: List of document texts
             corpus_ids: List of document IDs
-            sbert_model: SentenceTransformer model
-            doc_embeddings: Document embeddings tensor
-            method: Retrieval method to evaluate
-            hybrid_strategy: Strategy for hybrid retrieval
-            hybrid_weight: Weight for BM25 vs SBERT in weighted hybrid
-            top_k_p: Number of results to consider for precision
-            top_k_r: Number of results to consider for recall
-            use_mmr: Whether to use MMR reranking
-            mmr_lambda: Lambda parameter for MMR
-            use_cross_encoder: Whether to use cross-encoder reranking
+            sbert_model: SentenceTransformer model (optional)
+            doc_embeddings: Document embeddings tensor (optional)
+        """
+        self.bm25 = bm25
+        self.corpus_texts = corpus_texts
+        self.corpus_ids = corpus_ids
+        
+        if sbert_model is not None:
+            self.sbert_model = sbert_model
+        
+        if doc_embeddings is not None:
+            self.doc_embeddings = doc_embeddings
+            
+    def get_document_by_id(self, doc_id: str) -> Optional[str]:
+        """
+        Get document text by ID
+        
+        Args:
+            doc_id: Document ID to retrieve
             
         Returns:
-            Tuple of (avg_precisions, avg_recalls, num_evaluated)
+            Document text if found, None otherwise
         """
-        # Build qrels dictionaries
-        relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = (
-            EvaluationUtils.build_qrels_dicts(qrels_dataset)
-        )
-
-        # Initialize metrics containers
-        all_precisions = {'relevant': [], 'highly_relevant': [], 'overall': []}
-        all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
-        num_evaluated = 0
-
-        for query_item in tqdm(queries_dataset, desc="Evaluating Queries"):
-            query_id = int(query_item["_id"])
-            query_text = query_item["text"]
+        if self.corpus_ids is None or self.corpus_texts is None:
+            return None
             
-            # Log progress
-            logger.debug(f"Evaluating query {query_id}: {query_text[:50]}...")
+        try:
+            idx = self.corpus_ids.index(doc_id)
+            return self.corpus_texts[idx]
+        except ValueError:
+            return None
 
-            # Retrieve documents
-            results = search_engine.search(
-                query=query_text,
-                bm25=bm25,
-                corpus_texts=corpus_texts,
-                corpus_ids=corpus_ids,
-                sbert_model=sbert_model,
-                doc_embeddings=doc_embeddings,
-                top_k=max(top_k_p, top_k_r),
-                method=method,
-                hybrid_strategy=hybrid_strategy,
-                hybrid_weight=hybrid_weight,
-                use_mmr=use_mmr,
-                mmr_lambda=mmr_lambda,
-                use_cross_encoder=use_cross_encoder
-            )
-
-            # Extract document IDs
-            retrieved_docs = [doc_id for doc_id, _ in results[:top_k_p]]
-            full_retrieved_docs = [doc_id for doc_id, _ in results[:top_k_r]]
-
-            # Helper function to calculate precision and recall
-            def calculate_precision_recall(relevant_set):
-                if not relevant_set:
-                    return None, None
-
-                # Precision@k
-                retrieved_set = set(retrieved_docs)
-                num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-                precision = num_relevant_retrieved / len(retrieved_docs) if retrieved_docs else 0
-
-                # Recall@k
-                full_retrieved_set = set(full_retrieved_docs)
-                num_relevant_in_full = len(relevant_set.intersection(full_retrieved_set))
-                recall = num_relevant_in_full / len(relevant_set) if relevant_set else 0
-
-                return precision, recall
-
-            # Calculate metrics for different relevance levels
-            if query_id in relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['relevant'].append(precision)
-                    all_recalls['relevant'].append(recall)
-
-            if query_id in highly_relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(highly_relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['highly_relevant'].append(precision)
-                    all_recalls['highly_relevant'].append(recall)
-
-            if query_id in overall_relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(overall_relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['overall'].append(precision)
-                    all_recalls['overall'].append(recall)
-
-            num_evaluated += 1
-
-        # Compute averages
-        avg_precisions = {
-            level: (sum(precisions) / len(precisions)) if precisions else 0.0
-            for level, precisions in all_precisions.items()
-        }
-        
-        avg_recalls = {
-            level: (sum(recalls) / len(recalls)) if recalls else 0.0
-            for level, recalls in all_recalls.items()
-        }
-
-        return avg_precisions, avg_recalls, num_evaluated
-
-
-def save_evaluation_results(results, output_file="search_evaluation_results.json"):
-    """
-    Save evaluation results to a JSON file
-    """
-    # Convert results to a serializable format
-    serializable_results = []
-    for result in results:
-        serializable_result = {
-            "config": {
-                "name": result["config"]["name"],
-                "method": result["config"]["method"] if isinstance(result["config"]["method"], str) else result["config"]["method"].value,
-                "use_mmr": result["config"]["use_mmr"],
-                "use_cross_encoder": result["config"]["use_cross_encoder"]
-            },
-            "avg_precisions": result["avg_precisions"],
-            "avg_recalls": result["avg_recalls"],
-            "num_evaluated": result["num_evaluated"]
-        }
-        
-        # Add hybrid strategy if present
-        if "hybrid_strategy" in result["config"]:
-            serializable_result["config"]["hybrid_strategy"] = (
-                result["config"]["hybrid_strategy"] 
-                if isinstance(result["config"]["hybrid_strategy"], str) 
-                else result["config"]["hybrid_strategy"].value
-            )
-            
-        # Add other optional parameters if present
-        for param in ["mmr_lambda", "hybrid_weight"]:
-            if param in result["config"]:
-                serializable_result["config"][param] = result["config"][param]
-            
-        serializable_results.append(serializable_result)
-    
-    # Save to file
-    with open(output_file, "w") as f:
-        json.dump(serializable_results, f, indent=2)
-    
-    logger.info(f"Saved evaluation results to {output_file}")
-    return output_file
-
-
-def run_evaluation(
-    corpus_dataset,
+def run_search_for_multiple_queries(
+    search_engine: SearchEngine,
     queries_dataset,
-    qrels_dataset,
-    force_reindex: bool = False,
-    top_k_p: int = 20,
-    top_k_r: int = 1000,
-    sbert_model_name: str = "all-mpnet-base-v2",
-    cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    evaluation_methods: List[Dict] = None,
-    save_results: bool = True,
-    generate_plots: bool = True,
-    output_dir: str = "results"
-):
+    top_k: int = 1000,
+    method: RetrievalMethod = RetrievalMethod.BM25,
+    hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+    hybrid_weight: float = 0.5,
+    use_mmr: bool = False,
+    mmr_lambda: float = 0.5,
+    use_cross_encoder: bool = False
+) -> Dict[int, List[Tuple[str, float]]]:
     """
-    Run the full evaluation pipeline
+    Run search for multiple queries
     
     Args:
-        corpus_dataset: Dataset containing the corpus
-        queries_dataset: Dataset containing the queries
-        qrels_dataset: Dataset containing relevance judgments
-        force_reindex: Whether to force rebuilding indices
-        top_k_p: Number of results to consider for precision
-        top_k_r: Number of results to consider for recall
-        sbert_model_name: Name of the sentence transformer model
-        cross_encoder_model_name: Name of the cross-encoder model
-        evaluation_methods: List of configurations to evaluate
+        search_engine: Initialized SearchEngine instance
+        queries_dataset: Dataset containing queries
+        top_k: Number of results to retrieve per query
+        method: Retrieval method
+        hybrid_strategy: Strategy for hybrid retrieval
+        hybrid_weight: Weight for BM25 vs SBERT in weighted hybrid
+        use_mmr: Whether to use MMR
+        mmr_lambda: Lambda parameter for MMR
+        use_cross_encoder: Whether to use cross-encoder reranking
+        
+    Returns:
+        Dictionary mapping query IDs to search results
     """
-    # Initialize components
-    preprocessor = TextPreprocessor()
-    index_manager = IndexManager(preprocessor)
-    
-    # Build indices
-    logger.info("Building BM25 index...")
-    bm25, corpus_texts, corpus_ids = index_manager.build_bm25_index(
-        corpus_dataset,
-        cache_path="cache/bm25_index.pkl",
-        force_reindex=force_reindex
-    )
-    
-    logger.info("Building SBERT index...")
-    sbert_model, doc_embeddings = index_manager.build_sbert_index(
-        corpus_texts,
-        model_name=sbert_model_name,
-        batch_size=64,
-        cache_path="cache/sbert_index.pt",
-        force_reindex=force_reindex
-    )
-    
-    # Initialize search engine
-    search_engine = SearchEngine(preprocessor, cross_encoder_model_name)
-    
-    # Default evaluation methods if none provided
-    if evaluation_methods is None:
-        evaluation_methods = [
-            {
-                "name": "BM25",
-                "method": RetrievalMethod.BM25,
-                "use_mmr": False,
-                "use_cross_encoder": False
-            },
-            {
-                "name": "SBERT",
-                "method": RetrievalMethod.SBERT,
-                "use_mmr": False,
-                "use_cross_encoder": False
-            },
-            {
-                "name": "Hybrid (Simple Sum)",
-                "method": RetrievalMethod.HYBRID,
-                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-                "use_mmr": False,
-                "use_cross_encoder": False
-            },
-            {
-                "name": "Hybrid (RRF)",
-                "method": RetrievalMethod.HYBRID,
-                "hybrid_strategy": HybridStrategy.RRF,
-                "use_mmr": False,
-                "use_cross_encoder": False
-            },
-            {
-                "name": "Hybrid + MMR",
-                "method": RetrievalMethod.HYBRID,
-                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-                "use_mmr": True,
-                "mmr_lambda": 0.5,
-                "use_cross_encoder": False
-            },
-            {
-                "name": "Hybrid + CrossEncoder",
-                "method": RetrievalMethod.HYBRID,
-                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-                "use_mmr": False,
-                "use_cross_encoder": True
-            }
-        ]
-    
-    # Run evaluations
-    results = []
-    for config in evaluation_methods:
-        logger.info(f"Evaluating method: {config['name']}")
+    query_results = {}
+    for query_item in tqdm(queries_dataset, desc="Running searches"):
+        query_id = int(query_item["_id"])
+        query_text = query_item["text"]
         
-        # Extract parameters from config with defaults
-        method = config.get("method", RetrievalMethod.BM25)
-        hybrid_strategy = config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM)
-        hybrid_weight = config.get("hybrid_weight", 0.5)
-        use_mmr = config.get("use_mmr", False)
-        mmr_lambda = config.get("mmr_lambda", 0.5)
-        use_cross_encoder = config.get("use_cross_encoder", False)
-        
-        # Run evaluation
-        avg_precisions, avg_recalls, num_evaluated = EvaluationUtils.evaluate_retrieval(
-            queries_dataset=queries_dataset,
-            qrels_dataset=qrels_dataset,
-            search_engine=search_engine,
-            bm25=bm25,
-            corpus_texts=corpus_texts,
-            corpus_ids=corpus_ids,
-            sbert_model=sbert_model,
-            doc_embeddings=doc_embeddings,
+        # Perform search
+        search_results = search_engine.search(
+            query=query_text,
+            top_k=top_k,
             method=method,
             hybrid_strategy=hybrid_strategy,
             hybrid_weight=hybrid_weight,
-            top_k_p=top_k_p,
-            top_k_r=top_k_r,
             use_mmr=use_mmr,
             mmr_lambda=mmr_lambda,
             use_cross_encoder=use_cross_encoder
         )
         
-        # Log results
-        logger.info(f"[{config['name']}] Queries evaluated: {num_evaluated}")
-        for level in ['relevant', 'highly_relevant', 'overall']:
-            logger.info(f"[{config['name']}] [{level.capitalize()}] Precision@{top_k_p}: {avg_precisions[level]:.4f}, Recall@{top_k_r}: {avg_recalls[level]:.4f}")
+        # Store results for this query
+        query_results[query_id] = search_results
+    
+    return query_results
+
+def search_single_query(
+    search_engine: SearchEngine,
+    query_text: str,
+    top_k: int = 10,
+    method: RetrievalMethod = RetrievalMethod.HYBRID,
+    hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+    use_cross_encoder: bool = True
+) -> List[Tuple[str, str, float]]:
+    """
+    Convenience function to search for a single query and return document texts
+    
+    Args:
+        search_engine: Initialized SearchEngine instance
+        query_text: Query text
+        top_k: Number of results to retrieve
+        method: Retrieval method
+        hybrid_strategy: Strategy for hybrid retrieval
+        use_cross_encoder: Whether to use cross-encoder reranking
         
-        # Store results
-        results.append({
-            "config": config,
-            "avg_precisions": avg_precisions,
-            "avg_recalls": avg_recalls,
-            "num_evaluated": num_evaluated
-        })
+    Returns:
+        List of tuples (doc_id, doc_text, score)
+    """
+    # Perform search
+    results = search_engine.search(
+        query=query_text,
+        top_k=top_k,
+        method=method,
+        hybrid_strategy=hybrid_strategy,
+        use_cross_encoder=use_cross_encoder
+    )
     
-    # Create output directory if needed
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Save results to JSON if requested
-    if save_results:
-        results_file = os.path.join(output_dir, "evaluation_results.json")
-        save_evaluation_results(results, results_file)
-
-    # Generate visualization plots if requested
-    if generate_plots:
-        logger.info("Generating visualization plots...")
-        plots_dir = os.path.join(output_dir, "plots")
-        plot_paths = visualize_all_results(
-            results,
-            top_k_p=top_k_p,
-            top_k_r=top_k_r,
-            output_dir=plots_dir
-        )
-        logger.info(f"Generated {len(plot_paths)} visualization plots in {plots_dir}")
+    # Get document texts
+    search_results_with_text = []
+    for doc_id, score in results:
+        doc_text = search_engine.get_document_by_id(doc_id)
+        search_results_with_text.append((doc_id, doc_text, score))
     
-    return results
+    return search_results_with_text
 
 
 def main():
-    """Main function to demonstrate functionality"""
+    """Main function to demonstrate search functionality"""
     # Define constants
     FORCE_REINDEX = False
-    TOP_K_P = 20
-    TOP_K_R = 1000
     SBERT_MODEL = 'all-mpnet-base-v2'
     CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
     LOG_LEVEL = 'INFO'
-    OUTPUT_DIR = 'results/search'
     
     # Configure logging
     logging.basicConfig(
@@ -948,13 +748,40 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Print basic statistics
-    logger.info(f"Corpus size: {len(corpus_dataset)} documents")
-    logger.info(f"Query set size: {len(queries_dataset)} queries")
-    logger.info(f"QRels size: {len(qrels_dataset)} judgments")
+    # Initialize components
+    preprocessor = TextPreprocessor()
+    index_manager = IndexManager(preprocessor)
     
-    # Define evaluation methods
-    evaluation_methods = [
+    # Build indices
+    logger.info("Building BM25 index...")
+    bm25, corpus_texts, corpus_ids = index_manager.build_bm25_index(
+        corpus_dataset,
+        cache_path="cache/bm25_index.pkl",
+        force_reindex=FORCE_REINDEX
+    )
+    
+    logger.info("Building SBERT index...")
+    sbert_model, doc_embeddings = index_manager.build_sbert_index(
+        corpus_texts,
+        model_name=SBERT_MODEL,
+        batch_size=64,
+        cache_path="cache/sbert_index.pt",
+        force_reindex=FORCE_REINDEX
+    )
+    
+    # Initialize search engine with all indices and models
+    search_engine = SearchEngine(
+        preprocessor=preprocessor, 
+        bm25=bm25, 
+        corpus_texts=corpus_texts, 
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model, 
+        doc_embeddings=doc_embeddings,
+        cross_encoder_model_name=CROSS_ENCODER_MODEL
+    )
+    
+    # Define search configurations to test
+    search_configs = [
         {
             "name": "BM25",
             "method": RetrievalMethod.BM25,
@@ -981,60 +808,127 @@ def main():
             "use_mmr": False,
             "use_cross_encoder": False
         },
-        # {
-        #     "name": "Hybrid + MMR",
-        #     "method": RetrievalMethod.HYBRID,
-        #     "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        #     "use_mmr": True,
-        #     "mmr_lambda": 0.5,
-        #     "use_cross_encoder": False
-        # },
         {
             "name": "Hybrid + CrossEncoder",
             "method": RetrievalMethod.HYBRID,
             "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
             "use_mmr": False,
             "use_cross_encoder": True
-        },
-        # {
-        #     "name": "Hybrid + MMR + CrossEncoder",
-        #     "method": RetrievalMethod.HYBRID,
-        #     "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        #     "use_mmr": True,
-        #     "mmr_lambda": 0.5,
-        #     "use_cross_encoder": True
-        # }
+        }
     ]
     
-    # Run evaluation
-    results = run_evaluation(
-        corpus_dataset=corpus_dataset,
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        force_reindex=FORCE_REINDEX,
-        top_k_p=TOP_K_P,
-        top_k_r=TOP_K_R,
-        sbert_model_name=SBERT_MODEL,
-        cross_encoder_model_name=CROSS_ENCODER_MODEL,
-        evaluation_methods=evaluation_methods,
-        save_results=True,
-        generate_plots=True,
-        output_dir=OUTPUT_DIR
-    )
-    logger.info(f"\nResults and plots saved to {OUTPUT_DIR}")
+    # Run searches for each configuration
+    logger.info("Running searches with different configurations...")
+    all_results = {}
+    
+    for config in search_configs:
+        logger.info(f"Running search with {config['name']}...")
+        method = config.get("method", RetrievalMethod.BM25)
+        hybrid_strategy = config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM)
+        use_mmr = config.get("use_mmr", False)
+        use_cross_encoder = config.get("use_cross_encoder", False)
+        
+        # Run search for all queries with this configuration
+        query_results = run_search_for_multiple_queries(
+            search_engine=search_engine,
+            queries_dataset=queries_dataset,
+            top_k=1000,
+            method=method,
+            hybrid_strategy=hybrid_strategy,
+            use_mmr=use_mmr,
+            use_cross_encoder=use_cross_encoder
+        )
+        
+        all_results[config["name"]] = query_results
+    
+    # Import the SearchEvaluationUtils for evaluation
+    from evaluation import SearchEvaluationUtils
+    
+    # Evaluate each search configuration
+    logger.info("Evaluating search results...")
+    evaluation_results = []
+    
+    for config_name, query_results in all_results.items():
+        logger.info(f"Evaluating {config_name}...")
+        
+        # Calculate metrics
+        avg_precisions, avg_recalls, num_evaluated = SearchEvaluationUtils.evaluate_results(
+            results_by_query_id=query_results,
+            qrels_dataset=qrels_dataset,
+            top_k_p=20,
+            top_k_r=1000
+        )
+        
+        # Get the corresponding config
+        config = next(config for config in search_configs if config["name"] == config_name)
+        
+        # Store evaluation results
+        evaluation_results.append({
+            "config": config,
+            "avg_precisions": avg_precisions,
+            "avg_recalls": avg_recalls,
+            "num_evaluated": num_evaluated
+        })
+    
+    # Calculate F1 scores
+    metrics_with_f1 = SearchEvaluationUtils.calculate_f1_scores(evaluation_results)
     
     # Print results summary
     logger.info("\n===== EVALUATION RESULTS SUMMARY =====")
-    logger.info(f"{'Method':<30} {'P@'+str(TOP_K_P):<10} {'R@'+str(TOP_K_R):<10}")
-    logger.info("-" * 50)
+    logger.info(f"{'Method':<30} {'P@20':<10} {'R@1000':<10} {'F1':<10}")
+    logger.info("-" * 60)
     
-    for result in results:
-        config_name = result["config"]["name"]
-        precision = result["avg_precisions"]["highly_relevant"]
-        recall = result["avg_recalls"]["highly_relevant"]
-        logger.info(f"{config_name:<30} {precision:.4f}     {recall:.4f}")
+    for metric in metrics_with_f1:
+        name = metric["config"]["name"]
+        precision = metric["precision"]
+        recall = metric["recall"]
+        f1 = metric["f1"]
+        logger.info(f"{name:<30} {precision:.4f}     {recall:.4f}     {f1:.4f}")
     
-    return results
+    # Save results
+    output_dir = "results/search"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    results_file = os.path.join(output_dir, "search_evaluation_results.json")
+    SearchEvaluationUtils.save_evaluation_results(evaluation_results, results_file)
+    logger.info(f"Results saved to {results_file}")
+    
+    # Import visualization functions from search_viz.py
+    from search_viz import visualize_all_results
+    
+    # Generate visualization plots
+    logger.info("Generating visualization plots...")
+    plots_dir = os.path.join(output_dir, "plots")
+    plot_paths = visualize_all_results(
+        results=evaluation_results,
+        top_k_p=20,
+        top_k_r=1000,
+        output_dir=plots_dir
+    )
+    
+    # Log visualization outputs
+    logger.info(f"Generated {len(plot_paths)} visualization plots:")
+    for path in plot_paths:
+        logger.info(f"- {path}")
+    
+    # Example of a single query search
+    example_query = queries_dataset[0]["text"]
+    logger.info(f"\nRunning example search for query: {example_query}")
+    
+    example_results = search_single_query(
+        search_engine=search_engine,
+        query_text=example_query,
+        top_k=5,
+        method=RetrievalMethod.HYBRID,
+        use_cross_encoder=True
+    )
+    
+    logger.info("Top 5 search results:")
+    for i, (doc_id, doc_text, score) in enumerate(example_results):
+        doc_preview = doc_text[:100] + "..." if len(doc_text) > 100 else doc_text
+        logger.info(f"{i+1}. [ID: {doc_id}, Score: {score:.4f}] {doc_preview}")
+    
+    return evaluation_results
 
 
 # Execute main function if called directly
