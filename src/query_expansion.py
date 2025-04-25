@@ -2,15 +2,10 @@
 import os
 import logging
 import pickle
-import time
-import matplotlib.pyplot as plt
-import numpy as np
 from typing import List, Dict, Tuple, Set, Union, Optional
 from enum import Enum
-from collections import Counter, defaultdict
-import torch
+from collections import defaultdict
 from tqdm import tqdm
-import json
 
 # Import from other modules
 from search import (
@@ -19,9 +14,9 @@ from search import (
     IndexManager,
     RetrievalMethod,
     HybridStrategy,
-    EvaluationUtils,
-    save_evaluation_results
+    run_search_for_multiple_queries
 )
+from evaluation import SearchEvaluationUtils
 from keyword_extraction import KeywordExtractor
 from search_viz import visualize_all_results
 
@@ -72,17 +67,8 @@ class QueryExpander:
         self.sbert_model_name = sbert_model_name
         self.cross_encoder_model_name = cross_encoder_model_name
         
-        # Initialize keyword extractor
-        self.keyword_extractor = KeywordExtractor(
-            keybert_model=sbert_model_name,
-            cache_dir=cache_dir
-        )
-        
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
-        
-        # Cache paths
-        self.expansion_cache_path = os.path.join(cache_dir, "query_expansion_results.pkl")
     
     def _load_or_build_indices(
         self,
@@ -173,19 +159,19 @@ class QueryExpander:
         result = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return result
     
-    def expand_and_search(
+    def expand_queries(
         self,
         queries_dataset,
         corpus_dataset,
-        qrels_dataset=None,
+        baseline_results: Dict[int, List[Tuple[str, float]]],
+        search_engine: SearchEngine,
+        query_keywords: Dict[str, List[str]],
         expansion_method: QueryExpansionMethod = QueryExpansionMethod.KEYBERT,
         combination_strategy: QueryCombinationStrategy = QueryCombinationStrategy.WEIGHTED_RRF,
         num_keywords: int = 5,
-        top_n_docs_for_extraction: int = 10,
         top_k_results: int = 1000,
-        original_query_weight: float = 0.7,
-        force_reindex: bool = False,
-        force_regenerate: bool = False,
+        original_query_weight: float = 0.5,
+        force_regenerate_expansion: bool = False,
         cache_path: Optional[str] = None
     ):
         """
@@ -194,19 +180,19 @@ class QueryExpander:
         Args:
             queries_dataset: Dataset containing queries
             corpus_dataset: Dataset containing corpus documents
-            qrels_dataset: Dataset containing relevance judgments (optional)
-            expansion_method: Method for keyword extraction (keybert, pmi, sopmi, combined)
-            combination_strategy: How to combine expanded terms (rrf or concatenated)
+            baseline_results: Dictionary of baseline search results
+            search_engine: Initialized SearchEngine instance
+            query_keywords: Pre-extracted keywords for each query
+            expansion_method: Method for keyword extraction
+            combination_strategy: How to combine expanded terms
             num_keywords: Number of keywords to extract per query
-            top_n_docs_for_extraction: Number of docs to use for keyword extraction
             top_k_results: Number of results to retrieve per query
             original_query_weight: Weight for original query in RRF combination
-            force_reindex: Whether to force rebuilding indices
-            force_regenerate: Whether to force regenerating results
+            force_regenerate_expansion: Whether to force regenerating expansion results
             cache_path: Optional specific cache path for this configuration
             
         Returns:
-            Dictionary of results, including raw search results and evaluation metrics if qrels provided
+            Dictionary of results, including raw search results
         """
         # Use specific cache path if provided, otherwise use default
         if cache_path is None:
@@ -216,7 +202,7 @@ class QueryExpander:
             )
         
         # Try to load cached results first
-        if not force_regenerate and os.path.exists(cache_path):
+        if not force_regenerate_expansion and os.path.exists(cache_path):
             try:
                 logger.info(f"Loading cached expansion results from {cache_path}")
                 with open(cache_path, "rb") as f:
@@ -224,99 +210,29 @@ class QueryExpander:
             except Exception as e:
                 logger.warning(f"Error loading cached results: {e}")
         
-        # Load or build indices
-        bm25, corpus_texts, corpus_ids, sbert_model, doc_embeddings = self._load_or_build_indices(
-            corpus_dataset,
-            force_reindex=force_reindex
-        )
+        # Create a map of query_id to query_text for easier access
+        query_id_to_text = {int(item["_id"]): item["text"] for item in queries_dataset}
         
-        # Initialize search engine
-        search_engine = SearchEngine(self.preprocessor, self.cross_encoder_model_name)
+        # Process expanded queries based on strategy
+        logger.info(f"Processing expanded queries with {combination_strategy.value}...")
+        expanded_results = {}
         
-        # Track results for each query
-        baseline_results = []
-        expanded_results = []
-        
-        # Process each query
-        for query_item in tqdm(queries_dataset, desc="Processing queries"):
-            query_id = int(query_item["_id"])
-            query_text = query_item["text"]
-            
-            logger.info(f"Processing query ID {query_id}: {query_text}")
-            
-            # Baseline search (hybrid simple sum, no MMR, no cross-encoder)
-            baseline_search_results = search_engine.search(
-                query=query_text,
-                bm25=bm25,
-                corpus_texts=corpus_texts,
-                corpus_ids=corpus_ids,
-                sbert_model=sbert_model,
-                doc_embeddings=doc_embeddings,
-                top_k=top_k_results,
-                method=RetrievalMethod.HYBRID,
-                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
-                use_mmr=False,
-                use_cross_encoder=False
-            )
-            
-            # Store baseline results
-            baseline_results.append({
-                "query_id": query_id,
-                "query_text": query_text,
-                "results": baseline_search_results
-            })
-            
-            # Get top N documents for keyword extraction
-            top_docs = []
-            for doc_id, _ in baseline_search_results[:top_n_docs_for_extraction]:
-                idx = corpus_ids.index(doc_id)
-                top_docs.append(corpus_texts[idx])
-            
-            # Extract keywords based on selected method
-            if expansion_method == QueryExpansionMethod.KEYBERT:
-                keywords = self.keyword_extractor.extract_keywords(
-                    query=query_text,
-                    docs_text=top_docs,
-                    num_keywords=num_keywords
-                )
-            elif expansion_method == QueryExpansionMethod.PMI:
-                # TODO: Implement PMI keyword extraction
-                keywords = self.keyword_extractor.extract_keywords(
-                    query=query_text,
-                    docs_text=top_docs,
-                    num_keywords=num_keywords
-                )  # Fallback to KeyBERT for now
-            elif expansion_method == QueryExpansionMethod.SOPMI:
-                # TODO: Implement SoPMI keyword extraction
-                keywords = self.keyword_extractor.extract_keywords(
-                    query=query_text,
-                    docs_text=top_docs,
-                    num_keywords=num_keywords
-                )  # Fallback to KeyBERT for now
-            elif expansion_method == QueryExpansionMethod.COMBINED:
-                # Combine keywords from multiple methods (all KeyBERT for now)
-                keywords = self.keyword_extractor.extract_keywords(
-                    query=query_text,
-                    docs_text=top_docs,
-                    num_keywords=num_keywords
-                )
-            else:
-                raise ValueError(f"Unsupported expansion method: {expansion_method}")
-            
-            logger.info(f"Extracted keywords: {keywords}")
-            
-            # Apply the selected combination strategy
-            if combination_strategy == QueryCombinationStrategy.WEIGHTED_RRF:
+        if combination_strategy == QueryCombinationStrategy.WEIGHTED_RRF:
+            # For each query, combine original results with keyword results using RRF
+            for query_id, original_results in tqdm(baseline_results.items(), desc="Processing with RRF"):
+                # Skip if no keywords available
+                if query_keywords is None or str(query_id) not in query_keywords:
+                    logger.warning(f"No keywords found for query ID {query_id}, skipping expansion")
+                    continue
+                
+                # Get keywords for this query
+                keywords = query_keywords[str(query_id)]
+                
                 # Search for each keyword individually
                 keyword_results = []
                 for keyword in keywords:
                     kw_results = search_engine.search(
                         query=keyword,
-                        bm25=bm25,
-                        corpus_texts=corpus_texts,
-                        corpus_ids=corpus_ids,
-                        sbert_model=sbert_model,
-                        doc_embeddings=doc_embeddings,
                         top_k=top_k_results,
                         method=RetrievalMethod.HYBRID,
                         hybrid_strategy=HybridStrategy.SIMPLE_SUM,
@@ -326,116 +242,99 @@ class QueryExpander:
                     keyword_results.append(kw_results)
                 
                 # Combine with RRF, weighting original query higher
-                all_rankings = [baseline_search_results] + keyword_results
+                all_rankings = [original_results] + keyword_results
                 weights = [original_query_weight] + [(1.0 - original_query_weight) / len(keywords)] * len(keywords)
                 
                 combined_results = self._reciprocal_rank_fusion(all_rankings, weights)
+                expanded_results[query_id] = combined_results
                 
-                expanded_results.append({
-                    "query_id": query_id,
-                    "query_text": query_text,
-                    "expanded_text": ", ".join(keywords),  # Just for logging
-                    "strategy": combination_strategy.value,
-                    "results": combined_results
-                })
+        elif combination_strategy == QueryCombinationStrategy.CONCATENATED:
+            # Create expanded query dataset with concatenated keywords
+            expanded_queries = []
+            
+            for query_item in queries_dataset:
+                query_id = int(query_item["_id"])
+                query_text = query_item["text"]
                 
-            elif combination_strategy == QueryCombinationStrategy.CONCATENATED:
-                # Concatenate original query with keywords
-                expanded_query_text = self._deduplicate_query_and_keywords(query_text, keywords)
-                logger.info(f"Expanded query: {expanded_query_text}")
+                # Skip if no keywords available
+                if query_keywords is None or str(query_id) not in query_keywords:
+                    logger.warning(f"No keywords found for query ID {query_id}, skipping expansion")
+                    continue
                 
-                # Search with concatenated query
-                expanded_search_results = search_engine.search(
-                    query=expanded_query_text,
-                    bm25=bm25,
-                    corpus_texts=corpus_texts,
-                    corpus_ids=corpus_ids,
-                    sbert_model=sbert_model,
-                    doc_embeddings=doc_embeddings,
-                    top_k=top_k_results,
-                    method=RetrievalMethod.HYBRID,
-                    hybrid_strategy=HybridStrategy.SIMPLE_SUM,
-                    use_mmr=False,
-                    use_cross_encoder=False
-                )
+                # Get keywords and concatenate with original query
+                keywords = query_keywords[str(query_id)]
+                expanded_text = self._deduplicate_query_and_keywords(query_text, keywords)
                 
-                expanded_results.append({
-                    "query_id": query_id,
-                    "query_text": query_text,
-                    "expanded_text": expanded_query_text,
-                    "strategy": combination_strategy.value,
-                    "results": expanded_search_results
-                })
-                
-            elif combination_strategy == QueryCombinationStrategy.CONCATENATED_RERANKED:
-                # Concatenate original query with keywords
-                expanded_query_text = self._deduplicate_query_and_keywords(query_text, keywords)
-                logger.info(f"Expanded query (with reranking): {expanded_query_text}")
-                
-                # Search with concatenated query and cross-encoder reranking
-                expanded_search_results = search_engine.search(
-                    query=expanded_query_text,
-                    bm25=bm25,
-                    corpus_texts=corpus_texts,
-                    corpus_ids=corpus_ids,
-                    sbert_model=sbert_model,
-                    doc_embeddings=doc_embeddings,
-                    top_k=top_k_results,
-                    method=RetrievalMethod.HYBRID,
-                    hybrid_strategy=HybridStrategy.SIMPLE_SUM,
-                    use_mmr=False,
-                    use_cross_encoder=True  # Enable reranking
-                )
-                
-                expanded_results.append({
-                    "query_id": query_id,
-                    "query_text": query_text,
-                    "expanded_text": expanded_query_text,
-                    "strategy": combination_strategy.value,
-                    "results": expanded_search_results
+                # Add to expanded queries list
+                expanded_queries.append({
+                    "_id": str(query_id),
+                    "text": expanded_text
                 })
             
-            else:
-                raise ValueError(f"Unsupported combination strategy: {combination_strategy}")
+            # Run search with expanded queries
+            expanded_results = run_search_for_multiple_queries(
+                search_engine=search_engine,
+                queries_dataset=expanded_queries,
+                top_k=top_k_results,
+                method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
+            
+        elif combination_strategy == QueryCombinationStrategy.CONCATENATED_RERANKED:
+            # Create expanded query dataset with concatenated keywords
+            expanded_queries = []
+            
+            for query_item in queries_dataset:
+                query_id = int(query_item["_id"])
+                query_text = query_item["text"]
+                
+                # Skip if no keywords available
+                if query_keywords is None or str(query_id) not in query_keywords:
+                    logger.warning(f"No keywords found for query ID {query_id}, skipping expansion")
+                    continue
+                
+                # Get keywords and concatenate with original query
+                keywords = query_keywords[str(query_id)]
+                expanded_text = self._deduplicate_query_and_keywords(query_text, keywords)
+                
+                # Add to expanded queries list
+                expanded_queries.append({
+                    "_id": str(query_id),
+                    "text": expanded_text
+                })
+            
+            # Run search with expanded queries and cross-encoder reranking
+            expanded_results = run_search_for_multiple_queries(
+                search_engine=search_engine,
+                queries_dataset=expanded_queries,
+                top_k=top_k_results,
+                method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                use_mmr=False,
+                use_cross_encoder=True  # Enable reranking
+            )
+            
+        else:
+            raise ValueError(f"Unsupported combination strategy: {combination_strategy}")
+        
+        # Format results for consistency with original code
+        expanded_formatted = []
+        for query_id, results in expanded_results.items():
+            if query_id in query_id_to_text:
+                expanded_formatted.append({
+                    "query_id": query_id,
+                    "query_text": query_id_to_text[query_id],
+                    "results": results
+                })
         
         result_data = {
             "expansion_method": expansion_method.value,
             "combination_strategy": combination_strategy.value,
             "num_keywords": num_keywords,
-            "baseline_results": baseline_results,
-            "expanded_results": expanded_results,
+            "expanded_results": expanded_formatted,
         }
-        
-        # Perform evaluation if qrels are provided
-        if qrels_dataset is not None:
-            # Use EvaluationUtils from search.py
-            relevant_docs_by_query, highly_relevant_docs_by_query, overall_relevant_docs_by_query = (
-                EvaluationUtils.build_qrels_dicts(qrels_dataset)
-            )
-            
-            # Evaluate baseline results
-            baseline_metrics = self._evaluate_search_results(
-                baseline_results, 
-                relevant_docs_by_query,
-                highly_relevant_docs_by_query,
-                overall_relevant_docs_by_query,
-                top_k_p=20,
-                top_k_r=top_k_results
-            )
-            
-            # Evaluate expanded results
-            expanded_metrics = self._evaluate_search_results(
-                expanded_results, 
-                relevant_docs_by_query,
-                highly_relevant_docs_by_query,
-                overall_relevant_docs_by_query,
-                top_k_p=20,
-                top_k_r=top_k_results
-            )
-            
-            # Add metrics to result data
-            result_data["baseline_metrics"] = baseline_metrics
-            result_data["expanded_metrics"] = expanded_metrics
         
         # Cache results
         try:
@@ -447,105 +346,6 @@ class QueryExpander:
         
         return result_data
     
-    def _evaluate_search_results(
-        self,
-        search_results: List[Dict],
-        relevant_docs_by_query: Dict[int, Set[str]],
-        highly_relevant_docs_by_query: Dict[int, Set[str]],
-        overall_relevant_docs_by_query: Dict[int, Set[str]],
-        top_k_p: int = 20,
-        top_k_r: int = 1000
-    ) -> Dict:
-        """
-        Evaluate search results using metrics from search.py
-        
-        Args:
-            search_results: List of search result items
-            relevant_docs_by_query: Dictionary of relevant docs by query ID
-            highly_relevant_docs_by_query: Dictionary of highly relevant docs by query ID
-            overall_relevant_docs_by_query: Dictionary of all relevant docs by query ID
-            top_k_p: Number of results to consider for precision
-            top_k_r: Number of results to consider for recall
-            
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        all_precisions = {'relevant': [], 'highly_relevant': [], 'overall': []}
-        all_recalls = {'relevant': [], 'highly_relevant': [], 'overall': []}
-        num_evaluated = 0
-        
-        for result_item in search_results:
-            query_id = result_item["query_id"]
-            retrieved_results = result_item["results"]
-            
-            # Extract document IDs
-            retrieved_docs = [doc_id for doc_id, _ in retrieved_results[:top_k_p]]
-            full_retrieved_docs = [doc_id for doc_id, _ in retrieved_results[:top_k_r]]
-            
-            # Helper function to calculate precision and recall
-            def calculate_precision_recall(relevant_set):
-                if not relevant_set:
-                    return None, None
-                
-                # Precision@k
-                retrieved_set = set(retrieved_docs)
-                num_relevant_retrieved = len(relevant_set.intersection(retrieved_set))
-                precision = num_relevant_retrieved / len(retrieved_docs) if retrieved_docs else 0
-                
-                # Recall@k
-                full_retrieved_set = set(full_retrieved_docs)
-                num_relevant_in_full = len(relevant_set.intersection(full_retrieved_set))
-                recall = num_relevant_in_full / len(relevant_set) if relevant_set else 0
-                
-                return precision, recall
-            
-            # Calculate metrics for different relevance levels
-            if query_id in relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['relevant'].append(precision)
-                    all_recalls['relevant'].append(recall)
-            
-            if query_id in highly_relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(highly_relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['highly_relevant'].append(precision)
-                    all_recalls['highly_relevant'].append(recall)
-            
-            if query_id in overall_relevant_docs_by_query:
-                precision, recall = calculate_precision_recall(overall_relevant_docs_by_query[query_id])
-                if precision is not None:
-                    all_precisions['overall'].append(precision)
-                    all_recalls['overall'].append(recall)
-            
-            num_evaluated += 1
-        
-        # Compute averages
-        avg_precisions = {
-            level: (sum(precisions) / len(precisions)) if precisions else 0.0
-            for level, precisions in all_precisions.items()
-        }
-        
-        avg_recalls = {
-            level: (sum(recalls) / len(recalls)) if recalls else 0.0
-            for level, recalls in all_recalls.items()
-        }
-        
-        # Calculate F1 scores
-        f1_scores = {}
-        for level in ['relevant', 'highly_relevant', 'overall']:
-            precision = avg_precisions[level]
-            recall = avg_recalls[level]
-            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-            f1_scores[level] = f1
-        
-        return {
-            "precisions": avg_precisions,
-            "recalls": avg_recalls,
-            "f1_scores": f1_scores,
-            "num_evaluated": num_evaluated
-        }
-    
     def run_evaluation_suite(
         self,
         queries_dataset,
@@ -556,7 +356,8 @@ class QueryExpander:
         top_n_docs_for_extraction: int = 10,
         top_k_results: int = 1000,
         force_reindex: bool = False,
-        force_regenerate: bool = False,
+        force_regenerate_keywords: bool = False,
+        force_regenerate_expansion: bool = False,
         output_dir: str = "results/query_expansion"
     ) -> Dict:
         """
@@ -571,7 +372,8 @@ class QueryExpander:
             top_n_docs_for_extraction: Number of docs to use for keyword extraction
             top_k_results: Number of results to retrieve per query
             force_reindex: Whether to force rebuilding indices
-            force_regenerate: Whether to force regenerating results
+            force_regenerate_keywords: Whether to force regenerating keywords
+            force_regenerate_expansion: Whether to force regenerating expansion results
             output_dir: Directory for output files
             
         Returns:
@@ -580,26 +382,116 @@ class QueryExpander:
         # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
         
+        # Load or build indices
+        bm25, corpus_texts, corpus_ids, sbert_model, doc_embeddings = self._load_or_build_indices(
+            corpus_dataset,
+            force_reindex=force_reindex
+        )
+        
+        # Initialize search engine
+        search_engine = SearchEngine(
+            preprocessor=self.preprocessor, 
+            bm25=bm25,
+            corpus_texts=corpus_texts,
+            corpus_ids=corpus_ids,
+            sbert_model=sbert_model,
+            doc_embeddings=doc_embeddings,
+            cross_encoder_model_name=self.cross_encoder_model_name
+        )
+        
+        # Run baseline search with original queries
+        logger.info("Running baseline search...")
+        baseline_cache_path = os.path.join(self.cache_dir, "baseline_results.pkl")
+        
+        # Try to load cached baseline results
+        baseline_results = None
+        if not force_regenerate_expansion and os.path.exists(baseline_cache_path):
+            try:
+                logger.info(f"Loading cached baseline results from {baseline_cache_path}")
+                with open(baseline_cache_path, "rb") as f:
+                    baseline_data = pickle.load(f)
+                    baseline_formatted = baseline_data.get("baseline_results", [])
+                    baseline_results = {item["query_id"]: item["results"] for item in baseline_formatted}
+            except Exception as e:
+                logger.warning(f"Error loading cached baseline results: {e}")
+        
+        # Run baseline search if not loaded from cache
+        if baseline_results is None:
+            baseline_results = run_search_for_multiple_queries(
+                search_engine=search_engine,
+                queries_dataset=queries_dataset,
+                top_k=top_k_results,
+                method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
+            
+            # Format baseline results and cache them
+            query_id_to_text = {int(item["_id"]): item["text"] for item in queries_dataset}
+            baseline_formatted = []
+            for query_id, results in baseline_results.items():
+                baseline_formatted.append({
+                    "query_id": query_id,
+                    "query_text": query_id_to_text.get(query_id, ""),
+                    "results": results
+                })
+                
+            baseline_data = {
+                "baseline_results": baseline_formatted
+            }
+            
+            try:
+                with open(baseline_cache_path, "wb") as f:
+                    pickle.dump(baseline_data, f)
+            except Exception as e:
+                logger.warning(f"Error caching baseline results: {e}")
+        
+        # Initialize keyword extractor with the appropriate parameters
+        keyword_extractor = KeywordExtractor(
+            keybert_model=self.sbert_model_name,
+            cache_dir=self.cache_dir,
+            top_k_docs=top_k_results,
+            top_n_docs_for_extraction=top_n_docs_for_extraction
+        )
+        
+        # Extract keywords for all queries once
+        logger.info("Extracting keywords for all queries...")
+        all_query_keywords = keyword_extractor.extract_keywords_for_queries(
+            queries_dataset=queries_dataset,
+            corpus_dataset=corpus_dataset,
+            num_keywords=num_keywords,
+            diversity=0.7,  # Default diversity parameter
+            force_regenerate=force_regenerate_keywords,
+            force_reindex=force_reindex
+        )
+        
         # Track all results for visualization
         all_visualization_results = []
         results_by_config = {}
         
-        # First, run baseline (no expansion)
-        logger.info("Running baseline evaluation...")
-        baseline_cache_path = os.path.join(self.cache_dir, "baseline_results.pkl")
-        
-        baseline_result = self.expand_and_search(
-            queries_dataset=queries_dataset,
-            corpus_dataset=corpus_dataset,
-            qrels_dataset=qrels_dataset,
-            # No expansion for baseline
-            cache_path=baseline_cache_path,
-            force_reindex=force_reindex,
-            force_regenerate=force_regenerate
-        )
-        
-        # Format baseline result for visualization
-        if "baseline_metrics" in baseline_result:
+        # Prepare baseline result for visualization
+        baseline_metrics = None
+        if qrels_dataset is not None:
+            # Evaluate baseline results
+            avg_precisions, avg_recalls, num_evaluated = SearchEvaluationUtils.evaluate_results(
+                results_by_query_id=baseline_results,
+                qrels_dataset=qrels_dataset,
+                top_k_p=20,
+                top_k_r=top_k_results
+            )
+
+            baseline_metrics = {
+                "precisions": avg_precisions,
+                "recalls": avg_recalls,
+                "f1_scores": {
+                    level: SearchEvaluationUtils.calculate_f1_score(avg_precisions[level], avg_recalls[level])
+                    for level in ['relevant', 'highly_relevant', 'overall']
+                },
+                "num_evaluated": num_evaluated
+            }
+            
+            # Add baseline to visualization results
             baseline_viz_result = {
                 "config": {
                     "name": "Baseline",
@@ -608,9 +500,9 @@ class QueryExpander:
                     "use_mmr": False,
                     "use_cross_encoder": False
                 },
-                "avg_precisions": baseline_result["baseline_metrics"]["precisions"],
-                "avg_recalls": baseline_result["baseline_metrics"]["recalls"],
-                "num_evaluated": baseline_result["baseline_metrics"]["num_evaluated"]
+                "avg_precisions": baseline_metrics["precisions"],
+                "avg_recalls": baseline_metrics["recalls"],
+                "num_evaluated": baseline_metrics["num_evaluated"]
             }
             all_visualization_results.append(baseline_viz_result)
         
@@ -626,26 +518,52 @@ class QueryExpander:
                 f"expanded_{expansion_method.value}_{combination_strategy.value}.pkl"
             )
             
-            # Run expansion and search
-            result_data = self.expand_and_search(
+            # Run expansion and search with pre-extracted keywords
+            result_data = self.expand_queries(
                 queries_dataset=queries_dataset,
                 corpus_dataset=corpus_dataset,
-                qrels_dataset=qrels_dataset,
+                baseline_results=baseline_results,
+                search_engine=search_engine,
+                query_keywords=all_query_keywords,
                 expansion_method=expansion_method,
                 combination_strategy=combination_strategy,
                 num_keywords=num_keywords,
-                top_n_docs_for_extraction=top_n_docs_for_extraction,
                 top_k_results=top_k_results,
-                force_reindex=force_reindex,
-                force_regenerate=force_regenerate,
+                force_regenerate_expansion=force_regenerate_expansion,
                 cache_path=cache_path
             )
             
-            # Store results
-            results_by_config[config["name"]] = result_data
+            # Add baseline metrics if available
+            if baseline_metrics is not None:
+                result_data["baseline_metrics"] = baseline_metrics
             
-            # Format for visualization
-            if "expanded_metrics" in result_data:
+            # Evaluate expanded results if qrels are provided
+            if qrels_dataset is not None:
+                # Convert to the format needed for evaluation
+                expanded_results_by_query_id = {item["query_id"]: item["results"] for item in result_data["expanded_results"]}
+                
+                # Evaluate expanded results
+                avg_precisions, avg_recalls, num_evaluated = SearchEvaluationUtils.evaluate_results(
+                    results_by_query_id=expanded_results_by_query_id,
+                    qrels_dataset=qrels_dataset,
+                    top_k_p=20,
+                    top_k_r=top_k_results
+                )
+
+                expanded_metrics = {
+                    "precisions": avg_precisions,
+                    "recalls": avg_recalls,
+                    "f1_scores": {
+                        level: SearchEvaluationUtils.calculate_f1_score(avg_precisions[level], avg_recalls[level])
+                        for level in ['relevant', 'highly_relevant', 'overall']
+                    },
+                    "num_evaluated": num_evaluated
+                }
+                
+                # Add metrics to result data
+                result_data["expanded_metrics"] = expanded_metrics
+                
+                # Format for visualization
                 viz_result = {
                     "config": {
                         "name": config["name"],
@@ -656,25 +574,32 @@ class QueryExpander:
                         "expansion_method": expansion_method.value,
                         "combination_strategy": combination_strategy.value
                     },
-                    "avg_precisions": result_data["expanded_metrics"]["precisions"],
-                    "avg_recalls": result_data["expanded_metrics"]["recalls"],
-                    "num_evaluated": result_data["expanded_metrics"]["num_evaluated"]
+                    "avg_precisions": expanded_metrics["precisions"],
+                    "avg_recalls": expanded_metrics["recalls"],
+                    "num_evaluated": expanded_metrics["num_evaluated"]
                 }
                 all_visualization_results.append(viz_result)
+            
+            # Store results
+            results_by_config[config["name"]] = result_data
         
         # Save combined results for visualization
-        output_file = os.path.join(output_dir, "query_expansion_results.json")
-        save_evaluation_results(all_visualization_results, output_file)
-        
-        # Generate visualization plots
-        logger.info("Generating visualization plots...")
-        plots_dir = os.path.join(output_dir, "plots")
-        plot_paths = visualize_all_results(
-            all_visualization_results,
-            top_k_p=20,
-            top_k_r=top_k_results,
-            output_dir=plots_dir
-        )
+        if all_visualization_results:
+            output_file = os.path.join(output_dir, "query_expansion_results.json")
+            SearchEvaluationUtils.save_evaluation_results(all_visualization_results, output_file)
+            
+            # Generate visualization plots
+            logger.info("Generating visualization plots...")
+            plots_dir = os.path.join(output_dir, "plots")
+            plot_paths = visualize_all_results(
+                all_visualization_results,
+                top_k_p=20,
+                top_k_r=top_k_results,
+                output_dir=plots_dir
+            )
+        else:
+            output_file = None
+            plot_paths = []
         
         return {
             "visualization_results": all_visualization_results,
@@ -690,8 +615,9 @@ def main():
     
     # Define constants for configuration
     FORCE_REINDEX = False
-    FORCE_REGENERATE = False
-    NUM_KEYWORDS = 5
+    FORCE_REGENERATE_KEYWORDS = False
+    FORCE_REGENERATE_EXPANSION = False
+    NUM_KEYWORDS = 10
     TOP_N_DOCS = 10
     TOP_K_RESULTS = 1000
     OUTPUT_DIR = "results/query_expansion"
@@ -753,7 +679,8 @@ def main():
         top_n_docs_for_extraction=TOP_N_DOCS,
         top_k_results=TOP_K_RESULTS,
         force_reindex=FORCE_REINDEX,
-        force_regenerate=FORCE_REGENERATE,
+        force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS,
+        force_regenerate_expansion=FORCE_REGENERATE_EXPANSION,
         output_dir=OUTPUT_DIR
     )
     
@@ -768,12 +695,15 @@ def main():
         recall = result["avg_recalls"]["overall"]
         
         # Calculate F1
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        f1 = SearchEvaluationUtils.calculate_f1_score(precision, recall)
         
         logger.info(f"{config_name:<40} {precision:.4f}     {recall:.4f}     {f1:.4f}")
     
-    logger.info(f"\nResults saved to {results['output_file']}")
-    logger.info(f"Visualization plots saved to {os.path.dirname(results['plot_paths'][0])}")
+    if results["output_file"]:
+        logger.info(f"\nResults saved to {results['output_file']}")
+    
+    if results["plot_paths"]:
+        logger.info(f"Visualization plots saved to {os.path.dirname(results['plot_paths'][0])}")
     
     return results
 
