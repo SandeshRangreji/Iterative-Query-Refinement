@@ -2,19 +2,22 @@
 import logging
 import os
 import json
-import pickle
 from typing import List, Dict, Tuple, Set, Optional
-from collections import defaultdict
 import nltk
 from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-import torch
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from datasets import load_dataset
 
-# Import from search.py
-from search import IndexManager, SearchEngine, TextPreprocessor, RetrievalMethod, HybridStrategy
+# Import from other modules
+from search import (
+    TextPreprocessor, 
+    IndexManager,
+    SearchEngine,
+    RetrievalMethod,
+    HybridStrategy
+)
 
 # Configure logging
 logging.basicConfig(
@@ -180,8 +183,15 @@ class KeywordExtractor:
             force_reindex=force_reindex
         )
         
-        # Initialize search engine
-        search_engine = SearchEngine(preprocessor)
+        # Initialize search engine with all indices and models
+        search_engine = SearchEngine(
+            preprocessor=preprocessor,
+            bm25=bm25,
+            corpus_texts=corpus_texts,
+            corpus_ids=corpus_ids,
+            sbert_model=sbert_model,
+            doc_embeddings=doc_embeddings
+        )
         
         # Dictionary to store extracted keywords
         all_keywords = {}
@@ -199,11 +209,6 @@ class KeywordExtractor:
             # Retrieve documents using hybrid search
             results = search_engine.search(
                 query=query_text,
-                bm25=bm25,
-                corpus_texts=corpus_texts,
-                corpus_ids=corpus_ids,
-                sbert_model=sbert_model,
-                doc_embeddings=doc_embeddings,
                 top_k=self.top_k_docs,
                 method=RetrievalMethod.HYBRID,
                 hybrid_strategy=HybridStrategy.SIMPLE_SUM,
@@ -256,8 +261,6 @@ def main():
     
     # Load dataset
     logger.info("Loading dataset...")
-    from datasets import load_dataset
-    
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
     queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
     

@@ -287,7 +287,7 @@ def visualize_all_results(
     results: List[Dict[str, Any]],
     top_k_p: int = 20,
     top_k_r: int = 1000,
-    output_dir: str = "plots"
+    output_dir: str = "results/sample/plots"
 ) -> List[str]:
     """
     Create all visualizations for the evaluation results
