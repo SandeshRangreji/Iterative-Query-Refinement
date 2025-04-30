@@ -182,6 +182,7 @@ sbert_index.pt
 
 # Cache
 cache/
+results/topic_models/
 
 # Mac Stuff
 .DS_Store
