@@ -14,6 +14,7 @@ from bertopic.vectorizers import ClassTfidfTransformer
 from sklearn.feature_extraction.text import CountVectorizer
 from sentence_transformers import SentenceTransformer
 from umap import UMAP
+from datasets import load_dataset
 
 # Import from other modules
 from sampling import (
@@ -431,7 +432,9 @@ class TopicModeler:
         reduce_frequent_words: bool = True,
         stop_words: str = 'english',
         verbose: bool = False,
-        force_recompute: bool = False
+        force_recompute: bool = False,
+        use_svd: bool = True,
+        max_documents: Optional[int] = None  # Changed to Optional, None means no limit
     ) -> Dict:
         """
         Run BERTopic on a set of documents
@@ -455,6 +458,8 @@ class TopicModeler:
             stop_words: Stop words for vectorizer
             verbose: Whether to show verbose output
             force_recompute: Whether to force recomputation
+            use_svd: Whether to use SVD instead of UMAP (faster)
+            max_documents: Maximum number of documents to process (None for no limit)
             
         Returns:
             Dictionary with topic modeling results
@@ -471,7 +476,8 @@ class TopicModeler:
             "use_guided": use_guided,
             "nr_topics": nr_topics,
             "hierarchical_topics": hierarchical_topics,
-            "reduce_frequent_words": reduce_frequent_words
+            "reduce_frequent_words": reduce_frequent_words,
+            "use_svd": use_svd
         }
         
         # Generate cache path
@@ -487,16 +493,50 @@ class TopicModeler:
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
         
+        # Ensure we have enough documents to work with
+        if len(documents) == 0:
+            logger.error("No documents provided for topic modeling")
+            raise ValueError("No documents provided for topic modeling")
+        
+        # Only limit documents if max_documents is explicitly set
+        if max_documents is not None and len(documents) > max_documents:
+            logger.warning(f"Limiting to {max_documents} documents out of {len(documents)}")
+            # Sample systematically rather than randomly to ensure diversity
+            step = len(documents) // max_documents
+            documents = documents[::step][:max_documents]
+        else:
+            logger.info(f"Using full dataset with {len(documents)} documents")
+        
         logger.info(f"Running BERTopic on {len(documents)} documents with method: {method_name}")
         
-        # Prepare UMAP model
-        umap_model = UMAP(
-            n_components=n_components,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist,
-            metric=metric,
-            random_state=self.random_seed
-        )
+        # Force matplotlib to use non-interactive backend
+        import matplotlib
+        matplotlib.use('Agg')
+        
+        # Prepare dimensionality reduction model
+        if use_svd:
+            # Use TruncatedSVD (much faster than UMAP)
+            from sklearn.decomposition import TruncatedSVD
+            svd_components = min(min(100, len(documents) - 1), 50)  # Ensure we don't exceed document count-1
+            logger.info(f"Using TruncatedSVD with {svd_components} components")
+            dimensionality_reduction = TruncatedSVD(n_components=svd_components, random_state=self.random_seed)
+        else:
+            # Use UMAP (slower but potentially better quality)
+            try:
+                from umap import UMAP
+                umap_model = UMAP(
+                    n_components=min(n_components, len(documents) - 1),  # Ensure n_components doesn't exceed docs-1
+                    n_neighbors=min(n_neighbors, len(documents) - 1),  # Ensure n_neighbors doesn't exceed docs-1
+                    min_dist=min_dist,
+                    metric=metric,
+                    random_state=self.random_seed
+                )
+                dimensionality_reduction = umap_model
+            except ImportError:
+                logger.warning("UMAP not available, falling back to SVD")
+                from sklearn.decomposition import TruncatedSVD
+                svd_components = min(min(100, len(documents) - 1), 50)
+                dimensionality_reduction = TruncatedSVD(n_components=svd_components, random_state=self.random_seed)
         
         # Prepare seed topic list if using guided topic modeling and query text is provided
         seed_topic_list = None
@@ -511,7 +551,7 @@ class TopicModeler:
         # Initialize BERTopic model
         topic_model = BERTopic(
             embedding_model=self.embedding_model,
-            umap_model=umap_model,
+            umap_model=dimensionality_reduction,
             hdbscan_model=None,  # Use default HDBSCAN
             vectorizer_model=vectorizer_model,
             ctfidf_model=ctfidf_model,
@@ -523,37 +563,152 @@ class TopicModeler:
             verbose=verbose
         )
         
-        # Encode documents
-        document_embeddings = self.embedding_model.encode(
-            documents, 
-            show_progress_bar=True,
-            batch_size=32
-        )
+        # Encode documents in batches to reduce memory usage
+        logger.info("Encoding documents...")
+        document_embeddings = []
+        documents_per_batch = 32
+        
+        for i in tqdm(range(0, len(documents), documents_per_batch)):
+            batch = documents[i:i + documents_per_batch]
+            try:
+                batch_embeddings = self.embedding_model.encode(
+                    batch, 
+                    show_progress_bar=False,
+                    convert_to_tensor=True,
+                    device=self.device
+                )
+                # Move to CPU to save GPU memory
+                document_embeddings.append(batch_embeddings.cpu().numpy())
+            except Exception as e:
+                logger.error(f"Error encoding batch {i}: {str(e)}")
+                raise
+        
+        # Combine batches
+        document_embeddings = np.vstack(document_embeddings)
         
         # Fit the model
-        topics, probs = topic_model.fit_transform(
-            documents=documents,
-            embeddings=document_embeddings
-        )
+        logger.info("Fitting BERTopic model...")
+        try:
+            topics, probs = topic_model.fit_transform(
+                documents=documents,
+                embeddings=document_embeddings
+            )
+        except Exception as e:
+            logger.error(f"Error fitting BERTopic model: {str(e)}")
+            raise
         
-        # Compute hierarchical topics if requested
-        hierarchical_info = None
-        if hierarchical_topics:
-            try:
-                hierarchical_info = topic_model.hierarchical_topics(documents)
-            except Exception as e:
-                logger.warning(f"Failed to compute hierarchical topics: {e}")
-        
+        # Handle case where probs might be None
+        if probs is None:
+            logger.warning("Probabilities are None, using dummy values")
+            probs = np.zeros((len(documents), 1))
+            
         # Get topic information
         topic_info = topic_model.get_topic_info()
         topic_words = {t: topic_model.get_topic(t) for t in set(topics) if t != -1}
         
-        # Create document info dataframe
+        # Create document info dataframe with safer probability handling
+        if len(probs.shape) > 1:
+            # Multi-dimensional probabilities
+            max_probs = probs.max(axis=1)
+        else:
+            # One-dimensional probabilities
+            max_probs = probs
+        
         document_info = pd.DataFrame({
             "Document": documents,
             "Topic": topics,
-            "Probability": probs.max(axis=1) if len(probs.shape) > 1 else probs
+            "Probability": max_probs
         })
+        
+        # Generate visualizations with explicit sizes
+        visualizations = {}
+        try:
+            import plotly.io as pio
+            import plotly.graph_objects as go
+            import plotly.express as px
+            from plotly.subplots import make_subplots
+            import io
+            
+            # Fix for "arrays used as indices must be of integer type" error
+            # Create custom topic visualization instead of using BERTopic's visualize_topics
+            if len(topic_info) > 0:
+                # Get only valid topics (not -1 which is outliers)
+                valid_topics = topic_info[topic_info["Topic"] >= 0]
+                
+                if len(valid_topics) > 0:
+                    # Create a simple topics plot
+                    fig = px.scatter(
+                        x=range(len(valid_topics)), 
+                        y=valid_topics["Count"],
+                        text=valid_topics["Topic"],
+                        size=valid_topics["Count"],
+                        title="Topic Distribution"
+                    )
+                    fig.update_traces(textposition='top center')
+                    
+                    buf = io.BytesIO()
+                    fig.write_image(buf, format='png', scale=2, width=1200, height=800)
+                    buf.seek(0)
+                    visualizations["topics"] = buf.getvalue()
+            
+            # Fix for "rows argument must be int greater than 0" error
+            # Create custom barchart instead of using BERTopic's visualize_barchart
+            if len(topic_info) > 0:
+                valid_topics = topic_info[topic_info["Topic"] >= 0]
+                
+                if len(valid_topics) > 0:
+                    # Sort by Count
+                    valid_topics = valid_topics.sort_values("Count", ascending=False)
+                    
+                    # Take top 20 or fewer
+                    top_n = min(20, len(valid_topics))
+                    top_topics = valid_topics.head(top_n)
+                    
+                    # Create barchart
+                    fig = px.bar(
+                        top_topics,
+                        x="Count",
+                        y=top_topics["Topic"].astype(str),
+                        orientation='h',
+                        title="Top Topics by Document Count"
+                    )
+                    
+                    buf = io.BytesIO()
+                    fig.write_image(buf, format='png', scale=2, width=1200, height=800)
+                    buf.seek(0)
+                    visualizations["barchart"] = buf.getvalue()
+            
+        except Exception as e:
+            # If Plotly fails, use Matplotlib as fallback
+            try:
+                import matplotlib.pyplot as plt
+                import io
+                
+                if len(topic_info) > 0:
+                    valid_topics = topic_info[topic_info["Topic"] >= 0]
+                    
+                    if len(valid_topics) > 0:
+                        # Sort by Count
+                        valid_topics = valid_topics.sort_values("Count", ascending=False)
+                        
+                        # Take top 20 or fewer
+                        top_n = min(20, len(valid_topics))
+                        top_topics = valid_topics.head(top_n)
+                        
+                        # Create barchart
+                        plt.figure(figsize=(12, 8))
+                        plt.barh(top_topics["Topic"].astype(str), top_topics["Count"])
+                        plt.xlabel("Document Count")
+                        plt.ylabel("Topic")
+                        plt.title("Top Topics by Document Count")
+                        
+                        buf = io.BytesIO()
+                        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+                        buf.seek(0)
+                        visualizations["barchart_matplotlib"] = buf.getvalue()
+                        plt.close()
+            except Exception:
+                pass
         
         # Prepare result
         result = {
@@ -565,7 +720,7 @@ class TopicModeler:
             "topic_info": topic_info,
             "topic_words": topic_words,
             "document_info": document_info,
-            "hierarchical_topics": hierarchical_info,
+            "visualizations": visualizations,
             "num_documents": len(documents),
             "num_topics": len(topic_words)
         }
@@ -630,7 +785,9 @@ class TopicModeler:
             "hierarchical_topics": False,
             "reduce_frequent_words": True,
             "stop_words": "english",
-            "verbose": True
+            "verbose": True,
+            "use_svd": True,  # Default to using SVD
+            "max_documents": 10000  # Default max documents
         }
         
         # Merge with provided configuration
@@ -669,7 +826,9 @@ class TopicModeler:
             reduce_frequent_words=topic_model_config["reduce_frequent_words"],
             stop_words=topic_model_config["stop_words"],
             verbose=topic_model_config["verbose"],
-            force_recompute=force_topic_model
+            force_recompute=force_topic_model,
+            use_svd=topic_model_config.get("use_svd", True),
+            max_documents=topic_model_config.get("max_documents", 10000)
         )
         
         # Combine results
@@ -742,7 +901,7 @@ class TopicModeler:
         output_dir: str = "results/topic_models"
     ) -> Dict[str, str]:
         """
-        Export topic modeling results to files
+        Export topic modeling results to files with better visualization support
         
         Args:
             topic_model_results: Dictionary mapping methods to topic modeling results
@@ -820,70 +979,15 @@ class TopicModeler:
                     f.write(f"Document {i+1} (ID: {doc_id}):\n")
                     f.write(f"{text[:500]}...\n\n")
             
-            # Export topic model visualizations if matplotlib is available
-            try:
-                import matplotlib.pyplot as plt
-                
-                # Create visualizations directory
-                vis_dir = os.path.join(method_dir, "visualizations")
-                os.makedirs(vis_dir, exist_ok=True)
-                
-                topic_model = topic_model_result["topic_model"]
-                
-                # Topic visualization
-                try:
-                    fig = topic_model.visualize_topics()
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(vis_dir, "topic_visualization.png"), dpi=300)
-                    plt.close()
-                except Exception as e:
-                    logger.warning(f"Could not create topic visualization: {str(e)}")
-                
-                # Topic hierarchy if available
-                if topic_model_result["hierarchical_topics"] is not None:
-                    try:
-                        fig = topic_model.visualize_hierarchy()
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(vis_dir, "topic_hierarchy.png"), dpi=300)
-                        plt.close()
-                    except Exception as e:
-                        logger.warning(f"Could not create topic hierarchy: {str(e)}")
-                
-                # Topic distribution
-                try:
-                    topics = topic_model_result["topics"]
-                    if isinstance(topics, list):
-                        import numpy as np
-                        topics = np.array(topics)
-                    
-                    fig = topic_model.visualize_distribution(topics)
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(vis_dir, "topic_distribution.png"), dpi=300)
-                    plt.close()
-                except Exception as e:
-                    logger.warning(f"Could not create topic distribution: {str(e)}")
-                
-                # Topic similarity
-                try:
-                    fig = topic_model.visualize_heatmap()
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(vis_dir, "topic_similarity.png"), dpi=300)
-                    plt.close()
-                except Exception as e:
-                    logger.warning(f"Could not create topic similarity: {str(e)}")
-                
-                # Topic embedding projection
-                try:
-                    if hasattr(topic_model, "topic_embeddings_"):
-                        fig = topic_model.visualize_topics_over_time(topic_model_result["topics"])
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(vis_dir, "topic_projection.png"), dpi=300)
-                        plt.close()
-                except Exception as e:
-                    logger.warning(f"Could not create topic projection: {str(e)}")
-                
-            except ImportError as e:
-                logger.warning(f"Could not create visualizations, matplotlib not available: {str(e)}")
+            # Export pre-generated visualizations if available
+            vis_dir = os.path.join(method_dir, "visualizations")
+            os.makedirs(vis_dir, exist_ok=True)
+            
+            if "visualizations" in topic_model_result:
+                for vis_name, vis_data in topic_model_result["visualizations"].items():
+                    if vis_data:
+                        with open(os.path.join(vis_dir, f"{vis_name}.png"), "wb") as f:
+                            f.write(vis_data)
             
             # Save full results
             with open(os.path.join(method_dir, "full_result.pkl"), "wb") as f:
@@ -1020,19 +1124,21 @@ class TopicModeler:
 
 def main():
     """Main function to demonstrate topic modeling functionality"""
-    from datasets import load_dataset
-    
     # Define constants
     CACHE_DIR = "cache"
     LOG_LEVEL = 'INFO'
     OUTPUT_DIR = "results/topic_models"
     
     # Define query IDs to process
-    QUERY_IDS = ["43"]  # First 3 queries
+    QUERY_IDS = ["43"]  # Example query ID
     
-    # Flag to force recomputation
+    # Flags to control execution
     FORCE_SAMPLE = False
     FORCE_TOPIC_MODEL = False
+    USE_SVD = True  # Use SVD instead of UMAP (much faster)
+    USE_GPU = True  # Use GPU if available
+    SAMPLE_SIZE = 1000
+    MAX_DOCUMENTS = 10000
     
     # Configure logging
     logging.basicConfig(
@@ -1055,24 +1161,28 @@ def main():
         qrels_dataset=qrels_dataset,
         embedding_model_name="all-mpnet-base-v2",
         cache_dir=CACHE_DIR,
-        random_seed=42
+        random_seed=42,
+        device='cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
     )
     
     # Define methods to use
     methods = [
-        TopicModelingMethod.DIRECT_RETRIEVAL,           # 1. Direct hybrid retrieval
-        TopicModelingMethod.QUERY_EXPANSION,            # 2. KeyBERT query expansion
-        TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,    # 3. Cluster sampling after retrieval
-        TopicModelingMethod.CLUSTER_AFTER_EXPANSION,    # 4. Cluster sampling after query expansion
-        TopicModelingMethod.FULL_DATASET,               # 5. Full dataset topic modeling
-        TopicModelingMethod.UNIFORM_SAMPLING            # 6. Uniform sampling topic modeling
+        TopicModelingMethod.DIRECT_RETRIEVAL,
+        TopicModelingMethod.QUERY_EXPANSION,
+        TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,
+        TopicModelingMethod.CLUSTER_AFTER_EXPANSION,
+        TopicModelingMethod.FULL_DATASET,  # Keeping this method
+        TopicModelingMethod.UNIFORM_SAMPLING
     ]
+    
+    # Warning about FULL_DATASET
+    logger.warning("Note: FULL_DATASET method may take a long time to run. The optimizations should help, but it will still be slower than other methods.")
     
     # Define configurations
     retrieval_config = {
         "retrieval_method": RetrievalMethod.HYBRID,
         "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        "top_k": 1000,
+        "top_k": SAMPLE_SIZE,
         "use_mmr": False,
         "use_cross_encoder": False
     }
@@ -1093,6 +1203,7 @@ def main():
         "min_cluster_size": 5
     }
     
+    # In the main function, update the topic_model_config:
     topic_model_config = {
         "n_components": 5,
         "n_neighbors": 15,
@@ -1101,12 +1212,14 @@ def main():
         "min_cluster_size": 10,
         "min_samples": None,
         "mmr_diversity": 0.3,
-        "nr_topics": None,
+        "nr_topics": 20,  # Fixed number of topics for better visualization
         "use_guided": True,
         "hierarchical_topics": False,
         "reduce_frequent_words": True,
         "stop_words": "english",
-        "verbose": True
+        "verbose": True,
+        "use_svd": USE_SVD,
+        "max_documents": None  # No document limit - use full dataset
     }
     
     # Process queries
@@ -1114,7 +1227,7 @@ def main():
     all_results = topic_modeler.process_queries(
         query_ids=QUERY_IDS,
         methods=methods,
-        sample_size=1000,
+        sample_size=SAMPLE_SIZE,
         retrieval_config=retrieval_config,
         expansion_config=expansion_config,
         clustering_config=clustering_config,
