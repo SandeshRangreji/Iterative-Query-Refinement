@@ -35,7 +35,6 @@ from query_expansion import (
     QueryExpansionMethod, 
     QueryCombinationStrategy
 )
-from keyword_extraction import KeywordExtractor
 
 # Configure logging
 logging.basicConfig(
@@ -44,25 +43,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class QueryBasedTopicModel:
-    """Class for running BERTopic on query-based document samples"""
+class TopicModelingMethod(str, Enum):
+    """Enum for topic modeling document sampling methods"""
+    DIRECT_RETRIEVAL = "direct_retrieval"
+    QUERY_EXPANSION = "query_expansion"
+    CLUSTER_AFTER_RETRIEVAL = "cluster_after_retrieval"
+    CLUSTER_AFTER_EXPANSION = "cluster_after_expansion"
+    FULL_DATASET = "full_dataset"
+    UNIFORM_SAMPLING = "uniform_sampling"
+
+class TopicModeler:
+    """Class for topic modeling using various document sampling strategies"""
     
     def __init__(
         self,
+        corpus_dataset,
+        queries_dataset=None,
+        qrels_dataset=None,
         embedding_model_name: str = "all-mpnet-base-v2",
-        cache_dir: str = "cache",
+        cache_dir: str = "cache/topic_modeling",
+        random_seed: int = 42,
         device: Optional[str] = None
     ):
         """
-        Initialize query-based topic model
+        Initialize the topic modeler
         
         Args:
+            corpus_dataset: Dataset containing corpus documents
+            queries_dataset: Dataset containing queries (optional, needed for query-based methods)
+            qrels_dataset: Dataset containing relevance judgments (optional)
             embedding_model_name: Name of the embedding model to use
             cache_dir: Directory for caching results
-            device: Device to use for embeddings
+            random_seed: Random seed for reproducibility
+            device: Device to use for embeddings (None for auto-selection)
         """
+        self.corpus_dataset = corpus_dataset
+        self.queries_dataset = queries_dataset
+        self.qrels_dataset = qrels_dataset
         self.embedding_model_name = embedding_model_name
         self.cache_dir = cache_dir
+        self.random_seed = random_seed
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
@@ -73,126 +93,50 @@ class QueryBasedTopicModel:
         else:
             self.device = device
         
+        logger.info(f"Using device: {self.device}")
+        
         # Initialize embedding model
         self.embedding_model = SentenceTransformer(embedding_model_name, device=self.device)
         
         # Initialize preprocessor and index manager
         self.preprocessor = TextPreprocessor()
         self.index_manager = IndexManager(self.preprocessor)
+        
+        # Initialize sampler
+        self.sampler = Sampler(
+            corpus_dataset=corpus_dataset,
+            queries_dataset=queries_dataset,
+            qrels_dataset=qrels_dataset,
+            preprocessor=self.preprocessor,
+            index_manager=self.index_manager,
+            cache_dir=cache_dir,
+            embedding_model_name=embedding_model_name,
+            random_seed=random_seed
+        )
+        
+        # Initialize query expander
+        self.query_expander = QueryExpander(
+            preprocessor=self.preprocessor,
+            index_manager=self.index_manager,
+            cache_dir=cache_dir,
+            sbert_model_name=embedding_model_name
+        )
+        
+        # Initialize search indices if needed
+        self._initialize_indices()
     
-    def _get_cache_path(
-        self, 
-        query_id: str,
-        method: str,
-        config: Dict[str, Any]
-    ) -> str:
-        """
-        Generate a cache path based on query ID and configuration
-        
-        Args:
-            query_id: ID of the query
-            method: Sampling method name
-            config: Configuration dictionary
-            
-        Returns:
-            Cache file path
-        """
-        # Create a string representation of key config parameters
-        config_str = "_".join([f"{k}={v}" for k, v in sorted(config.items()) 
-                              if k in ['n_components', 'n_neighbors', 'min_cluster_size', 
-                                       'mmr_diversity', 'use_guided', 'top_k']])
-        
-        # Create the filename
-        filename = f"topic_model_query_{query_id}_{method}_{config_str}.pkl"
-        
-        return os.path.join(self.cache_dir, filename)
-    
-    def retrieve_documents_for_query(
-        self,
-        query_id: str,
-        query_text: str,
-        corpus_dataset,
-        method: str = "retrieval",
-        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
-        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
-        top_k: int = 1000,
-        use_mmr: bool = False,
-        mmr_lambda: float = 0.5,
-        use_cross_encoder: bool = False,
-        expansion_method: Optional[QueryExpansionMethod] = None,
-        combination_strategy: Optional[QueryCombinationStrategy] = None,
-        num_keywords: int = 5,
-        keyword_diversity: float = 0.7,
-        docs_for_keywords: int = 10,
-        original_query_weight: float = 0.7,
-        force_recompute: bool = False
-    ) -> Dict:
-        """
-        Retrieve documents for a specific query
-        
-        Args:
-            query_id: ID of the query
-            query_text: Text of the query
-            corpus_dataset: Dataset containing corpus documents
-            method: Retrieval method ("retrieval" or "query_expansion")
-            retrieval_method: Method for document retrieval
-            hybrid_strategy: Strategy for hybrid retrieval
-            top_k: Number of documents to retrieve
-            use_mmr: Whether to use MMR for diversity
-            mmr_lambda: Lambda parameter for MMR (higher means more relevance, less diversity)
-            use_cross_encoder: Whether to use cross-encoder reranking
-            expansion_method: Method for query expansion (if method is "query_expansion")
-            combination_strategy: Strategy for combining expanded queries
-            num_keywords: Number of keywords to extract for query expansion
-            keyword_diversity: Diversity parameter for keyword extraction (0-1)
-            docs_for_keywords: Number of top documents to use for keyword extraction
-            original_query_weight: Weight for original query in RRF combination
-            force_recompute: Whether to force recomputation
-            
-        Returns:
-            Dictionary with retrieved documents
-        """
-        # Create config for cache path
-        config = {
-            "method": method,
-            "retrieval_method": retrieval_method.value,
-            "hybrid_strategy": hybrid_strategy.value,
-            "top_k": top_k,
-            "use_mmr": use_mmr,
-            "mmr_lambda": mmr_lambda,
-            "use_cross_encoder": use_cross_encoder,
-            "num_keywords": num_keywords,
-            "keyword_diversity": keyword_diversity,
-            "docs_for_keywords": docs_for_keywords,
-            "original_query_weight": original_query_weight
-        }
-        
-        if method == "query_expansion" and expansion_method is not None:
-            config.update({
-                "expansion_method": expansion_method.value,
-                "combination_strategy": combination_strategy.value if combination_strategy else "none"
-            })
-        
-        # Generate cache path
-        cache_path = os.path.join(self.cache_dir, f"query_{query_id}_{method}_docs.pkl")
-        
-        # Check cache
-        if not force_recompute and os.path.exists(cache_path):
-            logger.info(f"Loading retrieved documents from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-        
-        logger.info(f"Retrieving documents for query {query_id}: '{query_text}'")
-        
-        # Build indices
-        bm25, corpus_texts, corpus_ids = self.index_manager.build_bm25_index(
-            corpus_dataset,
+    def _initialize_indices(self):
+        """Initialize search indices"""
+        # Build BM25 index
+        self.bm25, self.corpus_texts, self.corpus_ids = self.index_manager.build_bm25_index(
+            self.corpus_dataset,
             cache_path=os.path.join(self.cache_dir, "bm25_index.pkl"),
             force_reindex=False
         )
         
-        sbert_model, doc_embeddings = self.index_manager.build_sbert_index(
-            corpus_texts,
+        # Build SBERT index
+        self.sbert_model, self.doc_embeddings = self.index_manager.build_sbert_index(
+            self.corpus_texts,
             model_name=self.embedding_model_name,
             batch_size=64,
             cache_path=os.path.join(self.cache_dir, "sbert_index.pt"),
@@ -200,118 +144,269 @@ class QueryBasedTopicModel:
         )
         
         # Initialize search engine
-        search_engine = SearchEngine(
+        self.search_engine = SearchEngine(
             preprocessor=self.preprocessor,
-            bm25=bm25,
-            corpus_texts=corpus_texts,
-            corpus_ids=corpus_ids,
-            sbert_model=sbert_model,
-            doc_embeddings=doc_embeddings
+            bm25=self.bm25,
+            corpus_texts=self.corpus_texts,
+            corpus_ids=self.corpus_ids,
+            sbert_model=self.sbert_model,
+            doc_embeddings=self.doc_embeddings
         )
+    
+    def _get_cache_path(
+        self, 
+        prefix: str,
+        method: str,
+        config: Dict[str, Any]
+    ) -> str:
+        """
+        Generate a cache path based on prefix and configuration
         
-        if method == "retrieval":
+        Args:
+            prefix: Prefix for the cache file
+            method: Method name
+            config: Configuration dictionary
+            
+        Returns:
+            Cache file path
+        """
+        # Create a string representation of key config parameters
+        config_str = "_".join([f"{k}={v}" for k, v in sorted(config.items()) 
+                             if isinstance(v, (str, int, float, bool))
+                             and k in ['sample_size', 'min_cluster_size', 'n_components', 
+                                      'mmr_diversity', 'use_guided', 'top_k']])
+        
+        # Create the filename
+        filename = f"{prefix}_{method}_{config_str}.pkl"
+        
+        return os.path.join(self.cache_dir, filename)
+    
+    def sample_documents(
+        self,
+        method: TopicModelingMethod,
+        query_id: Optional[str] = None,
+        query_text: Optional[str] = None,
+        sample_size: int = 1000,
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        expansion_config: Optional[Dict[str, Any]] = None,
+        clustering_config: Optional[Dict[str, Any]] = None,
+        force_recompute: bool = False
+    ) -> Dict:
+        """
+        Sample documents using the specified method
+        
+        Args:
+            method: Document sampling method
+            query_id: ID of the query (for query-based methods)
+            query_text: Text of the query (for query-based methods)
+            sample_size: Number of documents to sample
+            retrieval_config: Configuration for retrieval-based methods
+            expansion_config: Configuration for query expansion
+            clustering_config: Configuration for clustering-based methods
+            force_recompute: Whether to force recomputation
+            
+        Returns:
+            Dictionary with sampled documents
+        """
+        # Default configurations
+        default_retrieval_config = {
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "top_k": sample_size,
+            "use_mmr": False,
+            "mmr_lambda": 0.5,
+            "use_cross_encoder": False
+        }
+        
+        default_expansion_config = {
+            "expansion_method": QueryExpansionMethod.KEYBERT,
+            "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+            "num_keywords": 5,
+            "original_query_weight": 0.7
+        }
+        
+        default_clustering_config = {
+            "dim_reduction_method": DimensionReductionMethod.UMAP,
+            "n_components": 50,
+            "clustering_method": ClusteringMethod.KMEANS,
+            "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+            "n_per_cluster": 1,
+            "min_cluster_size": 5
+        }
+        
+        # Merge with provided configurations
+        if retrieval_config:
+            default_retrieval_config.update(retrieval_config)
+        retrieval_config = default_retrieval_config
+        
+        if expansion_config:
+            default_expansion_config.update(expansion_config)
+        expansion_config = default_expansion_config
+        
+        if clustering_config:
+            default_clustering_config.update(clustering_config)
+        clustering_config = default_clustering_config
+        
+        # Generate cache path
+        cache_key = f"{method.value}"
+        if query_id:
+            cache_key = f"query_{query_id}_{cache_key}"
+        
+        config = {
+            "method": method.value,
+            "sample_size": sample_size
+        }
+        
+        if method in [TopicModelingMethod.DIRECT_RETRIEVAL, TopicModelingMethod.QUERY_EXPANSION,
+                     TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
+            config.update({
+                "retrieval_method": retrieval_config["retrieval_method"].value 
+                    if isinstance(retrieval_config["retrieval_method"], Enum) else retrieval_config["retrieval_method"],
+                "hybrid_strategy": retrieval_config["hybrid_strategy"].value
+                    if isinstance(retrieval_config["hybrid_strategy"], Enum) else retrieval_config["hybrid_strategy"],
+                "top_k": retrieval_config["top_k"],
+                "use_mmr": retrieval_config["use_mmr"],
+                "use_cross_encoder": retrieval_config["use_cross_encoder"]
+            })
+        
+        if method in [TopicModelingMethod.QUERY_EXPANSION, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
+            config.update({
+                "expansion_method": expansion_config["expansion_method"].value
+                    if isinstance(expansion_config["expansion_method"], Enum) else expansion_config["expansion_method"],
+                "combination_strategy": expansion_config["combination_strategy"].value
+                    if isinstance(expansion_config["combination_strategy"], Enum) else expansion_config["combination_strategy"],
+                "num_keywords": expansion_config["num_keywords"],
+                "original_query_weight": expansion_config["original_query_weight"]
+            })
+        
+        if method in [TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
+            config.update({
+                "dim_reduction_method": clustering_config["dim_reduction_method"].value
+                    if isinstance(clustering_config["dim_reduction_method"], Enum) else clustering_config["dim_reduction_method"],
+                "n_components": clustering_config["n_components"],
+                "clustering_method": clustering_config["clustering_method"].value
+                    if isinstance(clustering_config["clustering_method"], Enum) else clustering_config["clustering_method"],
+                "rep_selection_method": clustering_config["rep_selection_method"].value
+                    if isinstance(clustering_config["rep_selection_method"], Enum) else clustering_config["rep_selection_method"],
+                "min_cluster_size": clustering_config["min_cluster_size"]
+            })
+        
+        cache_path = self._get_cache_path("sample", cache_key, config)
+        
+        # Check cache
+        if not force_recompute and os.path.exists(cache_path):
+            logger.info(f"Loading sampled documents from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        
+        # Handle query-based validation
+        if method in [TopicModelingMethod.DIRECT_RETRIEVAL, TopicModelingMethod.QUERY_EXPANSION, 
+                     TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
+            if query_id is None or query_text is None:
+                raise ValueError("query_id and query_text must be provided for query-based methods")
+        
+        logger.info(f"Sampling documents with method: {method.value}")
+        
+        # Sample using the specified method
+        if method == TopicModelingMethod.DIRECT_RETRIEVAL:
             # Direct retrieval
-            results = search_engine.search(
-                query=query_text,
-                top_k=top_k,
-                method=retrieval_method,
-                hybrid_strategy=hybrid_strategy,
-                use_mmr=use_mmr,
-                mmr_lambda=mmr_lambda,
-                use_cross_encoder=use_cross_encoder
+            result = self.sampler.sample_retrieval(
+                sample_size=sample_size,
+                retrieval_method=retrieval_config["retrieval_method"],
+                hybrid_strategy=retrieval_config["hybrid_strategy"],
+                top_k=retrieval_config["top_k"],
+                use_mmr=retrieval_config["use_mmr"],
+                use_cross_encoder=retrieval_config["use_cross_encoder"],
+                mmr_lambda=retrieval_config["mmr_lambda"],
+                force_regenerate=force_recompute
             )
             
-            # Get document texts
-            doc_ids = [doc_id for doc_id, _ in results]
-            doc_scores = [score for _, score in results]
-            doc_texts = []
-            
-            for doc_id in doc_ids:
-                doc_texts.append(search_engine.get_document_by_id(doc_id))
-            
-        elif method == "query_expansion" and expansion_method is not None:
+        elif method == TopicModelingMethod.QUERY_EXPANSION:
             # Query expansion
-            query_expander = QueryExpander(
-                preprocessor=self.preprocessor,
-                index_manager=self.index_manager,
-                cache_dir=self.cache_dir
+            result = self.sampler.sample_query_expansion(
+                sample_size=sample_size,
+                expansion_method=expansion_config["expansion_method"],
+                combination_strategy=expansion_config["combination_strategy"],
+                num_keywords=expansion_config["num_keywords"],
+                retrieval_method=retrieval_config["retrieval_method"],
+                hybrid_strategy=retrieval_config["hybrid_strategy"],
+                top_k=retrieval_config["top_k"],
+                use_mmr=retrieval_config["use_mmr"],
+                use_cross_encoder=retrieval_config["use_cross_encoder"],
+                original_query_weight=expansion_config["original_query_weight"],
+                force_regenerate=force_recompute
             )
             
-            # Extract keywords for this query only
-            keyword_extractor = KeywordExtractor(
-                keybert_model=query_expander.sbert_model_name,
-                cache_dir=query_expander.cache_dir,
-                top_k_docs=top_k,                    # how many docs are eligible
-                top_n_docs_for_extraction=docs_for_keywords
-            )
-            top_docs = []
+        elif method == TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL:
+            # Cluster after retrieval
+            source_config = {
+                "sample_size": retrieval_config["top_k"],
+                "retrieval_method": retrieval_config["retrieval_method"],
+                "hybrid_strategy": retrieval_config["hybrid_strategy"],
+                "top_k": retrieval_config["top_k"],
+                "use_mmr": retrieval_config["use_mmr"],
+                "use_cross_encoder": retrieval_config["use_cross_encoder"]
+            }
             
-            # First retrieve some docs to extract keywords from
-            initial_results = search_engine.search(
-                query=query_text,
-                top_k=top_k,
-                method=retrieval_method,
-                hybrid_strategy=hybrid_strategy
-            )
-            
-            # Get top N documents for keyword extraction
-            for doc_id, _ in initial_results[:docs_for_keywords]:
-                doc_text = search_engine.get_document_by_id(doc_id)
-                top_docs.append(doc_text)
-            
-            # Extract keywords
-            keywords = keyword_extractor.extract_keywords(
-                query=query_text,
-                docs_text=top_docs,
-                num_keywords=num_keywords,
-                diversity=keyword_diversity
+            result = self.sampler.sample_clustering(
+                sample_size=sample_size,
+                source_method=SamplingMethod.RETRIEVAL,
+                source_config=source_config,
+                dim_reduction_method=clustering_config["dim_reduction_method"],
+                n_components=clustering_config["n_components"],
+                clustering_method=clustering_config["clustering_method"],
+                rep_selection_method=clustering_config["rep_selection_method"],
+                n_per_cluster=clustering_config["n_per_cluster"],
+                min_cluster_size=clustering_config["min_cluster_size"],
+                force_recompute=force_recompute
             )
             
-            # Use extracted keywords for expansion
-            query_keywords = {query_id: keywords}
-            baseline_results = {int(query_id): initial_results}
+        elif method == TopicModelingMethod.CLUSTER_AFTER_EXPANSION:
+            # Cluster after query expansion
+            source_config = {
+                "sample_size": retrieval_config["top_k"],
+                "expansion_method": expansion_config["expansion_method"],
+                "combination_strategy": expansion_config["combination_strategy"],
+                "num_keywords": expansion_config["num_keywords"],
+                "retrieval_method": retrieval_config["retrieval_method"],
+                "hybrid_strategy": retrieval_config["hybrid_strategy"],
+                "top_k": retrieval_config["top_k"],
+                "use_mmr": retrieval_config["use_mmr"],
+                "use_cross_encoder": retrieval_config["use_cross_encoder"]
+            }
             
-            # Run expansion
-            expansion_results = query_expander.expand_queries(
-                queries_dataset=[{"_id": query_id, "text": query_text}],
-                corpus_dataset=corpus_dataset,
-                baseline_results=baseline_results,
-                search_engine=search_engine,
-                query_keywords=query_keywords,
-                expansion_method=expansion_method,
-                combination_strategy=combination_strategy,
-                num_keywords=num_keywords,
-                top_k_results=top_k,
-                original_query_weight=original_query_weight,
-                force_regenerate_expansion=force_recompute
+            result = self.sampler.sample_clustering(
+                sample_size=sample_size,
+                source_method=SamplingMethod.QUERY_EXPANSION,
+                source_config=source_config,
+                dim_reduction_method=clustering_config["dim_reduction_method"],
+                n_components=clustering_config["n_components"],
+                clustering_method=clustering_config["clustering_method"],
+                rep_selection_method=clustering_config["rep_selection_method"],
+                n_per_cluster=clustering_config["n_per_cluster"],
+                min_cluster_size=clustering_config["min_cluster_size"],
+                force_recompute=force_recompute
             )
             
-            # Extract document IDs and texts
-            expanded_query_results = expansion_results["expanded_results"][0]["results"]
-            doc_ids = [doc_id for doc_id, _ in expanded_query_results]
-            doc_scores = [score for _, score in expanded_query_results]
-            doc_texts = []
+        elif method == TopicModelingMethod.FULL_DATASET:
+            # Full dataset
+            result = self.sampler.sample_full_dataset()
             
-            for doc_id in doc_ids:
-                doc_texts.append(search_engine.get_document_by_id(doc_id))
-                
+        elif method == TopicModelingMethod.UNIFORM_SAMPLING:
+            # Uniform sampling
+            result = self.sampler.sample_uniform(sample_size=sample_size)
+            
         else:
             raise ValueError(f"Unsupported method: {method}")
         
-        # Build result
-        result = {
-            "query_id": query_id,
-            "query_text": query_text,
-            "method": method,
-            "config": config,
-            "doc_ids": doc_ids,
-            "doc_scores": doc_scores,
-            "doc_texts": doc_texts,
-            "num_docs": len(doc_ids)
-        }
+        # Add query information if applicable
+        if query_id is not None and query_text is not None:
+            result["query_id"] = query_id
+            result["query_text"] = query_text
         
         # Cache result
-        logger.info(f"Caching retrieved documents to: {cache_path}")
+        logger.info(f"Caching sampled documents to: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump(result, f)
         
@@ -319,10 +414,10 @@ class QueryBasedTopicModel:
     
     def run_bertopic(
         self,
-        query_id: str,
-        query_text: str,
         documents: List[str],
-        method: str,
+        method_name: str,
+        query_id: Optional[str] = None,
+        query_text: Optional[str] = None,
         n_components: int = 5,
         n_neighbors: int = 15,
         min_dist: float = 0.0,
@@ -339,10 +434,32 @@ class QueryBasedTopicModel:
         force_recompute: bool = False
     ) -> Dict:
         """
-        Run BERTopic on retrieved documents for a query.
-        (Docstring unchanged for brevity)
+        Run BERTopic on a set of documents
+        
+        Args:
+            documents: List of document texts
+            method_name: Method name for caching
+            query_id: ID of the query (optional)
+            query_text: Text of the query (optional, used for guided topic modeling)
+            n_components: Number of components for UMAP
+            n_neighbors: Number of neighbors for UMAP
+            min_dist: Minimum distance for UMAP
+            metric: Metric for UMAP
+            min_cluster_size: Minimum cluster size for HDBSCAN
+            min_samples: Minimum samples for HDBSCAN
+            mmr_diversity: Diversity for MaximalMarginalRelevance
+            nr_topics: Number of topics (None for auto)
+            use_guided: Whether to use guided topic modeling
+            hierarchical_topics: Whether to compute hierarchical topics
+            reduce_frequent_words: Whether to reduce frequent words
+            stop_words: Stop words for vectorizer
+            verbose: Whether to show verbose output
+            force_recompute: Whether to force recomputation
+            
+        Returns:
+            Dictionary with topic modeling results
         """
-        # ---------- 1. cache logic (unchanged) ----------
+        # Create config for cache path
         config = {
             "n_components": n_components,
             "n_neighbors": n_neighbors,
@@ -356,74 +473,91 @@ class QueryBasedTopicModel:
             "hierarchical_topics": hierarchical_topics,
             "reduce_frequent_words": reduce_frequent_words
         }
-        cache_path = self._get_cache_path(query_id, method, config)
+        
+        # Generate cache path
+        cache_prefix = f"topic_model"
+        if query_id:
+            cache_prefix = f"{cache_prefix}_query_{query_id}"
+        
+        cache_path = self._get_cache_path(cache_prefix, method_name, config)
+        
+        # Check cache
         if not force_recompute and os.path.exists(cache_path):
             logger.info(f"Loading topic model results from cache: {cache_path}")
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
-
-        logger.info(f"Running BERTopic for query {query_id} ({len(documents)} documents)")
-
-        # ---------- 2. build seed list BEFORE model instantiation ----------
-        seed_topic_list = [[query_text]] if use_guided else None
-
-        # ---------- 3. instantiate BERTopic WITH seed_topic_list ----------
+        
+        logger.info(f"Running BERTopic on {len(documents)} documents with method: {method_name}")
+        
+        # Prepare UMAP model
+        umap_model = UMAP(
+            n_components=n_components,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            random_state=self.random_seed
+        )
+        
+        # Prepare seed topic list if using guided topic modeling and query text is provided
+        seed_topic_list = None
+        if use_guided and query_text:
+            seed_topic_list = [[query_text]]
+        
+        # Prepare other components
+        vectorizer_model = CountVectorizer(stop_words=stop_words)
+        ctfidf_model = ClassTfidfTransformer(reduce_frequent_words=reduce_frequent_words)
+        representation_model = MaximalMarginalRelevance(diversity=mmr_diversity)
+        
+        # Initialize BERTopic model
         topic_model = BERTopic(
             embedding_model=self.embedding_model,
-            seed_topic_list=seed_topic_list,          # <- moved here
-            umap_model=None,
-            hdbscan_model=None,
+            umap_model=umap_model,
+            hdbscan_model=None,  # Use default HDBSCAN
+            vectorizer_model=vectorizer_model,
+            ctfidf_model=ctfidf_model,
+            representation_model=representation_model,
             min_topic_size=min_cluster_size,
             nr_topics=nr_topics,
-            low_memory=False,
-            verbose=verbose,
-            calculate_probabilities=True
+            seed_topic_list=seed_topic_list,
+            calculate_probabilities=True,
+            verbose=verbose
         )
-
-        # configure sub-models exactly as before
-        topic_model.umap_model.n_components = n_components
-        topic_model.umap_model.n_neighbors = n_neighbors
-        topic_model.umap_model.min_dist = min_dist
-        topic_model.umap_model.metric = metric
-        topic_model.umap_model.random_state = 42
-        topic_model.vectorizer_model = CountVectorizer(stop_words=stop_words)
-        topic_model.representation_model = MaximalMarginalRelevance(diversity=mmr_diversity)
-        topic_model.ctfidf_model = ClassTfidfTransformer(reduce_frequent_words=reduce_frequent_words)
-
-        # ---------- 4. fit the model ----------
-        if use_guided:
-            document_embeddings = self.embedding_model.encode(
-                documents, show_progress_bar=True, batch_size=32
-            )
-            topics, probs = topic_model.fit_transform(
-                documents=documents,
-                embeddings=document_embeddings            # <- NO seed_topic_list here
-            )
-        else:
-            topics, probs = topic_model.fit_transform(documents)
-
-        # ---------- 5. post-processing & caching (unchanged) ----------
+        
+        # Encode documents
+        document_embeddings = self.embedding_model.encode(
+            documents, 
+            show_progress_bar=True,
+            batch_size=32
+        )
+        
+        # Fit the model
+        topics, probs = topic_model.fit_transform(
+            documents=documents,
+            embeddings=document_embeddings
+        )
+        
+        # Compute hierarchical topics if requested
+        hierarchical_info = None
         if hierarchical_topics:
             try:
                 hierarchical_info = topic_model.hierarchical_topics(documents)
             except Exception as e:
                 logger.warning(f"Failed to compute hierarchical topics: {e}")
-                hierarchical_info = None
-        else:
-            hierarchical_info = None
-
+        
+        # Get topic information
         topic_info = topic_model.get_topic_info()
         topic_words = {t: topic_model.get_topic(t) for t in set(topics) if t != -1}
+        
+        # Create document info dataframe
         document_info = pd.DataFrame({
             "Document": documents,
             "Topic": topics,
             "Probability": probs.max(axis=1) if len(probs.shape) > 1 else probs
         })
-
+        
+        # Prepare result
         result = {
-            "query_id": query_id,
-            "query_text": query_text,
-            "method": method,
+            "method": method_name,
             "config": config,
             "topic_model": topic_model,
             "topics": topics,
@@ -435,61 +569,54 @@ class QueryBasedTopicModel:
             "num_documents": len(documents),
             "num_topics": len(topic_words)
         }
-
+        
+        # Add query information if provided
+        if query_id:
+            result["query_id"] = query_id
+        
+        if query_text:
+            result["query_text"] = query_text
+        
+        # Cache result
         logger.info(f"Caching topic model results to: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump(result, f)
-
+        
         return result
     
-    def process_query(
+    def run_topic_modeling(
         self,
-        query_id: str,
-        query_text: str,
-        corpus_dataset,
-        methods: List[str] = ["retrieval", "query_expansion"],
-        retrieval_config: Dict[str, Any] = None,
-        expansion_config: Dict[str, Any] = None,
-        topic_model_config: Dict[str, Any] = None,
-        force_retrieve: bool = False,
+        method: TopicModelingMethod,
+        query_id: Optional[str] = None,
+        query_text: Optional[str] = None,
+        sample_size: int = 1000,
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        expansion_config: Optional[Dict[str, Any]] = None,
+        clustering_config: Optional[Dict[str, Any]] = None,
+        topic_model_config: Optional[Dict[str, Any]] = None,
+        force_sample: bool = False,
         force_topic_model: bool = False
-    ) -> Dict[str, Dict]:
+    ) -> Dict:
         """
-        Complete process for a query - retrieve documents and run topic modeling
+        Run complete topic modeling pipeline - sample documents and run BERTopic
         
         Args:
-            query_id: ID of the query
-            query_text: Text of the query
-            corpus_dataset: Dataset containing corpus documents
-            methods: List of methods to use
-            retrieval_config: Configuration for document retrieval
+            method: Document sampling method
+            query_id: ID of the query (for query-based methods)
+            query_text: Text of the query (for query-based methods)
+            sample_size: Number of documents to sample
+            retrieval_config: Configuration for retrieval-based methods
             expansion_config: Configuration for query expansion
-            topic_model_config: Configuration for topic modeling
-            force_retrieve: Whether to force recomputing document retrieval
-            force_topic_model: Whether to force recomputing topic models
+            clustering_config: Configuration for clustering-based methods
+            topic_model_config: Configuration for BERTopic
+            force_sample: Whether to force recomputing document sampling
+            force_topic_model: Whether to force recomputing topic modeling
             
         Returns:
-            Dictionary mapping methods to topic modeling results
+            Dictionary with topic modeling results
         """
-        # Default configurations
-        default_retrieval_config = {
-            "retrieval_method": RetrievalMethod.HYBRID,
-            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-            "top_k": 1000,
-            "use_mmr": False,
-            "mmr_lambda": 0.5,
-            "use_cross_encoder": False
-        }
-        
-        default_expansion_config = {
-            "expansion_method": QueryExpansionMethod.KEYBERT,
-            "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-            "num_keywords": 5,
-            "keyword_diversity": 0.7,
-            "docs_for_keywords": 10,
-            "original_query_weight": 0.7
-        }
-        
+        # Default topic model configuration
         default_topic_model_config = {
             "n_components": 5,
             "n_neighbors": 15,
@@ -506,255 +633,406 @@ class QueryBasedTopicModel:
             "verbose": True
         }
         
-        # Merge with provided configurations
-        if retrieval_config:
-            default_retrieval_config.update(retrieval_config)
-        retrieval_config = default_retrieval_config
-        
-        if expansion_config:
-            default_expansion_config.update(expansion_config)
-        expansion_config = default_expansion_config
-        
+        # Merge with provided configuration
         if topic_model_config:
             default_topic_model_config.update(topic_model_config)
         topic_model_config = default_topic_model_config
         
+        # Sample documents
+        sample_result = self.sample_documents(
+            method=method,
+            query_id=query_id,
+            query_text=query_text,
+            sample_size=sample_size,
+            retrieval_config=retrieval_config,
+            expansion_config=expansion_config,
+            clustering_config=clustering_config,
+            force_recompute=force_sample
+        )
+        
+        # Run BERTopic
+        topic_model_result = self.run_bertopic(
+            documents=sample_result["sample_texts"],
+            method_name=method.value,
+            query_id=query_id,
+            query_text=query_text,
+            n_components=topic_model_config["n_components"],
+            n_neighbors=topic_model_config["n_neighbors"],
+            min_dist=topic_model_config["min_dist"],
+            metric=topic_model_config["metric"],
+            min_cluster_size=topic_model_config["min_cluster_size"],
+            min_samples=topic_model_config["min_samples"],
+            mmr_diversity=topic_model_config["mmr_diversity"],
+            nr_topics=topic_model_config["nr_topics"],
+            use_guided=topic_model_config["use_guided"],
+            hierarchical_topics=topic_model_config["hierarchical_topics"],
+            reduce_frequent_words=topic_model_config["reduce_frequent_words"],
+            stop_words=topic_model_config["stop_words"],
+            verbose=topic_model_config["verbose"],
+            force_recompute=force_topic_model
+        )
+        
+        # Combine results
+        result = {
+            "sample_result": sample_result,
+            "topic_model_result": topic_model_result,
+            "method": method.value,
+            "query_id": query_id,
+            "query_text": query_text
+        }
+        
+        return result
+    
+    def run_multi_method_topic_modeling(
+        self,
+        methods: List[TopicModelingMethod],
+        query_id: Optional[str] = None,
+        query_text: Optional[str] = None,
+        sample_size: int = 1000,
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        expansion_config: Optional[Dict[str, Any]] = None,
+        clustering_config: Optional[Dict[str, Any]] = None,
+        topic_model_config: Optional[Dict[str, Any]] = None,
+        force_sample: bool = False,
+        force_topic_model: bool = False
+    ) -> Dict[str, Dict]:
+        """
+        Run topic modeling with multiple methods
+        
+        Args:
+            methods: List of document sampling methods
+            query_id: ID of the query (for query-based methods)
+            query_text: Text of the query (for query-based methods)
+            sample_size: Number of documents to sample
+            retrieval_config: Configuration for retrieval-based methods
+            expansion_config: Configuration for query expansion
+            clustering_config: Configuration for clustering-based methods
+            topic_model_config: Configuration for BERTopic
+            force_sample: Whether to force recomputing document sampling
+            force_topic_model: Whether to force recomputing topic modeling
+            
+        Returns:
+            Dictionary mapping methods to topic modeling results
+        """
         results = {}
         
         for method in methods:
-            logger.info(f"Processing query {query_id} with method '{method}'")
+            logger.info(f"Running topic modeling with method: {method.value}")
             
-            if method == "retrieval":
-                # Direct retrieval
-                retrieved_docs = self.retrieve_documents_for_query(
-                    query_id=query_id,
-                    query_text=query_text,
-                    corpus_dataset=corpus_dataset,
-                    method="retrieval",
-                    retrieval_method=retrieval_config["retrieval_method"],
-                    hybrid_strategy=retrieval_config["hybrid_strategy"],
-                    top_k=retrieval_config["top_k"],
-                    use_mmr=retrieval_config["use_mmr"],
-                    mmr_lambda=retrieval_config["mmr_lambda"],
-                    use_cross_encoder=retrieval_config["use_cross_encoder"],
-                    force_recompute=force_retrieve
-                )
-            
-            elif method == "query_expansion":
-                # Query expansion-based retrieval
-                retrieved_docs = self.retrieve_documents_for_query(
-                    query_id=query_id,
-                    query_text=query_text,
-                    corpus_dataset=corpus_dataset,
-                    method="query_expansion",
-                    expansion_method=expansion_config["expansion_method"],
-                    combination_strategy=expansion_config["combination_strategy"],
-                    top_k=retrieval_config["top_k"],
-                    num_keywords=expansion_config["num_keywords"],
-                    keyword_diversity=expansion_config["keyword_diversity"],
-                    docs_for_keywords=expansion_config["docs_for_keywords"],
-                    original_query_weight=expansion_config["original_query_weight"],
-                    force_recompute=force_retrieve
-                )
-            
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-            
-            # Run topic modeling
-            topics_result = self.run_bertopic(
+            result = self.run_topic_modeling(
+                method=method,
                 query_id=query_id,
                 query_text=query_text,
-                documents=retrieved_docs["doc_texts"],
-                method=method,
-                n_components=topic_model_config["n_components"],
-                n_neighbors=topic_model_config["n_neighbors"],
-                min_dist=topic_model_config["min_dist"],
-                metric=topic_model_config["metric"],
-                min_cluster_size=topic_model_config["min_cluster_size"],
-                min_samples=topic_model_config["min_samples"],
-                mmr_diversity=topic_model_config["mmr_diversity"],
-                nr_topics=topic_model_config["nr_topics"],
-                use_guided=topic_model_config["use_guided"],
-                hierarchical_topics=topic_model_config["hierarchical_topics"],
-                reduce_frequent_words=topic_model_config["reduce_frequent_words"],
-                stop_words=topic_model_config["stop_words"],
-                verbose=topic_model_config["verbose"],
-                force_recompute=force_topic_model
+                sample_size=sample_size,
+                retrieval_config=retrieval_config,
+                expansion_config=expansion_config,
+                clustering_config=clustering_config,
+                topic_model_config=topic_model_config,
+                force_sample=force_sample,
+                force_topic_model=force_topic_model
             )
             
-            # Store result
-            results[method] = {
-                "retrieved_docs": retrieved_docs,
-                "topics_result": topics_result
-            }
+            results[method.value] = result
         
         return results
     
-    def export_topic_results(
+    def export_topic_models(
         self,
-        query_id: str,
-        topics_results: Dict[str, Dict],
-        output_dir: str = "results/topics"
+        topic_model_results: Dict[str, Dict],
+        output_dir: str = "results/topic_models"
     ) -> Dict[str, str]:
         """
-        Export topic modeling results for a query to files
+        Export topic modeling results to files
         
         Args:
-            query_id: ID of the query
-            topics_results: Dictionary mapping methods to results
+            topic_model_results: Dictionary mapping methods to topic modeling results
             output_dir: Directory to save results
             
         Returns:
             Dictionary mapping methods to output directories
         """
-        # Get query text from first result
-        query_text = next(iter(topics_results.values()))["topics_result"]["query_text"]
-        
-        logger.info(f"Exporting topic results for query {query_id}: '{query_text}'")
-        
         # Create base output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Create query directory
-        query_dir = os.path.join(output_dir, f"query_{query_id}")
-        os.makedirs(query_dir, exist_ok=True)
+        # Get query information if available
+        query_id = None
+        query_text = None
         
-        # Export query info
-        with open(os.path.join(query_dir, "query_info.txt"), "w") as f:
-            f.write(f"Query ID: {query_id}\n")
-            f.write(f"Query Text: {query_text}\n")
+        for result in topic_model_results.values():
+            if "query_id" in result:
+                query_id = result["query_id"]
+            if "query_text" in result:
+                query_text = result["query_text"]
+            if query_id and query_text:
+                break
+        
+        # Create query directory if applicable
+        if query_id:
+            base_dir = os.path.join(output_dir, f"query_{query_id}")
+            # Export query info
+            os.makedirs(base_dir, exist_ok=True)
+            with open(os.path.join(base_dir, "query_info.txt"), "w") as f:
+                f.write(f"Query ID: {query_id}\n")
+                f.write(f"Query Text: {query_text}\n")
+        else:
+            base_dir = output_dir
         
         output_paths = {}
         
-        for method, result in topics_results.items():
+        for method, result in topic_model_results.items():
             # Create method directory
-            method_dir = os.path.join(query_dir, method)
+            method_dir = os.path.join(base_dir, method)
             os.makedirs(method_dir, exist_ok=True)
             
-            # Extract topics result
-            topics_result = result["topics_result"]
+            # Extract topic model result
+            topic_model_result = result["topic_model_result"]
             
             # Export topic info
-            topics_result["topic_info"].to_csv(os.path.join(method_dir, "topic_info.csv"), index=False)
+            topic_model_result["topic_info"].to_csv(os.path.join(method_dir, "topic_info.csv"), index=False)
             
             # Export document info
-            topics_result["document_info"].to_csv(os.path.join(method_dir, "document_info.csv"), index=False)
+            topic_model_result["document_info"].to_csv(os.path.join(method_dir, "document_info.csv"), index=False)
             
             # Export topic words
             with open(os.path.join(method_dir, "topic_words.txt"), "w") as f:
-                for topic, words in topics_result["topic_words"].items():
+                for topic, words in topic_model_result["topic_words"].items():
                     f.write(f"Topic {topic}:\n")
                     for word, score in words:
                         f.write(f"  {word}: {score:.4f}\n")
                     f.write("\n")
             
-            # Export topic model visualization if matplotlib is available
+            # Export sample info
+            sample_result = result["sample_result"]
+            with open(os.path.join(method_dir, "sample_info.txt"), "w") as f:
+                f.write(f"Method: {sample_result['method']}\n")
+                f.write(f"Total documents in corpus: {sample_result['total_docs']}\n")
+                f.write(f"Sampled documents: {sample_result['sampled_docs']}\n")
+                f.write(f"Sampling rate: {sample_result['sampling_rate']:.4f}\n")
+            
+            # Export document IDs
+            with open(os.path.join(method_dir, "document_ids.txt"), "w") as f:
+                for doc_id in sample_result["sample_ids"]:
+                    f.write(f"{doc_id}\n")
+            
+            # Export sample documents (first few)
+            with open(os.path.join(method_dir, "sample_documents.txt"), "w") as f:
+                for i, (doc_id, text) in enumerate(zip(sample_result["sample_ids"][:5], sample_result["sample_texts"][:5])):
+                    f.write(f"Document {i+1} (ID: {doc_id}):\n")
+                    f.write(f"{text[:500]}...\n\n")
+            
+            # Export topic model visualizations if matplotlib is available
             try:
                 import matplotlib.pyplot as plt
                 
-                # Handle topic visualization with error handling
+                # Create visualizations directory
+                vis_dir = os.path.join(method_dir, "visualizations")
+                os.makedirs(vis_dir, exist_ok=True)
+                
+                topic_model = topic_model_result["topic_model"]
+                
+                # Topic visualization
                 try:
-                    fig = topics_result["topic_model"].visualize_topics()
+                    fig = topic_model.visualize_topics()
                     plt.tight_layout()
-                    plt.savefig(os.path.join(method_dir, "topic_visualization.png"), dpi=300)
+                    plt.savefig(os.path.join(vis_dir, "topic_visualization.png"), dpi=300)
                     plt.close()
                 except Exception as e:
                     logger.warning(f"Could not create topic visualization: {str(e)}")
                 
-                # Handle topic hierarchy with error handling
-                try:
-                    fig = topics_result["topic_model"].visualize_hierarchy()
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(method_dir, "topic_hierarchy.png"), dpi=300)
-                    plt.close()
-                except Exception as e:
-                    logger.warning(f"Could not create topic hierarchy: {str(e)}")
+                # Topic hierarchy if available
+                if topic_model_result["hierarchical_topics"] is not None:
+                    try:
+                        fig = topic_model.visualize_hierarchy()
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(vis_dir, "topic_hierarchy.png"), dpi=300)
+                        plt.close()
+                    except Exception as e:
+                        logger.warning(f"Could not create topic hierarchy: {str(e)}")
                 
-                # Handle topic distribution with error handling
+                # Topic distribution
                 try:
-                    # Convert to numpy array if it's a list
-                    topics = topics_result["topics"]
+                    topics = topic_model_result["topics"]
                     if isinstance(topics, list):
                         import numpy as np
                         topics = np.array(topics)
                     
-                    fig = topics_result["topic_model"].visualize_distribution(topics)
+                    fig = topic_model.visualize_distribution(topics)
                     plt.tight_layout()
-                    plt.savefig(os.path.join(method_dir, "topic_distribution.png"), dpi=300)
+                    plt.savefig(os.path.join(vis_dir, "topic_distribution.png"), dpi=300)
                     plt.close()
                 except Exception as e:
                     logger.warning(f"Could not create topic distribution: {str(e)}")
-                    
-            except (ImportError, Exception) as e:
-                logger.warning(f"Could not create visualizations: {str(e)}")
+                
+                # Topic similarity
+                try:
+                    fig = topic_model.visualize_heatmap()
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(vis_dir, "topic_similarity.png"), dpi=300)
+                    plt.close()
+                except Exception as e:
+                    logger.warning(f"Could not create topic similarity: {str(e)}")
+                
+                # Topic embedding projection
+                try:
+                    if hasattr(topic_model, "topic_embeddings_"):
+                        fig = topic_model.visualize_topics_over_time(topic_model_result["topics"])
+                        plt.tight_layout()
+                        plt.savefig(os.path.join(vis_dir, "topic_projection.png"), dpi=300)
+                        plt.close()
+                except Exception as e:
+                    logger.warning(f"Could not create topic projection: {str(e)}")
+                
+            except ImportError as e:
+                logger.warning(f"Could not create visualizations, matplotlib not available: {str(e)}")
             
-            # Save retrieved document IDs
-            retrieved_docs = result["retrieved_docs"]
-            with open(os.path.join(method_dir, "retrieved_doc_ids.txt"), "w") as f:
-                for doc_id in retrieved_docs["doc_ids"]:
-                    f.write(f"{doc_id}\n")
-            
-            # Save full result
+            # Save full results
             with open(os.path.join(method_dir, "full_result.pkl"), "wb") as f:
                 pickle.dump(result, f)
             
             output_paths[method] = method_dir
         
         return output_paths
+    
+    def process_queries(
+        self,
+        query_ids: List[str],
+        methods: List[TopicModelingMethod] = [
+            TopicModelingMethod.DIRECT_RETRIEVAL,
+            TopicModelingMethod.QUERY_EXPANSION,
+            TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,
+            TopicModelingMethod.CLUSTER_AFTER_EXPANSION,
+            TopicModelingMethod.FULL_DATASET,
+            TopicModelingMethod.UNIFORM_SAMPLING
+        ],
+        sample_size: int = 1000,
+        retrieval_config: Optional[Dict[str, Any]] = None,
+        expansion_config: Optional[Dict[str, Any]] = None,
+        clustering_config: Optional[Dict[str, Any]] = None,
+        topic_model_config: Optional[Dict[str, Any]] = None,
+        force_sample: bool = False,
+        force_topic_model: bool = False,
+        output_dir: str = "results/topic_models"
+    ) -> Dict[str, Dict[str, Dict]]:
+        """
+        Process multiple queries with multiple methods
+        
+        Args:
+            query_ids: List of query IDs to process
+            methods: List of topic modeling methods
+            sample_size: Number of documents to sample
+            retrieval_config: Configuration for retrieval-based methods
+            expansion_config: Configuration for query expansion
+            clustering_config: Configuration for clustering-based methods
+            topic_model_config: Configuration for BERTopic
+            force_sample: Whether to force recomputing document sampling
+            force_topic_model: Whether to force recomputing topic modeling
+            output_dir: Directory to save results
+            
+        Returns:
+            Dictionary mapping query IDs to methods to topic modeling results
+        """
+        # Validate that queries dataset is available for query-based methods
+        if any(method in [TopicModelingMethod.DIRECT_RETRIEVAL, 
+                         TopicModelingMethod.QUERY_EXPANSION,
+                         TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,
+                         TopicModelingMethod.CLUSTER_AFTER_EXPANSION] for method in methods) and self.queries_dataset is None:
+            raise ValueError("queries_dataset must be provided for query-based methods")
+        
+        # Get query texts
+        query_texts = {}
+        
+        if self.queries_dataset is not None:
+            for query_item in self.queries_dataset:
+                if isinstance(query_item, dict) and "_id" in query_item and "text" in query_item:
+                    # Dict access for Datasets objects
+                    q_id = str(query_item["_id"])
+                    query_texts[q_id] = query_item["text"]
+                elif hasattr(query_item, '_id') and hasattr(query_item, 'text'):
+                    # Attribute access for custom objects
+                    q_id = str(query_item._id)
+                    query_texts[q_id] = query_item.text
+        
+        # Filter to requested query IDs
+        query_texts = {q_id: query_texts[q_id] for q_id in query_ids if q_id in query_texts}
+        
+        if not query_texts and any(method in [TopicModelingMethod.DIRECT_RETRIEVAL, 
+                                            TopicModelingMethod.QUERY_EXPANSION,
+                                            TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,
+                                            TopicModelingMethod.CLUSTER_AFTER_EXPANSION] for method in methods):
+            raise ValueError(f"No valid queries found among the specified query IDs: {query_ids}")
+        
+        all_results = {}
+        
+        # Process each query
+        for query_id, query_text in query_texts.items():
+            logger.info(f"Processing query {query_id}: '{query_text}'")
+            
+            # Run all methods for this query
+            query_results = self.run_multi_method_topic_modeling(
+                methods=methods,
+                query_id=query_id,
+                query_text=query_text,
+                sample_size=sample_size,
+                retrieval_config=retrieval_config,
+                expansion_config=expansion_config,
+                clustering_config=clustering_config,
+                topic_model_config=topic_model_config,
+                force_sample=force_sample,
+                force_topic_model=force_topic_model
+            )
+            
+            # Export results
+            query_output_dir = os.path.join(output_dir, f"query_{query_id}")
+            self.export_topic_models(query_results, query_output_dir)
+            
+            # Store results
+            all_results[query_id] = query_results
+        
+        # Handle non-query methods if needed
+        if TopicModelingMethod.FULL_DATASET in methods or TopicModelingMethod.UNIFORM_SAMPLING in methods:
+            logger.info("Processing non-query methods")
+            
+            non_query_methods = [m for m in methods if m in [TopicModelingMethod.FULL_DATASET, TopicModelingMethod.UNIFORM_SAMPLING]]
+            
+            # Run non-query methods
+            non_query_results = self.run_multi_method_topic_modeling(
+                methods=non_query_methods,
+                sample_size=sample_size,
+                topic_model_config=topic_model_config,
+                force_sample=force_sample,
+                force_topic_model=force_topic_model
+            )
+            
+            # Export results
+            non_query_output_dir = os.path.join(output_dir, "corpus_level")
+            self.export_topic_models(non_query_results, non_query_output_dir)
+            
+            # Store results
+            all_results["corpus_level"] = non_query_results
+        
+        # Cache overall results
+        cache_path = os.path.join(self.cache_dir, "all_topic_model_results.pkl")
+        with open(cache_path, "wb") as f:
+            pickle.dump(all_results, f)
+        
+        return all_results
 
 
 def main():
-    """Main function to demonstrate query-based topic modeling"""
+    """Main function to demonstrate topic modeling functionality"""
     from datasets import load_dataset
     
     # Define constants
     CACHE_DIR = "cache"
     LOG_LEVEL = 'INFO'
-    OUTPUT_DIR = "results/topics"
+    OUTPUT_DIR = "results/topic_models"
     
-    # Define query IDs to process - can be modified
-    QUERY_IDS = ["1", "2", "3"]  # First 3 queries
+    # Define query IDs to process
+    QUERY_IDS = ["43"]  # First 3 queries
     
     # Flag to force recomputation
-    FORCE_RETRIEVE = False  # Force recomputing document retrieval
-    FORCE_TOPIC_MODEL = False  # Force recomputing topic models
-    
-    # Retrieval configuration
-    RETRIEVAL_CONFIG = {
-        "retrieval_method": RetrievalMethod.HYBRID,
-        "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        "top_k": 1000,
-        "use_mmr": False,
-        "mmr_lambda": 0.5,
-        "use_cross_encoder": False
-    }
-    
-    # Query expansion configuration
-    EXPANSION_CONFIG = {
-        "expansion_method": QueryExpansionMethod.KEYBERT,
-        "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-        "num_keywords": 5,
-        "keyword_diversity": 0.7,
-        "docs_for_keywords": 10,
-        "original_query_weight": 0.7
-    }
-    
-    # Topic modeling configuration
-    TOPIC_MODEL_CONFIG = {
-        "n_components": 5,  # Number of components for UMAP
-        "n_neighbors": 15,  # Number of neighbors for UMAP
-        "min_dist": 0.0,  # Minimum distance for UMAP
-        "metric": "cosine",  # Distance metric for UMAP
-        "min_cluster_size": 10,  # Minimum cluster size for HDBSCAN
-        "min_samples": None,  # Minimum samples for HDBSCAN (None defaults to min_cluster_size)
-        "mmr_diversity": 0.3,  # Diversity parameter for MMR
-        "nr_topics": None,  # Optional number of topics (None for automatic)
-        "use_guided": True,  # Whether to use guided topic modeling
-        "hierarchical_topics": False,  # Whether to compute hierarchical topics
-        "reduce_frequent_words": True,  # Whether to reduce frequent words in TF-IDF
-        "stop_words": "english",  # Stop words to remove
-        "verbose": True  # Show verbose output
-    }
+    FORCE_SAMPLE = False
+    FORCE_TOPIC_MODEL = False
     
     # Configure logging
     logging.basicConfig(
@@ -769,84 +1047,99 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Extract query texts
-    query_texts = {}
-    for i, q in enumerate(queries_dataset):
-        q_id = str(i+1)  # Convert to string ID (1-based indexing)
-        
-        if isinstance(q, dict) and "text" in q:
-            query_texts[q_id] = q["text"]  # Dictionary access
-        elif hasattr(q, 'text'):
-            query_texts[q_id] = q.text  # Attribute access
-        else:
-            # Default approach if structure is unknown
-            query_texts[q_id] = str(q)
-    
-    # Filter to selected query IDs
-    selected_queries = {q_id: query_texts[q_id] for q_id in QUERY_IDS if q_id in query_texts}
-    
-    if not selected_queries:
-        logger.error("No valid queries found in the specified query IDs")
-        return
-    
     # Initialize topic modeler
     logger.info("Initializing topic modeler...")
-    topic_modeler = QueryBasedTopicModel(
+    topic_modeler = TopicModeler(
+        corpus_dataset=corpus_dataset,
+        queries_dataset=queries_dataset,
+        qrels_dataset=qrels_dataset,
         embedding_model_name="all-mpnet-base-v2",
-        cache_dir=CACHE_DIR
+        cache_dir=CACHE_DIR,
+        random_seed=42
     )
     
-    all_results = {}
+    # Define methods to use
+    methods = [
+        TopicModelingMethod.DIRECT_RETRIEVAL,           # 1. Direct hybrid retrieval
+        TopicModelingMethod.QUERY_EXPANSION,            # 2. KeyBERT query expansion
+        TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,    # 3. Cluster sampling after retrieval
+        TopicModelingMethod.CLUSTER_AFTER_EXPANSION,    # 4. Cluster sampling after query expansion
+        TopicModelingMethod.FULL_DATASET,               # 5. Full dataset topic modeling
+        TopicModelingMethod.UNIFORM_SAMPLING            # 6. Uniform sampling topic modeling
+    ]
     
-    # Process each query
-    for query_id, query_text in selected_queries.items():
-        logger.info(f"Processing query {query_id}: '{query_text}'")
-        
-        # Process the query with all methods
-        results = topic_modeler.process_query(
-            query_id=query_id,
-            query_text=query_text,
-            corpus_dataset=corpus_dataset,
-            methods=["retrieval", "query_expansion"],  # Methods to use
-            retrieval_config=RETRIEVAL_CONFIG,
-            expansion_config=EXPANSION_CONFIG,
-            topic_model_config=TOPIC_MODEL_CONFIG,
-            force_retrieve=FORCE_RETRIEVE,
-            force_topic_model=FORCE_TOPIC_MODEL
-        )
-        
-        # Export results
-        output_paths = topic_modeler.export_topic_results(
-            query_id=query_id,
-            topics_results=results,
-            output_dir=OUTPUT_DIR
-        )
-        
-        all_results[query_id] = {
-            "query_text": query_text,
-            "results": results,
-            "output_paths": output_paths
-        }
+    # Define configurations
+    retrieval_config = {
+        "retrieval_method": RetrievalMethod.HYBRID,
+        "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+        "top_k": 1000,
+        "use_mmr": False,
+        "use_cross_encoder": False
+    }
+    
+    expansion_config = {
+        "expansion_method": QueryExpansionMethod.KEYBERT,
+        "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+        "num_keywords": 5,
+        "original_query_weight": 0.7
+    }
+    
+    clustering_config = {
+        "dim_reduction_method": DimensionReductionMethod.UMAP,
+        "n_components": 50,
+        "clustering_method": ClusteringMethod.KMEANS,
+        "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+        "n_per_cluster": 1,
+        "min_cluster_size": 5
+    }
+    
+    topic_model_config = {
+        "n_components": 5,
+        "n_neighbors": 15,
+        "min_dist": 0.0,
+        "metric": "cosine",
+        "min_cluster_size": 10,
+        "min_samples": None,
+        "mmr_diversity": 0.3,
+        "nr_topics": None,
+        "use_guided": True,
+        "hierarchical_topics": False,
+        "reduce_frequent_words": True,
+        "stop_words": "english",
+        "verbose": True
+    }
+    
+    # Process queries
+    logger.info("Processing queries...")
+    all_results = topic_modeler.process_queries(
+        query_ids=QUERY_IDS,
+        methods=methods,
+        sample_size=1000,
+        retrieval_config=retrieval_config,
+        expansion_config=expansion_config,
+        clustering_config=clustering_config,
+        topic_model_config=topic_model_config,
+        force_sample=FORCE_SAMPLE,
+        force_topic_model=FORCE_TOPIC_MODEL,
+        output_dir=OUTPUT_DIR
+    )
     
     # Print summary of results
     logger.info("\n===== TOPIC MODELING RESULTS SUMMARY =====")
-    logger.info(f"{'Query':<10} {'Method':<20} {'Documents':<10} {'Topics':<10}")
-    logger.info("-" * 55)
+    logger.info(f"{'Query':<10} {'Method':<30} {'Documents':<10} {'Topics':<10}")
+    logger.info("-" * 65)
     
-    for query_id, query_data in all_results.items():
-        for method, result in query_data["results"].items():
-            num_docs = result["retrieved_docs"]["num_docs"]
-            num_topics = result["topics_result"]["num_topics"]
+    for query_id, query_results in all_results.items():
+        for method, result in query_results.items():
+            sample_result = result["sample_result"]
+            topic_model_result = result["topic_model_result"]
             
-            logger.info(f"{query_id:<10} {method:<20} {num_docs:<10} {num_topics:<10}")
+            num_docs = sample_result["sampled_docs"]
+            num_topics = topic_model_result["num_topics"]
+            
+            logger.info(f"{query_id:<10} {method:<30} {num_docs:<10} {num_topics:<10}")
     
     logger.info(f"\nResults exported to {OUTPUT_DIR}")
-    
-    # Cache the summarized results
-    cache_path = os.path.join(CACHE_DIR, "topic_results_by_query.pkl")
-    logger.info(f"Caching topic results to: {cache_path}")
-    with open(cache_path, "wb") as f:
-        pickle.dump(all_results, f)
     
     return all_results
 
