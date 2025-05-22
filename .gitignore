@@ -187,3 +187,8 @@ results/
 
 # Mac Stuff
 .DS_Store
+
+# HPC related files
+*.sh 
+*.err
+*.out
