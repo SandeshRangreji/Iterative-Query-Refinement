@@ -1189,7 +1189,7 @@ def main():
     
     expansion_config = {
         "expansion_method": QueryExpansionMethod.KEYBERT,
-        "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+        "combination_strategy": QueryCombinationStrategy.CONCATENATED,
         "num_keywords": 5,
         "original_query_weight": 0.7
     }

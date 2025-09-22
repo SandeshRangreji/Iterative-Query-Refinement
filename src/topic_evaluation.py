@@ -1599,6 +1599,356 @@ class TopicEvaluator:
             logger.info(f"Saved topic word metrics visualization to: {output_path}")
         
         return plt.gcf()
+    
+    def calculate_topic_distribution_similarity(
+        self,
+        reference_result: Dict,
+        sample_result: Dict
+    ) -> float:
+        """
+        Calculate Jensen-Shannon divergence between topic distributions
+        
+        Args:
+            reference_result: Reference topic model result
+            sample_result: Sample topic model result
+            
+        Returns:
+            Similarity score (1 - JS divergence)
+        """
+        from scipy.spatial.distance import jensenshannon
+        from scipy.stats import entropy
+        import numpy as np
+        
+        # Get topic distributions (frequency of documents per topic)
+        ref_topics = reference_result["topics"]
+        sample_topics = sample_result["topics"]
+        
+        # Count documents per topic
+        ref_counts = {}
+        for topic in ref_topics:
+            if topic != -1:  # Skip noise/outlier topic
+                ref_counts[topic] = ref_counts.get(topic, 0) + 1
+        
+        sample_counts = {}
+        for topic in sample_topics:
+            if topic != -1:  # Skip noise/outlier topic
+                sample_counts[topic] = sample_counts.get(topic, 0) + 1
+        
+        # Get total counts (excluding noise)
+        ref_total = sum(ref_counts.values())
+        sample_total = sum(sample_counts.values())
+        
+        # Check if we have valid data
+        if ref_total == 0 or sample_total == 0:
+            return 0.0
+        
+        # Get the set of all topic IDs
+        all_topics = sorted(set(list(ref_counts.keys()) + list(sample_counts.keys())))
+        
+        # Create probability distributions
+        ref_dist = np.array([ref_counts.get(t, 0) / ref_total for t in all_topics])
+        sample_dist = np.array([sample_counts.get(t, 0) / sample_total for t in all_topics])
+        
+        # Calculate Jensen-Shannon divergence
+        js_distance = jensenshannon(ref_dist, sample_dist)
+        
+        # Convert to similarity (1 - distance)
+        return 1.0 - js_distance
+
+    def visualize_topic_distribution_comparison(
+        self,
+        reference_result: Dict,
+        sample_result: Dict,
+        output_path: Optional[str] = None,
+        title: Optional[str] = None
+    ) -> plt.Figure:
+        """
+        Create a visualization comparing topic distributions
+        
+        Args:
+            reference_result: Reference topic model result
+            sample_result: Sample topic model result
+            output_path: Optional path to save visualization
+            title: Optional title for the plot
+            
+        Returns:
+            Matplotlib Figure object
+        """
+        # Get topic distributions
+        ref_topics = reference_result.get("topics", [])
+        sample_topics = sample_result.get("topics", [])
+        
+        # Get method names safely
+        reference_method = reference_result.get("sample_method", 
+                        reference_result.get("reference_method", "Reference"))
+        sample_method = sample_result.get("sample_method", "Sample")
+        
+        # Count documents per topic, excluding noise
+        ref_counts = {}
+        for topic in ref_topics:
+            if topic != -1:
+                ref_counts[topic] = ref_counts.get(topic, 0) + 1
+        
+        sample_counts = {}
+        for topic in sample_topics:
+            if topic != -1:
+                sample_counts[topic] = sample_counts.get(topic, 0) + 1
+        
+        # Get total counts
+        ref_total = sum(ref_counts.values()) if ref_counts else 1
+        sample_total = sum(sample_counts.values()) if sample_counts else 1
+        
+        # Get topic percentages
+        ref_pcts = {t: (c / ref_total * 100) for t, c in ref_counts.items()}
+        sample_pcts = {t: (c / sample_total * 100) for t, c in sample_counts.items()}
+        
+        # Get a list of all topics
+        all_topics = sorted(set(list(ref_counts.keys()) + list(sample_counts.keys())))
+        
+        # Create data for plotting
+        x = list(range(len(all_topics)))
+        ref_values = [ref_pcts.get(t, 0) for t in all_topics]
+        sample_values = [sample_pcts.get(t, 0) for t in all_topics]
+        
+        # Setup plot
+        plt.figure(figsize=(12, 8))
+        
+        # Create bar chart
+        width = 0.35
+        ax = plt.gca()
+        ref_bars = ax.bar([i - width/2 for i in x], ref_values, width, label=reference_method)
+        sample_bars = ax.bar([i + width/2 for i in x], sample_values, width, label=sample_method)
+        
+        # Add labels and title
+        plt.xlabel('Topic ID')
+        plt.ylabel('Percentage of Documents (%)')
+        
+        if title:
+            plt.title(title)
+        else:
+            # Calculate similarity using Jensen-Shannon divergence if possible
+            try:
+                from scipy.spatial.distance import jensenshannon
+                ref_dist = np.array(ref_values) / 100
+                sample_dist = np.array(sample_values) / 100
+                
+                # Check for valid distributions
+                if np.sum(ref_dist) > 0 and np.sum(sample_dist) > 0:
+                    # Normalize distributions
+                    ref_dist = ref_dist / np.sum(ref_dist)
+                    sample_dist = sample_dist / np.sum(sample_dist)
+                    
+                    # Calculate JS divergence
+                    js_distance = jensenshannon(ref_dist, sample_dist)
+                    similarity = 1.0 - js_distance
+                    
+                    plt.title(f'Topic Distribution Comparison\nSimilarity: {similarity:.3f}')
+                else:
+                    plt.title('Topic Distribution Comparison')
+            except Exception:
+                plt.title('Topic Distribution Comparison')
+        
+        # Set x-ticks
+        plt.xticks(x, [f'T{t}' for t in all_topics])
+        if len(all_topics) > 15:
+            plt.xticks(rotation=90)
+        
+        # Add legend
+        plt.legend()
+        
+        plt.tight_layout()
+        
+        # Save if requested
+        if output_path:
+            plt.savefig(output_path, dpi=300)
+            logger.info(f"Saved topic distribution comparison to: {output_path}")
+        
+        return plt.gcf()
+
+    def visualize_sampling_efficiency(
+        self,
+        evaluation_results: Dict[str, Dict],
+        metric: str = "bcubed_f1",
+        output_path: Optional[str] = None,
+        title: Optional[str] = None
+    ) -> plt.Figure:
+        """
+        Create a visualization showing sampling efficiency (metric vs sample size)
+        
+        Args:
+            evaluation_results: Dictionary mapping method names to evaluation results
+            metric: Metric to use for efficiency calculation
+            output_path: Optional path to save visualization
+            title: Optional title for the plot
+            
+        Returns:
+            Matplotlib Figure object
+        """
+        # Extract data
+        methods = []
+        sample_sizes = []
+        metric_values = []
+        ref_sizes = []
+        
+        for name, result in evaluation_results.items():
+            # Skip methods with zero metric value
+            if result["document_metrics"].get(metric, 0) == 0:
+                continue
+                
+            methods.append(name)
+            sample_sizes.append(result["sample_docs_count"])
+            ref_sizes.append(result["reference_docs_count"])
+            
+            # Get metric value based on specified metric
+            if "." in metric:
+                # Handle nested metrics like topic_word_metrics.hungarian.f1_score
+                parts = metric.split(".")
+                value = result
+                for part in parts:
+                    value = value.get(part, {})
+                metric_values.append(value if isinstance(value, (int, float)) else 0)
+            else:
+                # Handle top-level metrics like bcubed_f1
+                metric_values.append(result["document_metrics"].get(metric, 0))
+        
+        # Calculate sampling ratio and efficiency
+        sampling_ratios = [s / r for s, r in zip(sample_sizes, ref_sizes)]
+        sampling_efficiency = [v / r for v, r in zip(metric_values, sampling_ratios)]
+        
+        # Setup plot
+        plt.figure(figsize=(10, 8))
+        
+        # Create scatter plot
+        plt.scatter(sampling_ratios, metric_values, s=[e * 100 for e in sampling_efficiency], 
+                    alpha=0.7, c=range(len(methods)), cmap='viridis')
+        
+        # Add method labels
+        for i, method in enumerate(methods):
+            plt.annotate(method, (sampling_ratios[i], metric_values[i]),
+                        xytext=(5, 5), textcoords='offset points')
+        
+        # Add labels and title
+        plt.xlabel('Sampling Ratio (Sample Size / Reference Size)')
+        
+        # Get nice metric name
+        metric_labels = {
+            "adjusted_rand_index": "Adjusted Rand Index",
+            "normalized_mutual_info": "Normalized Mutual Information",
+            "omega_index": "Omega Index",
+            "bcubed_precision": "B-Cubed Precision",
+            "bcubed_recall": "B-Cubed Recall", 
+            "bcubed_f1": "B-Cubed F1 Score",
+            "topic_word_metrics.hungarian.f1_score": "Topic Word F1 Score (Hungarian)",
+            "topic_word_metrics.greedy.f1_score": "Topic Word F1 Score (Greedy)"
+        }
+        metric_name = metric_labels.get(metric, metric)
+        plt.ylabel(metric_name)
+        
+        if title:
+            plt.title(title)
+        else:
+            plt.title(f'Sampling Efficiency: {metric_name} vs Sampling Ratio')
+        
+        # Add size legend
+        sizes = [0.001, 0.01, 0.1]
+        labels = ["0.1%", "1%", "10%"]
+        
+        for size, label in zip(sizes, labels):
+            plt.scatter([], [], s=size * 100, alpha=0.7, c='gray', label=f'Efficiency: {label}')
+        
+        plt.legend(title="Sampling Efficiency\n(Score/Ratio)")
+        
+        # Add grid
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Use log scale for x-axis if large differences
+        if max(sampling_ratios) / min(sampling_ratios) > 100:
+            plt.xscale('log')
+        
+        plt.tight_layout()
+        
+        # Save if requested
+        if output_path:
+            plt.savefig(output_path, dpi=300)
+            logger.info(f"Saved sampling efficiency visualization to: {output_path}")
+        
+        return plt.gcf()
+
+    def visualize_information_density(
+        self,
+        evaluation_results: Dict[str, Dict],
+        output_path: Optional[str] = None,
+        title: Optional[str] = None
+    ) -> plt.Figure:
+        """
+        Create a visualization showing information density in different samples
+        
+        Args:
+            evaluation_results: Dictionary mapping method names to evaluation results
+            output_path: Optional path to save visualization
+            title: Optional title for the plot
+            
+        Returns:
+            Matplotlib Figure object
+        """
+        # Extract data
+        methods = []
+        sample_sizes = []
+        bcubed_f1 = []
+        topic_f1 = []
+        
+        for name, result in evaluation_results.items():
+            # Skip methods with zero metric values
+            doc_f1 = result["document_metrics"].get("bcubed_f1", 0)
+            word_f1 = result["topic_word_metrics"]["hungarian"].get("f1_score", 0)
+            
+            if doc_f1 == 0 and word_f1 == 0:
+                continue
+                
+            methods.append(name)
+            sample_sizes.append(result["sample_docs_count"])
+            bcubed_f1.append(doc_f1)
+            topic_f1.append(word_f1)
+        
+        # Calculate density
+        density = [(b + t) / 2 for b, t in zip(bcubed_f1, topic_f1)]
+        
+        # Setup plot - vertical bar chart
+        plt.figure(figsize=(12, 8))
+        
+        # Create positions for bars
+        x = range(len(methods))
+        
+        # Create stacked bars
+        plt.bar(x, bcubed_f1, label='Document Structure (B³ F1)', color='#66b3ff')
+        plt.bar(x, topic_f1, bottom=bcubed_f1, label='Topic Content (Word F1)', color='#99ff99')
+        
+        # Add labels and title
+        plt.xlabel('Sampling Method')
+        plt.ylabel('Metric Score (Higher is Better)')
+        plt.xticks(x, methods, rotation=45, ha='right')
+        
+        # Add sample size annotations
+        for i, (size, d) in enumerate(zip(sample_sizes, density)):
+            plt.text(i, bcubed_f1[i] + topic_f1[i] + 0.03, f'Size: {size:,}', 
+                    ha='center', va='bottom', fontsize=9)
+            plt.text(i, bcubed_f1[i] + topic_f1[i]/2, f'Density: {d:.3f}', 
+                    ha='center', va='center', fontsize=9, color='white', fontweight='bold')
+        
+        if title:
+            plt.title(title)
+        else:
+            plt.title('Information Density Comparison')
+        
+        plt.legend(loc='upper right')
+        plt.tight_layout()
+        
+        # Save if requested
+        if output_path:
+            plt.savefig(output_path, dpi=300)
+            logger.info(f"Saved information density visualization to: {output_path}")
+        
+        return plt.gcf()
 
     def export_evaluation_results(
         self,
@@ -1670,6 +2020,13 @@ class TopicEvaluator:
         summary_df = pd.DataFrame(summary_data)
         summary_df.to_csv(summary_path, index=False)
         
+        # Find reference result data for topic distribution comparison
+        ref_result = None
+        for method_name, r in evaluation_results.items():
+            if method_name == reference_method:
+                ref_result = r
+                break
+        
         # Process each sample
         for name, result in evaluation_results.items():
             # Create a safe version of the sample name
@@ -1727,6 +2084,7 @@ class TopicEvaluator:
             
             # Create visualizations if requested
             if create_visualizations:
+                # Try each visualization separately to avoid one failure affecting others
                 try:
                     # Topic overlap matrix
                     matrix_path = os.path.join(sample_dir, "topic_similarity_matrix.png")
@@ -1739,7 +2097,6 @@ class TopicEvaluator:
                 except Exception as e:
                     logger.error(f"Error generating topic similarity matrix for {name}: {str(e)}")
                 
-                # Try each visualization separately to avoid one failure affecting others
                 try:
                     # Document metrics radar chart
                     radar_path = os.path.join(sample_dir, "document_metrics_radar.png")
@@ -1787,6 +2144,23 @@ class TopicEvaluator:
                     plt.close()
                 except Exception as e:
                     logger.error(f"Error generating coverage ratio for {name}: {str(e)}")
+                    
+                try:
+                    # Topic distribution comparison
+                    topic_dist_path = os.path.join(sample_dir, "topic_distribution.png")
+                    
+                    if ref_result and "topics" in result and "topics" in ref_result:
+                        self.visualize_topic_distribution_comparison(
+                            ref_result,
+                            result,
+                            output_path=topic_dist_path,
+                            title=f"Topic Distribution: {ref_result.get('sample_method', reference_method)} vs {result.get('sample_method', name)}"
+                        )
+                        plt.close()
+                    else:
+                        logger.warning(f"Skipping topic distribution comparison for {name} (missing topic data)")
+                except Exception as e:
+                    logger.error(f"Error generating topic distribution comparison for {name}: {str(e)}")
             
             output_paths[name] = sample_dir
         
@@ -1801,7 +2175,10 @@ class TopicEvaluator:
                     title=f"Document-Level Topic Evaluation Metrics (Reference: {reference_method})"
                 )
                 plt.close()
+            except Exception as e:
+                logger.error(f"Error generating document metrics visualization: {str(e)}")
                 
+            try:
                 # Comparative document metrics (NEW)
                 comparative_doc_path = os.path.join(ref_dir, "comparative_document_metrics.png")
                 self.visualize_comparative_metrics(
@@ -1812,7 +2189,10 @@ class TopicEvaluator:
                     title=f"Document Clustering Metrics Comparison (Reference: {reference_method})"
                 )
                 plt.close()
+            except Exception as e:
+                logger.error(f"Error generating comparative document metrics: {str(e)}")
                 
+            try:
                 # Comparative B-Cubed metrics (NEW)
                 comparative_bcubed_path = os.path.join(ref_dir, "comparative_bcubed_metrics.png")
                 self.visualize_comparative_metrics(
@@ -1823,7 +2203,10 @@ class TopicEvaluator:
                     title=f"B-Cubed Metrics Comparison (Reference: {reference_method})"
                 )
                 plt.close()
+            except Exception as e:
+                logger.error(f"Error generating comparative B-Cubed metrics: {str(e)}")
                 
+            try:
                 # Topic word metrics (Greedy)
                 word_metrics_greedy_path = os.path.join(ref_dir, "topic_word_metrics_greedy.png")
                 self.visualize_topic_word_metrics(
@@ -1833,7 +2216,10 @@ class TopicEvaluator:
                     title=f"Topic Word Metrics with Greedy Matching (Reference: {reference_method})"
                 )
                 plt.close()
+            except Exception as e:
+                logger.error(f"Error generating greedy metrics visualization: {str(e)}")
                 
+            try:
                 # Topic word metrics (Hungarian)
                 word_metrics_hungarian_path = os.path.join(ref_dir, "topic_word_metrics_hungarian.png")
                 self.visualize_topic_word_metrics(
@@ -1844,10 +2230,34 @@ class TopicEvaluator:
                 )
                 plt.close()
             except Exception as e:
-                logger.error(f"Error generating comparative visualizations: {str(e)}")
+                logger.error(f"Error generating Hungarian metrics visualization: {str(e)}")
+                
+            try:
+                # Sampling efficiency visualization (NEW)
+                sampling_efficiency_path = os.path.join(ref_dir, "sampling_efficiency.png")
+                self.visualize_sampling_efficiency(
+                    evaluation_results,
+                    metric="bcubed_f1",  # Use B-Cubed F1 as default metric
+                    output_path=sampling_efficiency_path,
+                    title=f"Topic Modeling Efficiency with Different Sampling Methods"
+                )
+                plt.close()
+            except Exception as e:
+                logger.error(f"Error generating sampling efficiency visualization: {str(e)}")
+                
+            try:
+                # Information density visualization (NEW)
+                density_path = os.path.join(ref_dir, "information_density.png")
+                self.visualize_information_density(
+                    evaluation_results,
+                    output_path=density_path,
+                    title=f"Information Density in Different Sampling Methods"
+                )
+                plt.close()
+            except Exception as e:
+                logger.error(f"Error generating information density visualization: {str(e)}")
         
         return output_paths
-
 
 def main():
     """Main function to evaluate topic models using FULL_DATASET as the gold standard"""

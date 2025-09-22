@@ -1433,7 +1433,7 @@ def main():
             "source_method": SamplingMethod.FULL_DATASET,
             "dim_reduction_method": DimensionReductionMethod.UMAP,
             "n_components": 50,
-            "clustering_method": ClusteringMethod.KMEANS,
+            "clustering_method": ClusteringMethod.HDBSCAN,
             "rep_selection_method": RepresentativeSelectionMethod.CENTROID
         },
         {
@@ -1443,7 +1443,7 @@ def main():
             "source_method": SamplingMethod.RETRIEVAL,
             "dim_reduction_method": DimensionReductionMethod.UMAP,
             "n_components": 50,
-            "clustering_method": ClusteringMethod.KMEANS,
+            "clustering_method": ClusteringMethod.HDBSCAN,
             "rep_selection_method": RepresentativeSelectionMethod.CENTROID
         }
     ]
