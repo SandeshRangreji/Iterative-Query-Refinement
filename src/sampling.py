@@ -46,7 +46,7 @@ class DimensionReductionMethod(str, Enum):
 
 class ClusteringMethod(str, Enum):
     """Enum for clustering methods"""
-    KMEANS = "kmeans"
+    KMEANS = "kmeans"  # Now uses Mini-Batch KMeans by default
     HDBSCAN = "hdbscan"
 
 class RepresentativeSelectionMethod(str, Enum):
@@ -523,21 +523,21 @@ class Sampler:
         
         logger.info(f"Performing query expansion sampling (size: {sample_size})...")
         
-        # Initialize keyword extractor
+        # Initialize keyword extractor and pass force flag
         keyword_extractor = KeywordExtractor(
             keybert_model=self.sbert_model,
             cache_dir=self.cache_dir,
             top_k_docs=top_k,
-            top_n_docs_for_extraction=10  # Use top 10 docs for extraction
+            top_n_docs_for_extraction=10
         )
         
-        # Extract keywords for all queries
+        # Extract keywords with force flag
         all_keywords = keyword_extractor.extract_keywords_for_queries(
             queries_dataset=self.queries_dataset,
             corpus_dataset=self.corpus_dataset,
             num_keywords=num_keywords,
             diversity=0.7,
-            force_regenerate=force_regenerate_keywords
+            force_regenerate=force_regenerate_keywords  # PASS FLAG
         )
         
         # Initialize query expander
@@ -573,7 +573,7 @@ class Sampler:
             num_keywords=num_keywords,
             top_k_results=top_k,
             original_query_weight=original_query_weight,
-            force_regenerate_expansion=force_regenerate
+            force_regenerate_expansion=force_regenerate  # PASS FLAG
         )
         
         # Extract document IDs from expanded results
@@ -630,11 +630,16 @@ class Sampler:
         rep_selection_method: RepresentativeSelectionMethod = RepresentativeSelectionMethod.CENTROID,
         n_per_cluster: int = 1,
         min_cluster_size: int = 5,
+        batch_size: int = 1000,
+        max_iter: int = 100,
+        n_init: int = 3,
+        max_no_improvement: int = 10,
+        reassignment_ratio: float = 0.01,
         force_recompute: bool = False,
         force_source_regenerate: bool = False
     ) -> Dict:
         """
-        Sample documents using clustering
+        Sample documents using clustering with Mini-Batch KMeans optimization
         
         Args:
             sample_size: Target sample size
@@ -646,6 +651,11 @@ class Sampler:
             rep_selection_method: Method for selecting representatives
             n_per_cluster: Number of documents to select per cluster
             min_cluster_size: Minimum cluster size (for HDBSCAN)
+            batch_size: Batch size for Mini-Batch KMeans
+            max_iter: Maximum iterations for Mini-Batch KMeans
+            n_init: Number of initializations for Mini-Batch KMeans
+            max_no_improvement: Early stopping parameter for Mini-Batch KMeans
+            reassignment_ratio: Controls reassignment frequency for Mini-Batch KMeans
             force_recompute: Whether to force recomputing clustering
             force_source_regenerate: Whether to force regenerating source documents
             
@@ -653,30 +663,34 @@ class Sampler:
             Dictionary with sampling results
         """
         # Default source config if not provided
-        if source_config is None:
-            if source_method == SamplingMethod.FULL_DATASET:
-                source_config = {"sample_size": len(self.corpus_ids)}
-            elif source_method == SamplingMethod.RETRIEVAL:
-                source_config = {
-                    "sample_size": min(10000, len(self.corpus_ids)),
-                    "retrieval_method": RetrievalMethod.HYBRID,
-                    "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-                    "top_k": 1000,
-                    "use_mmr": False,
-                    "use_cross_encoder": False
-                }
-            elif source_method == SamplingMethod.QUERY_EXPANSION:
-                source_config = {
-                    "sample_size": min(10000, len(self.corpus_ids)),
-                    "expansion_method": QueryExpansionMethod.KEYBERT,
-                    "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-                    "num_keywords": 5,
-                    "retrieval_method": RetrievalMethod.HYBRID,
-                    "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-                    "top_k": 1000,
-                    "use_mmr": False,
-                    "use_cross_encoder": False
-                }
+        if source_method == SamplingMethod.FULL_DATASET:
+            source_result = self.sample_full_dataset()
+            
+        elif source_method == SamplingMethod.RETRIEVAL:
+            source_result = self.sample_retrieval(
+                sample_size=source_config["sample_size"],
+                retrieval_method=source_config["retrieval_method"],
+                hybrid_strategy=source_config["hybrid_strategy"],
+                top_k=source_config["top_k"],
+                use_mmr=source_config["use_mmr"],
+                use_cross_encoder=source_config["use_cross_encoder"],
+                force_regenerate=force_source_regenerate  # PASS FLAG
+            )
+            
+        elif source_method == SamplingMethod.QUERY_EXPANSION:
+            source_result = self.sample_query_expansion(
+                sample_size=source_config["sample_size"],
+                expansion_method=source_config["expansion_method"],
+                combination_strategy=source_config["combination_strategy"],
+                num_keywords=source_config["num_keywords"],
+                retrieval_method=source_config["retrieval_method"],
+                hybrid_strategy=source_config["hybrid_strategy"],
+                top_k=source_config["top_k"],
+                use_mmr=source_config["use_mmr"],
+                use_cross_encoder=source_config["use_cross_encoder"],
+                force_regenerate=force_source_regenerate,  # PASS FLAG
+                force_regenerate_keywords=force_source_regenerate  # PASS FLAG
+            )
         
         # Create config dictionary for cache path
         config = {
@@ -738,10 +752,10 @@ class Sampler:
         # Convert to numpy for processing
         embeddings_np = source_embeddings.cpu().numpy()
         
-        # Determine number of clusters based on sample size
+        # Calculate number of clusters based on sample size
         if clustering_method == ClusteringMethod.KMEANS:
             n_clusters = min(sample_size, len(source_doc_ids))
-        else:  # HDBSCAN might not assign all points to clusters
+        else:  # HDBSCAN
             n_clusters = sample_size // n_per_cluster
         
         # Perform dimensionality reduction if requested
@@ -761,7 +775,12 @@ class Sampler:
             reduced_embeddings, 
             method=clustering_method.value, 
             n_clusters=n_clusters, 
-            min_cluster_size=min_cluster_size
+            min_cluster_size=min_cluster_size,
+            batch_size=batch_size,          # NOW ACTUALLY USED
+            max_iter=max_iter,              # NOW ACTUALLY USED
+            n_init=n_init,                  # NOW ACTUALLY USED
+            max_no_improvement=max_no_improvement,  # NOW ACTUALLY USED
+            reassignment_ratio=reassignment_ratio   # NOW ACTUALLY USED
         )
         
         # Select representatives
@@ -870,17 +889,27 @@ class Sampler:
         method: str = "kmeans",
         n_clusters: int = 100,
         min_cluster_size: int = 5,
+        batch_size: int = 1000,
+        max_iter: int = 100,
+        n_init: int = 3,
+        max_no_improvement: int = 10,
+        reassignment_ratio: float = 0.01,
         random_state: int = 42,
         cache_key: Optional[str] = None
     ) -> Tuple[np.ndarray, Dict]:
         """
-        Cluster documents
+        Cluster documents using Mini-Batch KMeans (faster) or HDBSCAN
         
         Args:
             embeddings: Document embeddings
             method: Clustering method ('kmeans' or 'hdbscan')
-            n_clusters: Number of clusters for KMeans
+            n_clusters: Number of clusters for Mini-Batch KMeans
             min_cluster_size: Minimum cluster size for HDBSCAN
+            batch_size: Batch size for Mini-Batch KMeans
+            max_iter: Maximum iterations for Mini-Batch KMeans
+            n_init: Number of initializations for Mini-Batch KMeans
+            max_no_improvement: Early stopping parameter for Mini-Batch KMeans
+            reassignment_ratio: Controls reassignment frequency for Mini-Batch KMeans
             random_state: Random state for reproducibility
             cache_key: Optional key for caching results
             
@@ -892,7 +921,7 @@ class Sampler:
         if cache_key is not None:
             cache_path = os.path.join(
                 self.cache_dir, 
-                f"clusters_{method}_{n_clusters}_{min_cluster_size}_{cache_key}.pkl"
+                f"clusters_{method}_{n_clusters}_{min_cluster_size}_{batch_size}_{cache_key}.pkl"
             )
             
             # Check cache
@@ -903,12 +932,25 @@ class Sampler:
                 return result["labels"], result["cluster_info"]
         
         if method.lower() == "kmeans":
-            # KMeans for balanced clusters
-            clusterer = KMeans(
+            # Mini-Batch KMeans - optimized for speed
+            from sklearn.cluster import MiniBatchKMeans
+            
+            # Adjust batch size based on dataset size for optimal performance
+            actual_batch_size = min(batch_size, len(embeddings))
+            
+            logger.info(f"Running Mini-Batch KMeans with {n_clusters} clusters, batch_size={actual_batch_size}")
+            
+            clusterer = MiniBatchKMeans(
                 n_clusters=n_clusters,
+                batch_size=actual_batch_size,
                 random_state=random_state,
-                n_init=10
+                n_init=n_init,
+                max_iter=max_iter,
+                max_no_improvement=max_no_improvement,
+                reassignment_ratio=reassignment_ratio,
+                compute_labels=True
             )
+            
             labels = clusterer.fit_predict(embeddings)
             
             # Calculate cluster assignment probabilities (distance-based, inverse)
@@ -917,27 +959,33 @@ class Sampler:
             
             # Normalize to sum to 1 per row
             row_sums = probabilities.sum(axis=1, keepdims=True)
-            probabilities = probabilities / row_sums
+            probabilities = probabilities / (row_sums + 1e-9)  # Add small epsilon to avoid division by zero
             
             # Prepare cluster info
             cluster_info = {
-                "method": "kmeans",
+                "method": "mini_batch_kmeans",
                 "n_clusters": n_clusters,
+                "batch_size": actual_batch_size,
+                "max_iter": max_iter,
+                "n_init": n_init,
+                "max_no_improvement": max_no_improvement,
+                "reassignment_ratio": reassignment_ratio,
                 "inertia": clusterer.inertia_,
                 "cluster_centers": clusterer.cluster_centers_,
                 "cluster_sizes": np.bincount(labels, minlength=n_clusters).tolist(),
-                "probabilities": probabilities
+                "probabilities": probabilities,
+                "n_iter": clusterer.n_iter_
             }
             
         elif method.lower() == "hdbscan":
-            # HDBSCAN for density-based clustering (adaptive)
+            # HDBSCAN implementation remains the same
             min_samples = min(min_cluster_size // 2, 2)
                 
             clusterer = hdbscan.HDBSCAN(
                 min_cluster_size=min_cluster_size,
                 min_samples=min_samples,
                 metric='euclidean',
-                cluster_selection_method='eom'  # Excess of Mass
+                cluster_selection_method='eom'
             )
             labels = clusterer.fit_predict(embeddings)
             
@@ -1368,6 +1416,15 @@ def main():
     CACHE_DIR = "cache"
     LOG_LEVEL = 'INFO'
     OUTPUT_DIR = "results/samples"
+    SAMPLE_SIZE = 10000  # Increased from 1000
+    
+    # Force flags - individual control for each module
+    FORCE_REINDEX = False                      # For BM25/SBERT indices (search.py)
+    FORCE_REGENERATE_KEYWORDS = False          # For KeyBERT extraction (keyword_extraction.py)
+    FORCE_REGENERATE_EXPANSION = False         # For query expansion (query_expansion.py)
+    FORCE_REGENERATE_SAMPLING = False          # For sampling method results (sampling.py)
+    FORCE_RECOMPUTE_CLUSTERING = False         # For clustering specifically (sampling.py)
+    FORCE_REGENERATE_SOURCE = False            # For source docs in clustering (sampling.py)
     
     # Configure logging
     logging.basicConfig(
@@ -1382,7 +1439,7 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Initialize sampler
+    # Initialize sampler - pass force_reindex for underlying indices
     logger.info("Initializing sampler...")
     sampler = Sampler(
         corpus_dataset=corpus_dataset,
@@ -1394,63 +1451,178 @@ def main():
         random_seed=42
     )
     
-    # Define multiple sampling configurations to compare
+    # Force reindex if needed - call internal method to rebuild indices
+    if FORCE_REINDEX:
+        logger.info("Force reindexing enabled - rebuilding indices...")
+        sampler._initialize_indices_and_models(force_reindex=True)
+    
+    # Define multiple sampling configurations with all methods
     configs = [
         {
-            "name": "Random Sample (1000)",
+            "name": "Random Sample",
             "method": SamplingMethod.RANDOM,
-            "sample_size": 1000
+            "sample_size": SAMPLE_SIZE
         },
         {
-            "name": "Uniform Sample (1000)",
+            "name": "Uniform Sample",
             "method": SamplingMethod.UNIFORM,
-            "sample_size": 1000
+            "sample_size": SAMPLE_SIZE
         },
         {
-            "name": "Retrieval Sample (1000)",
+            "name": "Retrieval Sample",
             "method": SamplingMethod.RETRIEVAL,
-            "sample_size": 1000,
+            "sample_size": SAMPLE_SIZE,
             "retrieval_method": RetrievalMethod.HYBRID,
             "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-            "top_k": 1000,
+            "top_k": SAMPLE_SIZE,
             "use_mmr": False,
             "use_cross_encoder": False
         },
         {
-            "name": "Query Expansion Sample (1000)",
+            "name": "Query Expansion Sample",
             "method": SamplingMethod.QUERY_EXPANSION,
-            "sample_size": 1000,
+            "sample_size": SAMPLE_SIZE,
             "expansion_method": QueryExpansionMethod.KEYBERT,
             "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
             "num_keywords": 5,
             "retrieval_method": RetrievalMethod.HYBRID,
-            "top_k": 1000
+            "top_k": SAMPLE_SIZE
         },
         {
-            "name": "Clustering (Full Dataset, 1000)",
+            "name": "Clustering (Full Dataset)",
             "method": SamplingMethod.CLUSTERING,
-            "sample_size": 1000,
+            "sample_size": SAMPLE_SIZE,
             "source_method": SamplingMethod.FULL_DATASET,
             "dim_reduction_method": DimensionReductionMethod.UMAP,
             "n_components": 50,
             "clustering_method": ClusteringMethod.KMEANS,
-            "rep_selection_method": RepresentativeSelectionMethod.CENTROID
+            "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+            "batch_size": 2000,
+            "max_iter": 50,
+            "n_init": 2
         },
         {
-            "name": "Clustering (Retrieval, 1000)",
+            "name": "Clustering (Retrieval)",
             "method": SamplingMethod.CLUSTERING,
-            "sample_size": 1000,
+            "sample_size": SAMPLE_SIZE,
             "source_method": SamplingMethod.RETRIEVAL,
+            "source_config": {
+                "sample_size": SAMPLE_SIZE * 5,  # Retrieval multiplier for clustering
+                "retrieval_method": RetrievalMethod.HYBRID,
+                "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+                "top_k": SAMPLE_SIZE * 5,
+                "use_mmr": False,
+                "use_cross_encoder": False
+            },
             "dim_reduction_method": DimensionReductionMethod.UMAP,
             "n_components": 50,
             "clustering_method": ClusteringMethod.KMEANS,
-            "rep_selection_method": RepresentativeSelectionMethod.CENTROID
+            "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+            "batch_size": 2000,
+            "max_iter": 50,
+            "n_init": 2
+        },
+        {
+            "name": "Query Expansion + Clustering",
+            "method": SamplingMethod.CLUSTERING,
+            "sample_size": SAMPLE_SIZE,
+            "source_method": SamplingMethod.QUERY_EXPANSION,
+            "source_config": {
+                "sample_size": SAMPLE_SIZE * 3,  # Multiplier for clustering
+                "expansion_method": QueryExpansionMethod.KEYBERT,
+                "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+                "num_keywords": 5,
+                "retrieval_method": RetrievalMethod.HYBRID,
+                "top_k": SAMPLE_SIZE * 3
+            },
+            "dim_reduction_method": DimensionReductionMethod.UMAP,
+            "n_components": 50,
+            "clustering_method": ClusteringMethod.KMEANS,
+            "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+            "batch_size": 2000,
+            "max_iter": 50,
+            "n_init": 2
         }
     ]
     
-    # Run all sampling configurations
+    # Run all sampling configurations with proper force flag passing
     logger.info("Running all sampling configurations...")
-    all_samples = sampler.sample_multi_config(configs, force_regenerate=False)
+    all_samples = {}
+    
+    for config in configs:
+        config_name = config.get("name", f"config_{len(all_samples)}")
+        method = config.get("method", SamplingMethod.RANDOM)
+        
+        logger.info(f"Processing {config_name} with method {method}...")
+        
+        try:
+            if method == SamplingMethod.RANDOM:
+                result = sampler.sample_random(
+                    sample_size=config.get("sample_size", SAMPLE_SIZE)
+                )
+            
+            elif method == SamplingMethod.UNIFORM:
+                result = sampler.sample_uniform(
+                    sample_size=config.get("sample_size", SAMPLE_SIZE)
+                )
+            
+            elif method == SamplingMethod.RETRIEVAL:
+                result = sampler.sample_retrieval(
+                    sample_size=config.get("sample_size", SAMPLE_SIZE),
+                    retrieval_method=config.get("retrieval_method", RetrievalMethod.HYBRID),
+                    hybrid_strategy=config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM),
+                    top_k=config.get("top_k", SAMPLE_SIZE),
+                    use_mmr=config.get("use_mmr", False),
+                    use_cross_encoder=config.get("use_cross_encoder", False),
+                    mmr_lambda=config.get("mmr_lambda", 0.5),
+                    force_regenerate=FORCE_REGENERATE_SAMPLING
+                )
+            
+            elif method == SamplingMethod.QUERY_EXPANSION:
+                result = sampler.sample_query_expansion(
+                    sample_size=config.get("sample_size", SAMPLE_SIZE),
+                    expansion_method=config.get("expansion_method", QueryExpansionMethod.KEYBERT),
+                    combination_strategy=config.get("combination_strategy", QueryCombinationStrategy.WEIGHTED_RRF),
+                    num_keywords=config.get("num_keywords", 5),
+                    retrieval_method=config.get("retrieval_method", RetrievalMethod.HYBRID),
+                    hybrid_strategy=config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM),
+                    top_k=config.get("top_k", SAMPLE_SIZE),
+                    use_mmr=config.get("use_mmr", False),
+                    use_cross_encoder=config.get("use_cross_encoder", False),
+                    original_query_weight=config.get("original_query_weight", 0.7),
+                    force_regenerate=FORCE_REGENERATE_SAMPLING,
+                    force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS
+                )
+            
+            elif method == SamplingMethod.CLUSTERING:
+                result = sampler.sample_clustering(
+                    sample_size=config.get("sample_size", SAMPLE_SIZE),
+                    source_method=config.get("source_method", SamplingMethod.FULL_DATASET),
+                    source_config=config.get("source_config"),
+                    dim_reduction_method=config.get("dim_reduction_method", DimensionReductionMethod.UMAP),
+                    n_components=config.get("n_components", 50),
+                    clustering_method=config.get("clustering_method", ClusteringMethod.KMEANS),
+                    rep_selection_method=config.get("rep_selection_method", RepresentativeSelectionMethod.CENTROID),
+                    n_per_cluster=config.get("n_per_cluster", 1),
+                    min_cluster_size=config.get("min_cluster_size", 5),
+                    batch_size=config.get("batch_size", 1000),
+                    max_iter=config.get("max_iter", 100),
+                    n_init=config.get("n_init", 3),
+                    max_no_improvement=config.get("max_no_improvement", 10),
+                    reassignment_ratio=config.get("reassignment_ratio", 0.01),
+                    force_recompute=FORCE_RECOMPUTE_CLUSTERING,
+                    force_source_regenerate=FORCE_REGENERATE_SOURCE
+                )
+            
+            else:
+                raise ValueError(f"Unknown sampling method: {method}")
+            
+            all_samples[config_name] = result
+            logger.info(f"Successfully processed {config_name}: {result['sampled_docs']} documents sampled")
+            
+        except Exception as e:
+            logger.error(f"Error processing {config_name}: {str(e)}")
+            continue
     
     # Compare samples
     logger.info("Comparing samples...")
