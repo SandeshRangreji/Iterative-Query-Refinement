@@ -229,10 +229,16 @@ class TopicModeler:
         default_clustering_config = {
             "dim_reduction_method": DimensionReductionMethod.UMAP,
             "n_components": 50,
-            "clustering_method": ClusteringMethod.KMEANS,
+            "clustering_method": ClusteringMethod.KMEANS,  # Now uses Mini-Batch KMeans
             "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
             "n_per_cluster": 1,
-            "min_cluster_size": 5
+            "min_cluster_size": 5,
+            # Mini-Batch KMeans specific parameters
+            "batch_size": 1000,
+            "max_iter": 100,
+            "n_init": 3,
+            "max_no_improvement": 10,
+            "reassignment_ratio": 0.01
         }
         
         # Merge with provided configurations
@@ -359,6 +365,11 @@ class TopicModeler:
                 rep_selection_method=clustering_config["rep_selection_method"],
                 n_per_cluster=clustering_config["n_per_cluster"],
                 min_cluster_size=clustering_config["min_cluster_size"],
+                batch_size=clustering_config.get("batch_size", 1000),
+                max_iter=clustering_config.get("max_iter", 100),
+                n_init=clustering_config.get("n_init", 3),
+                max_no_improvement=clustering_config.get("max_no_improvement", 10),
+                reassignment_ratio=clustering_config.get("reassignment_ratio", 0.01),
                 force_recompute=force_recompute
             )
             
@@ -1124,21 +1135,90 @@ class TopicModeler:
 
 def main():
     """Main function to demonstrate topic modeling functionality"""
-    # Define constants
+    # Define constants - CONSISTENT WITH OTHER FILES
     CACHE_DIR = "cache"
     LOG_LEVEL = 'INFO'
     OUTPUT_DIR = "results/topic_models"
     
-    # Define query IDs to process
+    # Query processing parameters
     QUERY_IDS = ["43"]  # Example query ID
     
-    # Flags to control execution
+    # Execution control flags - CONSISTENT NAMING
+    FORCE_REINDEX = False
     FORCE_SAMPLE = False
     FORCE_TOPIC_MODEL = False
-    USE_SVD = True  # Use SVD instead of UMAP (much faster)
-    USE_GPU = True  # Use GPU if available
+    FORCE_REGENERATE_KEYWORDS = False
+    FORCE_REGENERATE_EXPANSION = False
+    
+    # Core parameters - CONSISTENT WITH OTHER FILES
     SAMPLE_SIZE = 1000
-    MAX_DOCUMENTS = 10000
+    NUM_KEYWORDS = 10                    # Consistent with query_expansion.py
+    TOP_K_RESULTS = 1000                 # Consistent with query_expansion.py
+    TOP_N_DOCS_FOR_EXTRACTION = 10       # Consistent with keyword_extraction.py
+    DIVERSITY = 0.7                      # Consistent with keyword_extraction.py
+    
+    # Performance optimization flags
+    USE_SVD = True                       # Use SVD instead of UMAP (faster)
+    USE_GPU = True                       # Use GPU if available
+    MAX_DOCUMENTS = None                 # No document limit
+    
+    # Embedding model - CONSISTENT ACROSS FILES
+    EMBEDDING_MODEL_NAME = "all-mpnet-base-v2"
+    CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    
+    # Mini-Batch KMeans clustering parameters (optimized for speed)
+    CLUSTERING_PARAMS = {
+        "dim_reduction_method": DimensionReductionMethod.UMAP,
+        "n_components": 30,              # Reduced for speed
+        "clustering_method": ClusteringMethod.KMEANS,
+        "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
+        "n_per_cluster": 1,
+        "min_cluster_size": 5,
+        # Mini-Batch KMeans specific parameters
+        "batch_size": 2000,              # Larger batch for better performance
+        "max_iter": 50,                  # Reduced iterations for speed
+        "n_init": 2,                     # Fewer initializations for speed
+        "max_no_improvement": 5,         # Early stopping for speed
+        "reassignment_ratio": 0.005      # Lower ratio for stability
+    }
+    
+    # Retrieval parameters - CONSISTENT WITH OTHER FILES
+    RETRIEVAL_PARAMS = {
+        "retrieval_method": RetrievalMethod.HYBRID,
+        "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+        "top_k": TOP_K_RESULTS,          # Using consistent variable
+        "use_mmr": False,
+        "use_cross_encoder": False,
+        "mmr_lambda": 0.5
+    }
+    
+    # Query expansion parameters - CONSISTENT WITH query_expansion.py
+    EXPANSION_PARAMS = {
+        "expansion_method": QueryExpansionMethod.KEYBERT,
+        "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+        "num_keywords": NUM_KEYWORDS,     # Using consistent variable
+        "original_query_weight": 0.7,
+        "diversity": DIVERSITY            # Using consistent variable
+    }
+    
+    # BERTopic parameters (optimized for speed)
+    TOPIC_MODEL_PARAMS = {
+        "n_components": 5,
+        "n_neighbors": 10,               # Reduced for speed
+        "min_dist": 0.0,
+        "metric": "cosine",
+        "min_cluster_size": 5,
+        "min_samples": None,
+        "mmr_diversity": 0.3,
+        "nr_topics": 15,                 # Fewer topics for faster processing
+        "use_guided": True,
+        "hierarchical_topics": False,
+        "reduce_frequent_words": True,
+        "stop_words": "english",
+        "verbose": True,
+        "use_svd": USE_SVD,
+        "max_documents": MAX_DOCUMENTS
+    }
     
     # Configure logging
     logging.basicConfig(
@@ -1153,13 +1233,13 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Initialize topic modeler
+    # Initialize topic modeler with consistent parameters
     logger.info("Initializing topic modeler...")
     topic_modeler = TopicModeler(
         corpus_dataset=corpus_dataset,
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
-        embedding_model_name="all-mpnet-base-v2",
+        embedding_model_name=EMBEDDING_MODEL_NAME,  # Consistent variable
         cache_dir=CACHE_DIR,
         random_seed=42,
         device='cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
@@ -1171,56 +1251,12 @@ def main():
         TopicModelingMethod.QUERY_EXPANSION,
         TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL,
         TopicModelingMethod.CLUSTER_AFTER_EXPANSION,
-        TopicModelingMethod.FULL_DATASET,  # Keeping this method
+        TopicModelingMethod.FULL_DATASET,
         TopicModelingMethod.UNIFORM_SAMPLING
     ]
     
-    # Warning about FULL_DATASET
-    logger.warning("Note: FULL_DATASET method may take a long time to run. The optimizations should help, but it will still be slower than other methods.")
-    
-    # Define configurations
-    retrieval_config = {
-        "retrieval_method": RetrievalMethod.HYBRID,
-        "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        "top_k": SAMPLE_SIZE,
-        "use_mmr": False,
-        "use_cross_encoder": False
-    }
-    
-    expansion_config = {
-        "expansion_method": QueryExpansionMethod.KEYBERT,
-        "combination_strategy": QueryCombinationStrategy.CONCATENATED,
-        "num_keywords": 5,
-        "original_query_weight": 0.7
-    }
-    
-    clustering_config = {
-        "dim_reduction_method": DimensionReductionMethod.UMAP,
-        "n_components": 50,
-        "clustering_method": ClusteringMethod.KMEANS,
-        "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
-        "n_per_cluster": 1,
-        "min_cluster_size": 5
-    }
-    
-    # In the main function, update the topic_model_config:
-    topic_model_config = {
-        "n_components": 5,
-        "n_neighbors": 15,
-        "min_dist": 0.0,
-        "metric": "cosine",
-        "min_cluster_size": 10,
-        "min_samples": None,
-        "mmr_diversity": 0.3,
-        "nr_topics": 20,  # Fixed number of topics for better visualization
-        "use_guided": True,
-        "hierarchical_topics": False,
-        "reduce_frequent_words": True,
-        "stop_words": "english",
-        "verbose": True,
-        "use_svd": USE_SVD,
-        "max_documents": None  # No document limit - use full dataset
-    }
+    logger.info("Using optimized Mini-Batch KMeans clustering for speed")
+    logger.info(f"Clustering batch size: {CLUSTERING_PARAMS['batch_size']}, max_iter: {CLUSTERING_PARAMS['max_iter']}")
     
     # Process queries
     logger.info("Processing queries...")
@@ -1228,19 +1264,26 @@ def main():
         query_ids=QUERY_IDS,
         methods=methods,
         sample_size=SAMPLE_SIZE,
-        retrieval_config=retrieval_config,
-        expansion_config=expansion_config,
-        clustering_config=clustering_config,
-        topic_model_config=topic_model_config,
+        retrieval_config=RETRIEVAL_PARAMS,
+        expansion_config=EXPANSION_PARAMS,
+        clustering_config=CLUSTERING_PARAMS,      # Now properly configured
+        topic_model_config=TOPIC_MODEL_PARAMS,
         force_sample=FORCE_SAMPLE,
         force_topic_model=FORCE_TOPIC_MODEL,
         output_dir=OUTPUT_DIR
     )
     
+    # Performance logging
+    logger.info("\n===== PERFORMANCE SUMMARY =====")
+    logger.info(f"Mini-Batch KMeans batch size: {CLUSTERING_PARAMS['batch_size']}")
+    logger.info(f"Max iterations: {CLUSTERING_PARAMS['max_iter']}")
+    logger.info(f"Early stopping at: {CLUSTERING_PARAMS['max_no_improvement']} iterations")
+    logger.info(f"Using {'SVD' if USE_SVD else 'UMAP'} for dimensionality reduction")
+    
     # Print summary of results
     logger.info("\n===== TOPIC MODELING RESULTS SUMMARY =====")
-    logger.info(f"{'Query':<10} {'Method':<30} {'Documents':<10} {'Topics':<10}")
-    logger.info("-" * 65)
+    logger.info(f"{'Query':<10} {'Method':<30} {'Documents':<10} {'Topics':<10} {'Clustering':<15}")
+    logger.info("-" * 80)
     
     for query_id, query_results in all_results.items():
         for method, result in query_results.items():
@@ -1250,7 +1293,18 @@ def main():
             num_docs = sample_result["sampled_docs"]
             num_topics = topic_model_result["num_topics"]
             
-            logger.info(f"{query_id:<10} {method:<30} {num_docs:<10} {num_topics:<10}")
+            # Get clustering info if available
+            clustering_info = "N/A"
+            if "cluster_info" in sample_result:
+                cluster_method = sample_result["cluster_info"].get("method", "N/A")
+                if cluster_method == "mini_batch_kmeans":
+                    batch_size = sample_result["cluster_info"].get("batch_size", "N/A")
+                    n_iter = sample_result["cluster_info"].get("n_iter", "N/A")
+                    clustering_info = f"MBK(bs={batch_size},i={n_iter})"
+                else:
+                    clustering_info = cluster_method
+            
+            logger.info(f"{query_id:<10} {method:<30} {num_docs:<10} {num_topics:<10} {clustering_info:<15}")
     
     logger.info(f"\nResults exported to {OUTPUT_DIR}")
     
