@@ -16,14 +16,22 @@ from sentence_transformers import SentenceTransformer
 from umap import UMAP
 from datasets import load_dataset
 
+# GPU imports with fallback
+try:
+    import cupy as cp
+    import cuml
+    from cuml.manifold import UMAP as cuMLUMAP
+    GPU_AVAILABLE = True
+    logger_gpu = logging.getLogger(__name__ + ".gpu")
+    logger_gpu.info("GPU libraries (CuPy, cuML) successfully imported for topic modeling")
+except ImportError as e:
+    GPU_AVAILABLE = False
+    cp = None
+    cuml = None
+    logger_gpu = logging.getLogger(__name__ + ".gpu")
+    logger_gpu.warning(f"GPU libraries not available for topic modeling: {e}")
+
 # Import from other modules
-from sampling import (
-    Sampler, 
-    SamplingMethod,
-    DimensionReductionMethod,
-    ClusteringMethod,
-    RepresentativeSelectionMethod
-)
 from search import (
     TextPreprocessor, 
     IndexManager,
@@ -45,13 +53,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TopicModelingMethod(str, Enum):
-    """Enum for topic modeling document sampling methods"""
+    """Enum for topic modeling document sampling methods - aligned with sampling.py"""
     DIRECT_RETRIEVAL = "direct_retrieval"
     QUERY_EXPANSION = "query_expansion"
     CLUSTER_AFTER_RETRIEVAL = "cluster_after_retrieval"
     CLUSTER_AFTER_EXPANSION = "cluster_after_expansion"
     FULL_DATASET = "full_dataset"
     UNIFORM_SAMPLING = "uniform_sampling"
+
+# Method name mapping between TopicModelingMethod and sampling method names
+TOPIC_METHOD_TO_SAMPLING_METHOD = {
+    TopicModelingMethod.DIRECT_RETRIEVAL: "direct_retrieval",
+    TopicModelingMethod.QUERY_EXPANSION: "query_expansion", 
+    TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL: "cluster_after_retrieval",
+    TopicModelingMethod.CLUSTER_AFTER_EXPANSION: "cluster_after_expansion",
+    TopicModelingMethod.FULL_DATASET: "full_dataset",
+    TopicModelingMethod.UNIFORM_SAMPLING: "uniform_sampling"
+}
+
+class GPUTopicUtils:
+    """Utility class for GPU operations in topic modeling"""
+    
+    @staticmethod
+    def is_gpu_available() -> bool:
+        """Check if GPU and required libraries are available"""
+        return GPU_AVAILABLE and cp is not None and cuml is not None
+    
+    @staticmethod
+    def clear_gpu_cache():
+        """Clear GPU memory cache"""
+        if GPUTopicUtils.is_gpu_available():
+            try:
+                mempool = cp.get_default_memory_pool()
+                mempool.free_all_blocks()
+                logger_gpu.info("GPU memory cache cleared in topic modeling")
+            except Exception as e:
+                logger_gpu.warning(f"Error clearing GPU cache in topic modeling: {e}")
 
 class TopicModeler:
     """Class for topic modeling using various document sampling strategies"""
@@ -62,7 +99,8 @@ class TopicModeler:
         queries_dataset=None,
         qrels_dataset=None,
         embedding_model_name: str = "all-mpnet-base-v2",
-        cache_dir: str = "cache/topic_modeling",
+        cache_dir: str = "cache",
+        corpus_subset_size: Optional[int] = None,
         random_seed: int = 42,
         device: Optional[str] = None
     ):
@@ -70,11 +108,12 @@ class TopicModeler:
         Initialize the topic modeler
         
         Args:
-            corpus_dataset: Dataset containing corpus documents
-            queries_dataset: Dataset containing queries (optional, needed for query-based methods)
+            corpus_dataset: Dataset containing corpus documents (for metadata only)
+            queries_dataset: Dataset containing queries (optional, for metadata)
             qrels_dataset: Dataset containing relevance judgments (optional)
             embedding_model_name: Name of the embedding model to use
             cache_dir: Directory for caching results
+            corpus_subset_size: Size of corpus subset (None for full corpus)
             random_seed: Random seed for reproducibility
             device: Device to use for embeddings (None for auto-selection)
         """
@@ -83,7 +122,14 @@ class TopicModeler:
         self.qrels_dataset = qrels_dataset
         self.embedding_model_name = embedding_model_name
         self.cache_dir = cache_dir
+        self.corpus_subset_size = corpus_subset_size
         self.random_seed = random_seed
+        
+        # Determine corpus size for cache paths
+        if corpus_subset_size is None:
+            self.corpus_cache_size = len(corpus_dataset)
+        else:
+            self.corpus_cache_size = min(corpus_subset_size, len(corpus_dataset))
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
@@ -99,78 +145,40 @@ class TopicModeler:
         # Initialize embedding model
         self.embedding_model = SentenceTransformer(embedding_model_name, device=self.device)
         
-        # Initialize preprocessor and index manager
+        # Initialize preprocessor for potential auto-sampling
         self.preprocessor = TextPreprocessor()
         self.index_manager = IndexManager(self.preprocessor)
-        
-        # Initialize sampler
-        self.sampler = Sampler(
-            corpus_dataset=corpus_dataset,
-            queries_dataset=queries_dataset,
-            qrels_dataset=qrels_dataset,
-            preprocessor=self.preprocessor,
-            index_manager=self.index_manager,
-            cache_dir=cache_dir,
-            embedding_model_name=embedding_model_name,
-            random_seed=random_seed
-        )
-        
-        # Initialize query expander
-        self.query_expander = QueryExpander(
-            preprocessor=self.preprocessor,
-            index_manager=self.index_manager,
-            cache_dir=cache_dir,
-            sbert_model_name=embedding_model_name
-        )
-        
-        # Initialize search indices if needed
-        self._initialize_indices()
     
-    def _initialize_indices(self):
-        """Initialize search indices"""
-        # Build BM25 index
-        self.bm25, self.corpus_texts, self.corpus_ids = self.index_manager.build_bm25_index(
-            self.corpus_dataset,
-            cache_path=os.path.join(self.cache_dir, "bm25_index.pkl"),
-            force_reindex=False
-        )
+    def _generate_corpus_cache_dir(self) -> str:
+        """Generate corpus-specific cache directory - consistent with sampling.py"""
+        if self.corpus_subset_size is None:
+            corpus_size_str = "full"
+        else:
+            corpus_size_str = f"{self.corpus_cache_size}"
         
-        # Build SBERT index
-        self.sbert_model, self.doc_embeddings = self.index_manager.build_sbert_index(
-            self.corpus_texts,
-            model_name=self.embedding_model_name,
-            batch_size=64,
-            cache_path=os.path.join(self.cache_dir, "sbert_index.pt"),
-            force_reindex=False
-        )
-        
-        # Initialize search engine
-        self.search_engine = SearchEngine(
-            preprocessor=self.preprocessor,
-            bm25=self.bm25,
-            corpus_texts=self.corpus_texts,
-            corpus_ids=self.corpus_ids,
-            sbert_model=self.sbert_model,
-            doc_embeddings=self.doc_embeddings
-        )
+        return os.path.join(self.cache_dir, f"corpus{corpus_size_str}")
     
     def _get_cache_path(
         self, 
         prefix: str,
         method: str,
-        config: Dict[str, Any]
+        config: Dict[str, Any],
+        query_id: Optional[str] = None
     ) -> str:
         """
-        Generate a cache path based on prefix and configuration
+        Generate a cache path based on prefix and configuration - consistent with sampling.py
         
         Args:
             prefix: Prefix for the cache file
             method: Method name
             config: Configuration dictionary
+            query_id: Query ID (for query-specific caching)
             
         Returns:
             Cache file path
         """
+        corpus_cache_dir = self._generate_corpus_cache_dir()
+        
         # Create a string representation of key config parameters
         config_str = "_".join([f"{k}={v}" for k, v in sorted(config.items()) 
                              if isinstance(v, (str, int, float, bool))
@@ -178,9 +186,202 @@ class TopicModeler:
                                       'mmr_diversity', 'use_guided', 'top_k']])
         
         # Create the filename
-        filename = f"{prefix}_{method}_{config_str}.pkl"
+        if query_id:
+            filename = f"{prefix}_query_{query_id}_{method}_{config_str}.pkl"
+        else:
+            filename = f"{prefix}_{method}_{config_str}.pkl"
         
-        return os.path.join(self.cache_dir, filename)
+        return os.path.join(corpus_cache_dir, "topic_models", filename)
+    
+    def load_sampling_registry(self) -> Dict:
+        """Load sampling registry from cache"""
+        corpus_cache_dir = self._generate_corpus_cache_dir()
+        registry_path = os.path.join(corpus_cache_dir, "sampling_registry.json")
+        
+        if os.path.exists(registry_path):
+            import json
+            with open(registry_path, "r") as f:
+                return json.load(f)
+        else:
+            logger.warning(f"Sampling registry not found at: {registry_path}")
+            return {}
+    
+    def load_cached_sample(
+        self, 
+        method: TopicModelingMethod, 
+        query_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Load cached sample result from sampling registry
+        
+        Args:
+            method: Topic modeling method (maps to sampling method)
+            query_id: Query ID (for query-based methods)
+            
+        Returns:
+            Dictionary with sampled documents
+        """
+        # Load registry
+        registry = self.load_sampling_registry()
+        
+        if not registry:
+            raise ValueError(f"No sampling registry found. Please run sampling.py first.")
+        
+        # Map topic modeling method to sampling method name
+        sampling_method_name = TOPIC_METHOD_TO_SAMPLING_METHOD.get(method)
+        if not sampling_method_name:
+            raise ValueError(f"Unknown topic modeling method: {method}")
+        
+        # Determine query level
+        if query_id is not None:
+            query_level = f"query_{query_id}"
+        else:
+            query_level = "corpus_level"
+        
+        # Check if query level exists in registry
+        if query_level not in registry:
+            if query_id is not None:
+                # Auto-trigger sampling for missing query
+                logger.info(f"Query {query_id} not found in registry. Auto-triggering sampling...")
+                return self._auto_trigger_sampling(method, query_id)
+            else:
+                raise ValueError(f"Corpus-level methods not found in registry. Please run sampling.py first.")
+        
+        # Check if specific method exists for this query level
+        if sampling_method_name not in registry[query_level]:
+            if query_id is not None:
+                # Auto-trigger sampling for missing method
+                logger.info(f"Method {sampling_method_name} not found for query {query_id}. Auto-triggering sampling...")
+                return self._auto_trigger_sampling(method, query_id)
+            else:
+                available_methods = list(registry[query_level].keys())
+                raise ValueError(f"Method {sampling_method_name} not found in corpus-level registry. Available: {available_methods}")
+        
+        # Get cache path from registry
+        method_info = registry[query_level][sampling_method_name]
+        cache_path = method_info.get("cache_path", "")
+        
+        if not cache_path or not os.path.exists(cache_path):
+            if query_id is not None:
+                # Auto-trigger sampling for missing cache file
+                logger.info(f"Cache file not found for {sampling_method_name}, query {query_id}. Auto-triggering sampling...")
+                return self._auto_trigger_sampling(method, query_id)
+            else:
+                raise ValueError(f"Cache file not found for {sampling_method_name}: {cache_path}")
+        
+        # Load cached sample
+        logger.info(f"Loading cached sample from: {cache_path}")
+        with open(cache_path, "rb") as f:
+            sample_result = pickle.load(f)
+        
+        return sample_result
+    
+    def _auto_trigger_sampling(self, method: TopicModelingMethod, query_id: str) -> Dict:
+        """
+        Auto-trigger sampling when cache is missing
+        
+        Args:
+            method: Topic modeling method
+            query_id: Query ID
+            
+        Returns:
+            Dictionary with sampled documents
+        """
+        # Import here to avoid circular imports
+        from sampling import Sampler, SamplingMethod, DimensionReductionMethod, RepresentativeSelectionMethod
+        
+        # Find query text
+        query_text = None
+        if self.queries_dataset:
+            for query_item in self.queries_dataset:
+                if str(query_item["_id"]) == query_id:
+                    query_text = query_item["text"]
+                    break
+        
+        if not query_text:
+            raise ValueError(f"Query text not found for query_id: {query_id}")
+        
+        logger.info(f"Auto-triggering sampling for method {method.value}, query {query_id}")
+        
+        # Initialize sampler
+        sampler = Sampler(
+            corpus_dataset=self.corpus_dataset,
+            queries_dataset=self.queries_dataset,
+            qrels_dataset=self.qrels_dataset,
+            cache_dir=self.cache_dir,
+            embedding_model_name=self.embedding_model_name,
+            corpus_subset_size=self.corpus_subset_size,
+            random_seed=self.random_seed
+        )
+        
+        # Default sampling parameters
+        sample_size = 1000
+        
+        # Call appropriate sampling method
+        if method == TopicModelingMethod.DIRECT_RETRIEVAL:
+            result = sampler.sample_direct_retrieval(
+                query_id=query_id,
+                query_text=query_text,
+                sample_size=sample_size,
+                retrieval_method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                top_k=1000,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
+        elif method == TopicModelingMethod.QUERY_EXPANSION:
+            result = sampler.sample_query_expansion(
+                query_id=query_id,
+                query_text=query_text,
+                sample_size=sample_size,
+                expansion_method=QueryExpansionMethod.KEYBERT,
+                combination_strategy=QueryCombinationStrategy.WEIGHTED_RRF,
+                num_keywords=5,
+                diversity=0.7,
+                retrieval_method=RetrievalMethod.HYBRID,
+                top_k=1000
+            )
+        elif method == TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL:
+            result = sampler.sample_clustering(
+                sample_size=sample_size,
+                source_method=SamplingMethod.DIRECT_RETRIEVAL,
+                source_config={
+                    "sample_size": sample_size * 5,
+                    "retrieval_method": RetrievalMethod.HYBRID,
+                    "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+                    "top_k": sample_size * 5,
+                    "use_mmr": False,
+                    "use_cross_encoder": False
+                },
+                query_id=query_id,
+                query_text=query_text,
+                dim_reduction_method=DimensionReductionMethod.UMAP,
+                n_components=50,
+                rep_selection_method=RepresentativeSelectionMethod.CENTROID
+            )
+        elif method == TopicModelingMethod.CLUSTER_AFTER_EXPANSION:
+            result = sampler.sample_clustering(
+                sample_size=sample_size,
+                source_method=SamplingMethod.QUERY_EXPANSION,
+                source_config={
+                    "sample_size": sample_size * 3,
+                    "expansion_method": QueryExpansionMethod.KEYBERT,
+                    "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+                    "num_keywords": 5,
+                    "diversity": 0.7,
+                    "retrieval_method": RetrievalMethod.HYBRID,
+                    "top_k": sample_size * 3
+                },
+                query_id=query_id,
+                query_text=query_text,
+                dim_reduction_method=DimensionReductionMethod.UMAP,
+                n_components=50,
+                rep_selection_method=RepresentativeSelectionMethod.CENTROID
+            )
+        else:
+            raise ValueError(f"Auto-triggering not supported for method: {method}")
+        
+        return result
     
     def sample_documents(
         self,
@@ -194,235 +395,42 @@ class TopicModeler:
         force_recompute: bool = False
     ) -> Dict:
         """
-        Sample documents using the specified method
+        Load documents using cached sampling results
         
         Args:
             method: Document sampling method
             query_id: ID of the query (for query-based methods)
-            query_text: Text of the query (for query-based methods)
-            sample_size: Number of documents to sample
-            retrieval_config: Configuration for retrieval-based methods
-            expansion_config: Configuration for query expansion
-            clustering_config: Configuration for clustering-based methods
-            force_recompute: Whether to force recomputation
+            query_text: Text of the query (for query-based methods, used for auto-triggering)
+            sample_size: Number of documents to sample (used for validation)
+            retrieval_config: Configuration for retrieval-based methods (ignored, uses cached)
+            expansion_config: Configuration for query expansion (ignored, uses cached)
+            clustering_config: Configuration for clustering-based methods (ignored, uses cached)
+            force_recompute: Whether to force recomputation (ignored, uses cached)
             
         Returns:
             Dictionary with sampled documents
         """
-        # Default configurations
-        default_retrieval_config = {
-            "retrieval_method": RetrievalMethod.HYBRID,
-            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-            "top_k": sample_size,
-            "use_mmr": False,
-            "mmr_lambda": 0.5,
-            "use_cross_encoder": False
-        }
+        logger.info(f"Loading cached sample for method: {method.value}")
         
-        default_expansion_config = {
-            "expansion_method": QueryExpansionMethod.KEYBERT,
-            "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-            "num_keywords": 5,
-            "original_query_weight": 0.7
-        }
-        
-        default_clustering_config = {
-            "dim_reduction_method": DimensionReductionMethod.UMAP,
-            "n_components": 50,
-            "clustering_method": ClusteringMethod.KMEANS,  # Now uses Mini-Batch KMeans
-            "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
-            "n_per_cluster": 1,
-            "min_cluster_size": 5,
-            # Mini-Batch KMeans specific parameters
-            "batch_size": 1000,
-            "max_iter": 100,
-            "n_init": 3,
-            "max_no_improvement": 10,
-            "reassignment_ratio": 0.01
-        }
-        
-        # Merge with provided configurations
-        if retrieval_config:
-            default_retrieval_config.update(retrieval_config)
-        retrieval_config = default_retrieval_config
-        
-        if expansion_config:
-            default_expansion_config.update(expansion_config)
-        expansion_config = default_expansion_config
-        
-        if clustering_config:
-            default_clustering_config.update(clustering_config)
-        clustering_config = default_clustering_config
-        
-        # Generate cache path
-        cache_key = f"{method.value}"
-        if query_id:
-            cache_key = f"query_{query_id}_{cache_key}"
-        
-        config = {
-            "method": method.value,
-            "sample_size": sample_size
-        }
-        
-        if method in [TopicModelingMethod.DIRECT_RETRIEVAL, TopicModelingMethod.QUERY_EXPANSION,
-                     TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
-            config.update({
-                "retrieval_method": retrieval_config["retrieval_method"].value 
-                    if isinstance(retrieval_config["retrieval_method"], Enum) else retrieval_config["retrieval_method"],
-                "hybrid_strategy": retrieval_config["hybrid_strategy"].value
-                    if isinstance(retrieval_config["hybrid_strategy"], Enum) else retrieval_config["hybrid_strategy"],
-                "top_k": retrieval_config["top_k"],
-                "use_mmr": retrieval_config["use_mmr"],
-                "use_cross_encoder": retrieval_config["use_cross_encoder"]
-            })
-        
-        if method in [TopicModelingMethod.QUERY_EXPANSION, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
-            config.update({
-                "expansion_method": expansion_config["expansion_method"].value
-                    if isinstance(expansion_config["expansion_method"], Enum) else expansion_config["expansion_method"],
-                "combination_strategy": expansion_config["combination_strategy"].value
-                    if isinstance(expansion_config["combination_strategy"], Enum) else expansion_config["combination_strategy"],
-                "num_keywords": expansion_config["num_keywords"],
-                "original_query_weight": expansion_config["original_query_weight"]
-            })
-        
-        if method in [TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
-            config.update({
-                "dim_reduction_method": clustering_config["dim_reduction_method"].value
-                    if isinstance(clustering_config["dim_reduction_method"], Enum) else clustering_config["dim_reduction_method"],
-                "n_components": clustering_config["n_components"],
-                "clustering_method": clustering_config["clustering_method"].value
-                    if isinstance(clustering_config["clustering_method"], Enum) else clustering_config["clustering_method"],
-                "rep_selection_method": clustering_config["rep_selection_method"].value
-                    if isinstance(clustering_config["rep_selection_method"], Enum) else clustering_config["rep_selection_method"],
-                "min_cluster_size": clustering_config["min_cluster_size"]
-            })
-        
-        cache_path = self._get_cache_path("sample", cache_key, config)
-        
-        # Check cache
-        if not force_recompute and os.path.exists(cache_path):
-            logger.info(f"Loading sampled documents from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-        
-        # Handle query-based validation
-        if method in [TopicModelingMethod.DIRECT_RETRIEVAL, TopicModelingMethod.QUERY_EXPANSION, 
-                     TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL, TopicModelingMethod.CLUSTER_AFTER_EXPANSION]:
-            if query_id is None or query_text is None:
-                raise ValueError("query_id and query_text must be provided for query-based methods")
-        
-        logger.info(f"Sampling documents with method: {method.value}")
-        
-        # Sample using the specified method
-        if method == TopicModelingMethod.DIRECT_RETRIEVAL:
-            # Direct retrieval
-            result = self.sampler.sample_retrieval(
-                sample_size=sample_size,
-                retrieval_method=retrieval_config["retrieval_method"],
-                hybrid_strategy=retrieval_config["hybrid_strategy"],
-                top_k=retrieval_config["top_k"],
-                use_mmr=retrieval_config["use_mmr"],
-                use_cross_encoder=retrieval_config["use_cross_encoder"],
-                mmr_lambda=retrieval_config["mmr_lambda"],
-                force_regenerate=force_recompute
-            )
+        try:
+            # Load cached sample
+            sample_result = self.load_cached_sample(method, query_id)
             
-        elif method == TopicModelingMethod.QUERY_EXPANSION:
-            # Query expansion
-            result = self.sampler.sample_query_expansion(
-                sample_size=sample_size,
-                expansion_method=expansion_config["expansion_method"],
-                combination_strategy=expansion_config["combination_strategy"],
-                num_keywords=expansion_config["num_keywords"],
-                retrieval_method=retrieval_config["retrieval_method"],
-                hybrid_strategy=retrieval_config["hybrid_strategy"],
-                top_k=retrieval_config["top_k"],
-                use_mmr=retrieval_config["use_mmr"],
-                use_cross_encoder=retrieval_config["use_cross_encoder"],
-                original_query_weight=expansion_config["original_query_weight"],
-                force_regenerate=force_recompute
-            )
+            # Validate sample size (warn if different from expected)
+            if sample_result.get("sampled_docs", 0) != sample_size:
+                logger.warning(f"Cached sample size ({sample_result.get('sampled_docs', 0)}) differs from requested ({sample_size})")
             
-        elif method == TopicModelingMethod.CLUSTER_AFTER_RETRIEVAL:
-            # Cluster after retrieval
-            source_config = {
-                "sample_size": retrieval_config["top_k"],
-                "retrieval_method": retrieval_config["retrieval_method"],
-                "hybrid_strategy": retrieval_config["hybrid_strategy"],
-                "top_k": retrieval_config["top_k"],
-                "use_mmr": retrieval_config["use_mmr"],
-                "use_cross_encoder": retrieval_config["use_cross_encoder"]
-            }
+            # Add query information if not present
+            if query_id is not None and "query_id" not in sample_result:
+                sample_result["query_id"] = query_id
+            if query_text is not None and "query_text" not in sample_result:
+                sample_result["query_text"] = query_text
             
-            result = self.sampler.sample_clustering(
-                sample_size=sample_size,
-                source_method=SamplingMethod.RETRIEVAL,
-                source_config=source_config,
-                dim_reduction_method=clustering_config["dim_reduction_method"],
-                n_components=clustering_config["n_components"],
-                clustering_method=clustering_config["clustering_method"],
-                rep_selection_method=clustering_config["rep_selection_method"],
-                n_per_cluster=clustering_config["n_per_cluster"],
-                min_cluster_size=clustering_config["min_cluster_size"],
-                batch_size=clustering_config.get("batch_size", 1000),
-                max_iter=clustering_config.get("max_iter", 100),
-                n_init=clustering_config.get("n_init", 3),
-                max_no_improvement=clustering_config.get("max_no_improvement", 10),
-                reassignment_ratio=clustering_config.get("reassignment_ratio", 0.01),
-                force_recompute=force_recompute
-            )
+            return sample_result
             
-        elif method == TopicModelingMethod.CLUSTER_AFTER_EXPANSION:
-            # Cluster after query expansion
-            source_config = {
-                "sample_size": retrieval_config["top_k"],
-                "expansion_method": expansion_config["expansion_method"],
-                "combination_strategy": expansion_config["combination_strategy"],
-                "num_keywords": expansion_config["num_keywords"],
-                "retrieval_method": retrieval_config["retrieval_method"],
-                "hybrid_strategy": retrieval_config["hybrid_strategy"],
-                "top_k": retrieval_config["top_k"],
-                "use_mmr": retrieval_config["use_mmr"],
-                "use_cross_encoder": retrieval_config["use_cross_encoder"]
-            }
-            
-            result = self.sampler.sample_clustering(
-                sample_size=sample_size,
-                source_method=SamplingMethod.QUERY_EXPANSION,
-                source_config=source_config,
-                dim_reduction_method=clustering_config["dim_reduction_method"],
-                n_components=clustering_config["n_components"],
-                clustering_method=clustering_config["clustering_method"],
-                rep_selection_method=clustering_config["rep_selection_method"],
-                n_per_cluster=clustering_config["n_per_cluster"],
-                min_cluster_size=clustering_config["min_cluster_size"],
-                force_recompute=force_recompute
-            )
-            
-        elif method == TopicModelingMethod.FULL_DATASET:
-            # Full dataset
-            result = self.sampler.sample_full_dataset()
-            
-        elif method == TopicModelingMethod.UNIFORM_SAMPLING:
-            # Uniform sampling
-            result = self.sampler.sample_uniform(sample_size=sample_size)
-            
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
-        # Add query information if applicable
-        if query_id is not None and query_text is not None:
-            result["query_id"] = query_id
-            result["query_text"] = query_text
-        
-        # Cache result
-        logger.info(f"Caching sampled documents to: {cache_path}")
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f)
-        
-        return result
+        except Exception as e:
+            logger.error(f"Failed to load cached sample for method {method.value}: {str(e)}")
+            raise
     
     def run_bertopic(
         self,
@@ -445,10 +453,11 @@ class TopicModeler:
         verbose: bool = False,
         force_recompute: bool = False,
         use_svd: bool = True,
-        max_documents: Optional[int] = None  # Changed to Optional, None means no limit
+        use_gpu_umap: bool = True,
+        max_documents: Optional[int] = None
     ) -> Dict:
         """
-        Run BERTopic on a set of documents
+        Run BERTopic on a set of documents with GPU UMAP support
         
         Args:
             documents: List of document texts
@@ -470,6 +479,7 @@ class TopicModeler:
             verbose: Whether to show verbose output
             force_recompute: Whether to force recomputation
             use_svd: Whether to use SVD instead of UMAP (faster)
+            use_gpu_umap: Whether to use GPU UMAP (if available)
             max_documents: Maximum number of documents to process (None for no limit)
             
         Returns:
@@ -488,15 +498,12 @@ class TopicModeler:
             "nr_topics": nr_topics,
             "hierarchical_topics": hierarchical_topics,
             "reduce_frequent_words": reduce_frequent_words,
-            "use_svd": use_svd
+            "use_svd": use_svd,
+            "use_gpu_umap": use_gpu_umap
         }
         
         # Generate cache path
-        cache_prefix = f"topic_model"
-        if query_id:
-            cache_prefix = f"{cache_prefix}_query_{query_id}"
-        
-        cache_path = self._get_cache_path(cache_prefix, method_name, config)
+        cache_path = self._get_cache_path("topic_model", method_name, config, query_id)
         
         # Check cache
         if not force_recompute and os.path.exists(cache_path):
@@ -528,26 +535,44 @@ class TopicModeler:
         if use_svd:
             # Use TruncatedSVD (much faster than UMAP)
             from sklearn.decomposition import TruncatedSVD
-            svd_components = min(min(100, len(documents) - 1), 50)  # Ensure we don't exceed document count-1
+            svd_components = min(min(100, len(documents) - 1), 50)
             logger.info(f"Using TruncatedSVD with {svd_components} components")
             dimensionality_reduction = TruncatedSVD(n_components=svd_components, random_state=self.random_seed)
         else:
             # Use UMAP (slower but potentially better quality)
-            try:
-                from umap import UMAP
-                umap_model = UMAP(
-                    n_components=min(n_components, len(documents) - 1),  # Ensure n_components doesn't exceed docs-1
-                    n_neighbors=min(n_neighbors, len(documents) - 1),  # Ensure n_neighbors doesn't exceed docs-1
-                    min_dist=min_dist,
-                    metric=metric,
-                    random_state=self.random_seed
-                )
-                dimensionality_reduction = umap_model
-            except ImportError:
-                logger.warning("UMAP not available, falling back to SVD")
-                from sklearn.decomposition import TruncatedSVD
-                svd_components = min(min(100, len(documents) - 1), 50)
-                dimensionality_reduction = TruncatedSVD(n_components=svd_components, random_state=self.random_seed)
+            if use_gpu_umap and GPUTopicUtils.is_gpu_available():
+                try:
+                    logger_gpu.info("Using GPU UMAP for topic modeling")
+                    # Initialize cuML UMAP for topic modeling
+                    umap_model = cuMLUMAP(
+                        n_components=min(n_components, len(documents) - 1),
+                        n_neighbors=min(n_neighbors, len(documents) - 1),
+                        min_dist=min_dist,
+                        metric=metric,
+                        random_state=self.random_seed
+                    )
+                    dimensionality_reduction = umap_model
+                except Exception as e:
+                    logger_gpu.warning(f"GPU UMAP failed, falling back to CPU: {e}")
+                    use_gpu_umap = False
+            
+            if not use_gpu_umap:
+                # Fallback to CPU UMAP
+                try:
+                    logger.info("Using CPU UMAP for topic modeling")
+                    umap_model = UMAP(
+                        n_components=min(n_components, len(documents) - 1),
+                        n_neighbors=min(n_neighbors, len(documents) - 1),
+                        min_dist=min_dist,
+                        metric=metric,
+                        random_state=self.random_seed
+                    )
+                    dimensionality_reduction = umap_model
+                except ImportError:
+                    logger.warning("UMAP not available, falling back to SVD")
+                    from sklearn.decomposition import TruncatedSVD
+                    svd_components = min(min(100, len(documents) - 1), 50)
+                    dimensionality_reduction = TruncatedSVD(n_components=svd_components, random_state=self.random_seed)
         
         # Prepare seed topic list if using guided topic modeling and query text is provided
         seed_topic_list = None
@@ -607,6 +632,10 @@ class TopicModeler:
         except Exception as e:
             logger.error(f"Error fitting BERTopic model: {str(e)}")
             raise
+        finally:
+            # Clear GPU cache if used
+            if use_gpu_umap and GPUTopicUtils.is_gpu_available():
+                GPUTopicUtils.clear_gpu_cache()
         
         # Handle case where probs might be None
         if probs is None:
@@ -640,8 +669,7 @@ class TopicModeler:
             from plotly.subplots import make_subplots
             import io
             
-            # Fix for "arrays used as indices must be of integer type" error
-            # Create custom topic visualization instead of using BERTopic's visualize_topics
+            # Create custom topic visualization
             if len(topic_info) > 0:
                 # Get only valid topics (not -1 which is outliers)
                 valid_topics = topic_info[topic_info["Topic"] >= 0]
@@ -662,8 +690,7 @@ class TopicModeler:
                     buf.seek(0)
                     visualizations["topics"] = buf.getvalue()
             
-            # Fix for "rows argument must be int greater than 0" error
-            # Create custom barchart instead of using BERTopic's visualize_barchart
+            # Create custom barchart
             if len(topic_info) > 0:
                 valid_topics = topic_info[topic_info["Topic"] >= 0]
                 
@@ -765,18 +792,18 @@ class TopicModeler:
         force_topic_model: bool = False
     ) -> Dict:
         """
-        Run complete topic modeling pipeline - sample documents and run BERTopic
+        Run complete topic modeling pipeline - load cached documents and run BERTopic
         
         Args:
             method: Document sampling method
             query_id: ID of the query (for query-based methods)
             query_text: Text of the query (for query-based methods)
             sample_size: Number of documents to sample
-            retrieval_config: Configuration for retrieval-based methods
-            expansion_config: Configuration for query expansion
-            clustering_config: Configuration for clustering-based methods
+            retrieval_config: Configuration for retrieval-based methods (ignored, uses cached)
+            expansion_config: Configuration for query expansion (ignored, uses cached)
+            clustering_config: Configuration for clustering-based methods (ignored, uses cached)
             topic_model_config: Configuration for BERTopic
-            force_sample: Whether to force recomputing document sampling
+            force_sample: Whether to force recomputing document sampling (ignored, uses cached)
             force_topic_model: Whether to force recomputing topic modeling
             
         Returns:
@@ -798,6 +825,7 @@ class TopicModeler:
             "stop_words": "english",
             "verbose": True,
             "use_svd": True,  # Default to using SVD
+            "use_gpu_umap": True,  # Default to using GPU UMAP
             "max_documents": 10000  # Default max documents
         }
         
@@ -806,7 +834,7 @@ class TopicModeler:
             default_topic_model_config.update(topic_model_config)
         topic_model_config = default_topic_model_config
         
-        # Sample documents
+        # Load cached sample documents
         sample_result = self.sample_documents(
             method=method,
             query_id=query_id,
@@ -839,6 +867,7 @@ class TopicModeler:
             verbose=topic_model_config["verbose"],
             force_recompute=force_topic_model,
             use_svd=topic_model_config.get("use_svd", True),
+            use_gpu_umap=topic_model_config.get("use_gpu_umap", True),
             max_documents=topic_model_config.get("max_documents", 10000)
         )
         
@@ -874,11 +903,11 @@ class TopicModeler:
             query_id: ID of the query (for query-based methods)
             query_text: Text of the query (for query-based methods)
             sample_size: Number of documents to sample
-            retrieval_config: Configuration for retrieval-based methods
-            expansion_config: Configuration for query expansion
-            clustering_config: Configuration for clustering-based methods
+            retrieval_config: Configuration for retrieval-based methods (ignored, uses cached)
+            expansion_config: Configuration for query expansion (ignored, uses cached)
+            clustering_config: Configuration for clustering-based methods (ignored, uses cached)
             topic_model_config: Configuration for BERTopic
-            force_sample: Whether to force recomputing document sampling
+            force_sample: Whether to force recomputing document sampling (ignored, uses cached)
             force_topic_model: Whether to force recomputing topic modeling
             
         Returns:
@@ -1029,17 +1058,17 @@ class TopicModeler:
         output_dir: str = "results/topic_models"
     ) -> Dict[str, Dict[str, Dict]]:
         """
-        Process multiple queries with multiple methods
+        Process multiple queries with multiple methods using cached samples
         
         Args:
             query_ids: List of query IDs to process
             methods: List of topic modeling methods
             sample_size: Number of documents to sample
-            retrieval_config: Configuration for retrieval-based methods
-            expansion_config: Configuration for query expansion
-            clustering_config: Configuration for clustering-based methods
+            retrieval_config: Configuration for retrieval-based methods (ignored, uses cached)
+            expansion_config: Configuration for query expansion (ignored, uses cached)
+            clustering_config: Configuration for clustering-based methods (ignored, uses cached)
             topic_model_config: Configuration for BERTopic
-            force_sample: Whether to force recomputing document sampling
+            force_sample: Whether to force recomputing document sampling (ignored, uses cached)
             force_topic_model: Whether to force recomputing topic modeling
             output_dir: Directory to save results
             
@@ -1126,7 +1155,9 @@ class TopicModeler:
             all_results["corpus_level"] = non_query_results
         
         # Cache overall results
-        cache_path = os.path.join(self.cache_dir, "all_topic_model_results.pkl")
+        corpus_cache_dir = self._generate_corpus_cache_dir()
+        cache_path = os.path.join(corpus_cache_dir, "topic_models", "all_topic_model_results.pkl")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         with open(cache_path, "wb") as f:
             pickle.dump(all_results, f)
         
@@ -1134,72 +1165,31 @@ class TopicModeler:
 
 
 def main():
-    """Main function to demonstrate topic modeling functionality"""
-    # Define constants - CONSISTENT WITH OTHER FILES
+    """Main function to demonstrate topic modeling functionality with cached samples"""
+    # Define constants - CONSISTENT WITH sampling.py
     CACHE_DIR = "cache"
     LOG_LEVEL = 'INFO'
     OUTPUT_DIR = "results/topic_models"
     
-    # Query processing parameters
-    QUERY_IDS = ["43"]  # Example query ID
+    # Corpus and query processing parameters
+    CORPUS_SUBSET_SIZE = 10000  # Should match sampling.py
+    QUERY_IDS = ["43"]          # Example query ID
     
-    # Execution control flags - CONSISTENT NAMING
-    FORCE_REINDEX = False
-    FORCE_SAMPLE = False
+    # Execution control flags
+    FORCE_SAMPLE = False        # Ignored - uses cached samples
     FORCE_TOPIC_MODEL = False
-    FORCE_REGENERATE_KEYWORDS = False
-    FORCE_REGENERATE_EXPANSION = False
     
-    # Core parameters - CONSISTENT WITH OTHER FILES
+    # Core parameters
     SAMPLE_SIZE = 1000
-    NUM_KEYWORDS = 10                    # Consistent with query_expansion.py
-    TOP_K_RESULTS = 1000                 # Consistent with query_expansion.py
-    TOP_N_DOCS_FOR_EXTRACTION = 10       # Consistent with keyword_extraction.py
-    DIVERSITY = 0.7                      # Consistent with keyword_extraction.py
     
     # Performance optimization flags
-    USE_SVD = True                       # Use SVD instead of UMAP (faster)
-    USE_GPU = True                       # Use GPU if available
-    MAX_DOCUMENTS = None                 # No document limit
+    USE_SVD = True              # Use SVD instead of UMAP (faster)
+    USE_GPU_UMAP = True         # Use GPU UMAP if available
+    USE_GPU = True              # General GPU usage flag
+    MAX_DOCUMENTS = None        # No document limit
     
     # Embedding model - CONSISTENT ACROSS FILES
     EMBEDDING_MODEL_NAME = "all-mpnet-base-v2"
-    CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    
-    # Mini-Batch KMeans clustering parameters (optimized for speed)
-    CLUSTERING_PARAMS = {
-        "dim_reduction_method": DimensionReductionMethod.UMAP,
-        "n_components": 30,              # Reduced for speed
-        "clustering_method": ClusteringMethod.KMEANS,
-        "rep_selection_method": RepresentativeSelectionMethod.CENTROID,
-        "n_per_cluster": 1,
-        "min_cluster_size": 5,
-        # Mini-Batch KMeans specific parameters
-        "batch_size": 2000,              # Larger batch for better performance
-        "max_iter": 50,                  # Reduced iterations for speed
-        "n_init": 2,                     # Fewer initializations for speed
-        "max_no_improvement": 5,         # Early stopping for speed
-        "reassignment_ratio": 0.005      # Lower ratio for stability
-    }
-    
-    # Retrieval parameters - CONSISTENT WITH OTHER FILES
-    RETRIEVAL_PARAMS = {
-        "retrieval_method": RetrievalMethod.HYBRID,
-        "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
-        "top_k": TOP_K_RESULTS,          # Using consistent variable
-        "use_mmr": False,
-        "use_cross_encoder": False,
-        "mmr_lambda": 0.5
-    }
-    
-    # Query expansion parameters - CONSISTENT WITH query_expansion.py
-    EXPANSION_PARAMS = {
-        "expansion_method": QueryExpansionMethod.KEYBERT,
-        "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-        "num_keywords": NUM_KEYWORDS,     # Using consistent variable
-        "original_query_weight": 0.7,
-        "diversity": DIVERSITY            # Using consistent variable
-    }
     
     # BERTopic parameters (optimized for speed)
     TOPIC_MODEL_PARAMS = {
@@ -1217,6 +1207,7 @@ def main():
         "stop_words": "english",
         "verbose": True,
         "use_svd": USE_SVD,
+        "use_gpu_umap": USE_GPU_UMAP,
         "max_documents": MAX_DOCUMENTS
     }
     
@@ -1226,6 +1217,14 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
+    # GPU availability check
+    if USE_GPU_UMAP:
+        if GPUTopicUtils.is_gpu_available():
+            logger_gpu.info("GPU acceleration available for topic modeling")
+        else:
+            logger.warning("GPU UMAP requested but not available. Falling back to CPU.")
+            USE_GPU_UMAP = False
+    
     # Load datasets
     logger.info("Loading datasets...")
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
@@ -1233,17 +1232,28 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Initialize topic modeler with consistent parameters
+    # Initialize topic modeler
     logger.info("Initializing topic modeler...")
     topic_modeler = TopicModeler(
         corpus_dataset=corpus_dataset,
         queries_dataset=queries_dataset,
         qrels_dataset=qrels_dataset,
-        embedding_model_name=EMBEDDING_MODEL_NAME,  # Consistent variable
+        embedding_model_name=EMBEDDING_MODEL_NAME,
         cache_dir=CACHE_DIR,
+        corpus_subset_size=CORPUS_SUBSET_SIZE,  # Should match sampling.py
         random_seed=42,
         device='cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
     )
+    
+    # Check if sampling registry exists
+    registry = topic_modeler.load_sampling_registry()
+    if not registry:
+        logger.warning("No sampling registry found. Please run sampling.py first to generate samples.")
+        logger.info("Auto-triggering will occur when methods are called.")
+    else:
+        logger.info(f"Found sampling registry with {len(registry)} query/corpus levels")
+        for level, methods in registry.items():
+            logger.info(f"  {level}: {list(methods.keys())}")
     
     # Define methods to use
     methods = [
@@ -1255,18 +1265,17 @@ def main():
         TopicModelingMethod.UNIFORM_SAMPLING
     ]
     
-    logger.info("Using optimized Mini-Batch KMeans clustering for speed")
-    logger.info(f"Clustering batch size: {CLUSTERING_PARAMS['batch_size']}, max_iter: {CLUSTERING_PARAMS['max_iter']}")
+    logger.info("Using cached samples from sampling.py")
+    if USE_GPU_UMAP:
+        logger.info("GPU UMAP enabled for topic modeling")
+    logger.info(f"Using {'SVD' if USE_SVD else 'UMAP'} for dimensionality reduction")
     
     # Process queries
-    logger.info("Processing queries...")
+    logger.info("Processing queries with cached samples...")
     all_results = topic_modeler.process_queries(
         query_ids=QUERY_IDS,
         methods=methods,
         sample_size=SAMPLE_SIZE,
-        retrieval_config=RETRIEVAL_PARAMS,
-        expansion_config=EXPANSION_PARAMS,
-        clustering_config=CLUSTERING_PARAMS,      # Now properly configured
         topic_model_config=TOPIC_MODEL_PARAMS,
         force_sample=FORCE_SAMPLE,
         force_topic_model=FORCE_TOPIC_MODEL,
@@ -1275,14 +1284,14 @@ def main():
     
     # Performance logging
     logger.info("\n===== PERFORMANCE SUMMARY =====")
-    logger.info(f"Mini-Batch KMeans batch size: {CLUSTERING_PARAMS['batch_size']}")
-    logger.info(f"Max iterations: {CLUSTERING_PARAMS['max_iter']}")
-    logger.info(f"Early stopping at: {CLUSTERING_PARAMS['max_no_improvement']} iterations")
+    logger.info(f"Corpus subset size: {CORPUS_SUBSET_SIZE if CORPUS_SUBSET_SIZE else 'full'}")
+    logger.info(f"Using cached samples: True")
+    logger.info(f"GPU UMAP: {USE_GPU_UMAP}")
     logger.info(f"Using {'SVD' if USE_SVD else 'UMAP'} for dimensionality reduction")
     
     # Print summary of results
     logger.info("\n===== TOPIC MODELING RESULTS SUMMARY =====")
-    logger.info(f"{'Query':<10} {'Method':<30} {'Documents':<10} {'Topics':<10} {'Clustering':<15}")
+    logger.info(f"{'Query':<10} {'Method':<30} {'Documents':<10} {'Topics':<10} {'Source':<15}")
     logger.info("-" * 80)
     
     for query_id, query_results in all_results.items():
@@ -1293,20 +1302,20 @@ def main():
             num_docs = sample_result["sampled_docs"]
             num_topics = topic_model_result["num_topics"]
             
-            # Get clustering info if available
-            clustering_info = "N/A"
+            # Get source info
+            source_info = "Cache"
             if "cluster_info" in sample_result:
                 cluster_method = sample_result["cluster_info"].get("method", "N/A")
-                if cluster_method == "mini_batch_kmeans":
-                    batch_size = sample_result["cluster_info"].get("batch_size", "N/A")
-                    n_iter = sample_result["cluster_info"].get("n_iter", "N/A")
-                    clustering_info = f"MBK(bs={batch_size},i={n_iter})"
-                else:
-                    clustering_info = cluster_method
+                if "gpu" in cluster_method.lower():
+                    source_info = "Cache(GPU)"
             
-            logger.info(f"{query_id:<10} {method:<30} {num_docs:<10} {num_topics:<10} {clustering_info:<15}")
+            logger.info(f"{query_id:<10} {method:<30} {num_docs:<10} {num_topics:<10} {source_info:<15}")
     
     logger.info(f"\nResults exported to {OUTPUT_DIR}")
+    
+    # Clear GPU cache if used
+    if USE_GPU_UMAP and GPUTopicUtils.is_gpu_available():
+        GPUTopicUtils.clear_gpu_cache()
     
     return all_results
 

@@ -12,6 +12,9 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from scipy.optimize import linear_sum_assignment
 from collections import defaultdict
 
+# Import from topic_modelling.py for consistent enums and cache handling
+from topic_modelling import TopicModelingMethod, TopicModeler
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -22,17 +25,36 @@ logger = logging.getLogger(__name__)
 class TopicEvaluator:
     """Class for evaluating topic models against a reference model"""
     
-    def __init__(self, cache_dir: str = "cache/topic_evaluation"):
+    def __init__(
+        self, 
+        cache_dir: str = "cache",
+        corpus_subset_size: Optional[int] = None
+    ):
         """
         Initialize topic evaluator
         
         Args:
             cache_dir: Directory for caching results
+            corpus_subset_size: Size of corpus subset (None for full corpus)
         """
         self.cache_dir = cache_dir
+        self.corpus_subset_size = corpus_subset_size
+        
+        # Generate corpus-specific cache directory
+        self.corpus_cache_dir = self._generate_corpus_cache_dir()
+        self.evaluation_cache_dir = os.path.join(self.corpus_cache_dir, "topic_evaluation")
         
         # Create cache directory if it doesn't exist
-        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(self.evaluation_cache_dir, exist_ok=True)
+    
+    def _generate_corpus_cache_dir(self) -> str:
+        """Generate corpus-specific cache directory - consistent with other modules"""
+        if self.corpus_subset_size is None:
+            corpus_size_str = "full"
+        else:
+            corpus_size_str = f"{self.corpus_subset_size}"
+        
+        return os.path.join(self.cache_dir, f"corpus{corpus_size_str}")
     
     def _get_cache_path(self, reference_method: str, sample_method: str, prefix: str = "eval") -> str:
         """
@@ -53,7 +75,59 @@ class TopicEvaluator:
         # Create the filename
         filename = f"{prefix}_{safe_ref}_vs_{safe_sample}.pkl"
         
-        return os.path.join(self.cache_dir, filename)
+        return os.path.join(self.evaluation_cache_dir, filename)
+    
+    def load_topic_model_registry(self) -> Dict:
+        """Load topic model registry from cache"""
+        registry_path = os.path.join(self.corpus_cache_dir, "topic_models", "all_topic_model_results.pkl")
+        
+        if os.path.exists(registry_path):
+            logger.info(f"Loading topic model registry from: {registry_path}")
+            with open(registry_path, "rb") as f:
+                return pickle.load(f)
+        else:
+            logger.warning(f"Topic model registry not found at: {registry_path}")
+            return {}
+    
+    def load_topic_model_result(
+        self,
+        method: str,
+        query_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Load a specific topic model result from cache
+        
+        Args:
+            method: Method name (canonical)
+            query_id: Query ID (for query-specific models)
+            
+        Returns:
+            Topic model result dictionary
+        """
+        # Load registry
+        registry = self.load_topic_model_registry()
+        
+        if not registry:
+            raise ValueError("No topic model registry found. Please run topic_modelling.py first.")
+        
+        # Determine query level
+        if query_id is not None:
+            query_level = query_id
+        else:
+            query_level = "corpus_level"
+        
+        # Check if query level exists
+        if query_level not in registry:
+            available_levels = list(registry.keys())
+            raise ValueError(f"Query level '{query_level}' not found in registry. Available: {available_levels}")
+        
+        # Check if method exists for this query level
+        if method not in registry[query_level]:
+            available_methods = list(registry[query_level].keys())
+            raise ValueError(f"Method '{method}' not found for query level '{query_level}'. Available: {available_methods}")
+        
+        # Return the topic model result
+        return registry[query_level][method]
     
     def calculate_adjusted_rand_index(
         self,
@@ -483,762 +557,6 @@ class TopicEvaluator:
         ref_topics = {k: v for k, v in reference_topic_words.items() if k != -1}
         sample_topics = {k: v for k, v in sample_topic_words.items() if k != -1}
         
-        # Ensure we have topics to compare
-        if not ref_topics or not sample_topics:
-            return {}
-        
-        # Extract top-n words for each topic
-        ref_top_words = {
-            topic: [word for word, _ in words[:top_n]] 
-            for topic, words in ref_topics.items()
-        }
-        
-        sample_top_words = {
-            topic: [word for word, _ in words[:top_n]] 
-            for topic, words in sample_topics.items()
-        }
-        
-        # Calculate similarity matrix
-        similarity_matrix = {}
-        
-        # Get or create sentence transformer model
-        if not hasattr(self, 'sbert_model'):
-            from sentence_transformers import SentenceTransformer
-            self.sbert_model = SentenceTransformer('all-mpnet-base-v2')
-        
-        # Calculate embeddings for all topic word lists
-        ref_embeddings = {}
-        for topic, words in ref_top_words.items():
-            # Join words into a space-separated string
-            topic_text = " ".join(words)
-            ref_embeddings[topic] = self.sbert_model.encode(topic_text, convert_to_tensor=True)
-        
-        sample_embeddings = {}
-        for topic, words in sample_top_words.items():
-            topic_text = " ".join(words)
-            sample_embeddings[topic] = self.sbert_model.encode(topic_text, convert_to_tensor=True)
-        
-        # Calculate cosine similarity between all pairs
-        from sentence_transformers import util
-        
-        for ref_topic, ref_embedding in ref_embeddings.items():
-            similarity_matrix[ref_topic] = {}
-            
-            for sample_topic, sample_embedding in sample_embeddings.items():
-                # Calculate cosine similarity
-                cos_sim = util.cos_sim(ref_embedding, sample_embedding).item()
-                similarity_matrix[ref_topic][sample_topic] = cos_sim
-        
-        return similarity_matrix
-
-    def visualize_topic_overlap_matrix(
-        self,
-        evaluation_result: Dict,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Visualize topic similarity matrix as a heatmap
-        
-        Args:
-            evaluation_result: Evaluation result dictionary
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Extract overlap matrix
-        overlap_matrix = evaluation_result.get("topic_word_overlap", {})
-        
-        # Check if we have data to visualize
-        if not overlap_matrix:
-            logger.warning("No topic overlap data to visualize")
-            # Create an empty figure
-            plt.figure(figsize=(8, 6))
-            plt.text(0.5, 0.5, "No topic overlap data available", 
-                    horizontalalignment='center', verticalalignment='center')
-            plt.tight_layout()
-            
-            # Save if requested
-            if output_path:
-                plt.savefig(output_path, dpi=300)
-                logger.info(f"Saved empty topic overlap matrix to: {output_path}")
-            
-            return plt.gcf()
-        
-        # Convert to numpy array
-        ref_topics = sorted(overlap_matrix.keys())
-        
-        # Check if we have reference topics
-        if not ref_topics:
-            logger.warning("No reference topics found in overlap matrix")
-            # Create an empty figure
-            plt.figure(figsize=(8, 6))
-            plt.text(0.5, 0.5, "No reference topics available", 
-                    horizontalalignment='center', verticalalignment='center')
-            plt.tight_layout()
-            
-            # Save if requested
-            if output_path:
-                plt.savefig(output_path, dpi=300)
-            
-            return plt.gcf()
-        
-        # Get sample topics from the first reference topic's scores
-        # (all reference topics should have the same sample topics)
-        first_ref = ref_topics[0]
-        if first_ref not in overlap_matrix or not overlap_matrix[first_ref]:
-            logger.warning("No sample topics found in overlap matrix")
-            # Create an empty figure
-            plt.figure(figsize=(8, 6))
-            plt.text(0.5, 0.5, "No sample topics available", 
-                    horizontalalignment='center', verticalalignment='center')
-            plt.tight_layout()
-            
-            # Save if requested
-            if output_path:
-                plt.savefig(output_path, dpi=300)
-            
-            return plt.gcf()
-        
-        sample_topics = sorted(overlap_matrix[first_ref].keys())
-        
-        # Create matrix array
-        matrix_array = np.zeros((len(ref_topics), len(sample_topics)))
-        
-        for i, ref_topic in enumerate(ref_topics):
-            for j, sample_topic in enumerate(sample_topics):
-                if sample_topic in overlap_matrix[ref_topic]:
-                    matrix_array[i, j] = overlap_matrix[ref_topic][sample_topic]
-        
-        # Create figure
-        plt.figure(figsize=(12, 10))
-        
-        # Plot heatmap
-        ax = sns.heatmap(
-            matrix_array,
-            annot=True,
-            fmt=".2f",
-            cmap="YlGnBu",
-            xticklabels=[f"T{t}" for t in sample_topics],
-            yticklabels=[f"T{t}" for t in ref_topics]
-        )
-        
-        # Add labels
-        plt.xlabel(f"Topics in {evaluation_result['sample_method']}")
-        plt.ylabel(f"Topics in {evaluation_result['reference_method']}")
-        
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"Topic Similarity: {evaluation_result['reference_method']} vs {evaluation_result['sample_method']}")
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved topic similarity matrix to: {output_path}")
-        
-        return plt.gcf()
-    
-    def evaluate_topic_model(
-        self,
-        reference_result: Dict,
-        sample_result: Dict,
-        top_n_words: int = 10,
-        force_recompute: bool = False
-    ) -> Dict:
-        """
-        Evaluate a topic model against a reference model
-        
-        Args:
-            reference_result: Reference topic model result
-            sample_result: Sample topic model result
-            top_n_words: Number of top words to consider for word-level metrics
-            force_recompute: Whether to force recomputing evaluation
-            
-        Returns:
-            Dictionary with evaluation results
-        """
-        # Extract method names
-        reference_method = reference_result["method"]
-        sample_method = sample_result["method"]
-        
-        # Generate cache path
-        cache_path = self._get_cache_path(reference_method, sample_method)
-        
-        # Check cache
-        if not force_recompute and os.path.exists(cache_path):
-            logger.info(f"Loading evaluation results from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-        
-        logger.info(f"Evaluating topic model: {sample_method} against {reference_method}...")
-        
-        # Extract topic assignments and documents
-        reference_topics = reference_result["topics"]
-        sample_topics = sample_result["topics"]
-        
-        # Extract document info (using document text as identifier)
-        reference_docs = reference_result["document_info"]["Document"].tolist()
-        sample_docs = sample_result["document_info"]["Document"].tolist()
-        
-        # Calculate document-level metrics
-        ari = self.calculate_adjusted_rand_index(
-            reference_topics,
-            sample_topics,
-            reference_docs,
-            sample_docs
-        )
-        
-        nmi = self.calculate_normalized_mutual_info(
-            reference_topics,
-            sample_topics,
-            reference_docs,
-            sample_docs
-        )
-        
-        omega = self.calculate_omega_index(
-            reference_topics,
-            sample_topics,
-            reference_docs,
-            sample_docs
-        )
-        
-        bcubed_precision, bcubed_recall, bcubed_f1 = self.calculate_bcubed_precision_recall(
-            reference_topics,
-            sample_topics,
-            reference_docs,
-            sample_docs
-        )
-        
-        # Calculate semantic similarity between topics
-        topic_similarity = self.calculate_topic_semantic_similarity(
-            reference_result["topic_words"],
-            sample_result["topic_words"],
-            top_n=top_n_words
-        )
-        
-        # Calculate topic word level metrics using topic similarity
-        # Greedy matching
-        word_precision_greedy, word_recall_greedy, word_f1_greedy = self.calculate_topic_word_precision_recall_greedy(
-            reference_result["topic_words"],
-            sample_result["topic_words"],
-            top_n=top_n_words
-        )
-        
-        # Hungarian matching
-        word_precision_hungarian, word_recall_hungarian, word_f1_hungarian, matched_pairs = self.calculate_topic_word_precision_recall_hungarian(
-            reference_result["topic_words"],
-            sample_result["topic_words"],
-            top_n=top_n_words
-        )
-        
-        # Build result dictionary
-        result = {
-            "reference_method": reference_method,
-            "sample_method": sample_method,
-            "document_metrics": {
-                "adjusted_rand_index": ari,
-                "normalized_mutual_info": nmi,
-                "omega_index": omega,
-                "bcubed_precision": bcubed_precision,
-                "bcubed_recall": bcubed_recall,
-                "bcubed_f1": bcubed_f1
-            },
-            "topic_word_metrics": {
-                "greedy": {
-                    "precision": word_precision_greedy,
-                    "recall": word_recall_greedy,
-                    "f1_score": word_f1_greedy
-                },
-                "hungarian": {
-                    "precision": word_precision_hungarian,
-                    "recall": word_recall_hungarian,
-                    "f1_score": word_f1_hungarian,
-                    "matched_pairs": matched_pairs
-                }
-            },
-            "topic_word_overlap": topic_similarity,  # Use semantic similarity instead of word overlap
-            "common_docs_count": len(set(reference_docs).intersection(set(sample_docs))),
-            "reference_docs_count": len(reference_docs),
-            "sample_docs_count": len(sample_docs)
-        }
-        
-        # Cache results
-        logger.info(f"Caching evaluation results to: {cache_path}")
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f)
-        
-        return result
-    
-    def evaluate_multiple_models(
-        self,
-        reference_result: Dict,
-        sample_results: Dict[str, Dict],
-        top_n_words: int = 10,
-        force_recompute: bool = False
-    ) -> Dict[str, Dict]:
-        """
-        Evaluate multiple topic models against a reference model
-        
-        Args:
-            reference_result: Reference topic model result
-            sample_results: Dictionary mapping sample names to results
-            top_n_words: Number of top words to consider for word-level metrics
-            force_recompute: Whether to force recomputing evaluation
-            
-        Returns:
-            Dictionary mapping sample names to evaluation results
-        """
-        evaluation_results = {}
-        
-        for name, result in sample_results.items():
-            logger.info(f"Evaluating model: {name}")
-            
-            # Add the method name to the result for identification
-            result["method"] = name
-            
-            # Run evaluation
-            eval_result = self.evaluate_topic_model(
-                reference_result=reference_result,
-                sample_result=result,
-                top_n_words=top_n_words,
-                force_recompute=force_recompute
-            )
-            
-            evaluation_results[name] = eval_result
-        
-        return evaluation_results
-    
-    def visualize_document_metrics_radar(
-        self,
-        evaluation_result: Dict,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Create a radar chart for document-level metrics
-        
-        Args:
-            evaluation_result: Evaluation result dictionary
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Extract metrics
-        doc_metrics = evaluation_result["document_metrics"]
-        
-        # Define metrics to include
-        metrics = [
-            "adjusted_rand_index", "normalized_mutual_info", "omega_index",
-            "bcubed_precision", "bcubed_recall", "bcubed_f1"
-        ]
-        
-        # Define nice labels
-        metric_labels = {
-            "adjusted_rand_index": "ARI",
-            "normalized_mutual_info": "NMI",
-            "omega_index": "Omega",
-            "bcubed_precision": "B³ Precision",
-            "bcubed_recall": "B³ Recall",
-            "bcubed_f1": "B³ F1"
-        }
-        
-        # Extract values
-        values = [doc_metrics[m] for m in metrics]
-        labels = [metric_labels[m] for m in metrics]
-        
-        # Create radar chart
-        plt.figure(figsize=(10, 8))
-        
-        # Set up radial axes
-        ax = plt.subplot(111, polar=True)
-        
-        # Number of metrics
-        N = len(metrics)
-        
-        # Ensure values are normalized between 0 and 1
-        values = np.clip(values, 0, 1)
-        
-        # Create angles for each metric (evenly spaced on unit circle)
-        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        
-        # Make the plot circular by repeating the first value and angle
-        values = np.append(values, values[0])
-        angles = np.append(angles, angles[0])
-        labels = labels + [labels[0]]  # Add the first label again to close the circle
-        
-        # Plot data
-        ax.plot(angles, values, 'b-', linewidth=2)
-        ax.fill(angles, values, 'b', alpha=0.2)
-        
-        # Fix axis to go in the right order and start at 12 o'clock
-        ax.set_theta_offset(np.pi / 2)
-        ax.set_theta_direction(-1)
-        
-        # Set labels at the correct angles
-        ax.set_xticks(angles[:-1])  # Use the angles without the repeated one
-        ax.set_xticklabels(labels[:-1])  # Use labels without the repeated one
-        
-        # Set title
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"Document-Level Metrics: {evaluation_result['sample_method']}")
-        
-        # Draw y-axis markers
-        ax.set_rlabel_position(0)
-        plt.yticks([0.2, 0.4, 0.6, 0.8, 1.0], ["0.2", "0.4", "0.6", "0.8", "1.0"], color="grey", size=8)
-        plt.ylim(0, 1)
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved document metrics radar chart to: {output_path}")
-        
-        return plt.gcf()
-
-    def visualize_topic_word_metrics_comparison(
-        self,
-        evaluation_result: Dict,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Create a bar chart comparing greedy and Hungarian matching for topic word metrics
-        
-        Args:
-            evaluation_result: Evaluation result dictionary
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Extract metrics
-        greedy_metrics = evaluation_result["topic_word_metrics"]["greedy"]
-        hungarian_metrics = evaluation_result["topic_word_metrics"]["hungarian"]
-        
-        # Define metrics to include
-        metrics = ["precision", "recall", "f1_score"]
-        
-        # Extract values
-        greedy_values = [greedy_metrics[m] for m in metrics]
-        hungarian_values = [hungarian_metrics[m] for m in metrics]
-        
-        # Setup plot
-        plt.figure(figsize=(10, 6))
-        
-        # Set width of bars
-        barWidth = 0.35
-        
-        # Set position of bars
-        r1 = np.arange(len(metrics))
-        r2 = [x + barWidth for x in r1]
-        
-        # Create bars
-        plt.bar(r1, greedy_values, width=barWidth, edgecolor='white', label='Greedy Matching')
-        plt.bar(r2, hungarian_values, width=barWidth, edgecolor='white', label='Hungarian Matching')
-        
-        # Add value labels on top of each bar
-        for i, v in enumerate(greedy_values):
-            plt.text(r1[i], v + 0.01, f"{v:.3f}", ha='center')
-        
-        for i, v in enumerate(hungarian_values):
-            plt.text(r2[i], v + 0.01, f"{v:.3f}", ha='center')
-        
-        # Add labels and legend
-        plt.xlabel('Metric', fontweight='bold')
-        plt.ylabel('Score', fontweight='bold')
-        plt.xticks([r + barWidth/2 for r in range(len(metrics))], [m.capitalize() for m in metrics])
-        plt.legend()
-        
-        # Set title
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"Topic Word Metrics: {evaluation_result['sample_method']}")
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved topic word metrics comparison chart to: {output_path}")
-        
-        return plt.gcf()
-
-    def visualize_bcubed_metrics(
-        self,
-        evaluation_result: Dict,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Create a pie chart visualizing B-Cubed metrics
-        
-        Args:
-            evaluation_result: Evaluation result dictionary
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Extract metrics
-        bcubed_precision = evaluation_result["document_metrics"]["bcubed_precision"]
-        bcubed_recall = evaluation_result["document_metrics"]["bcubed_recall"]
-        bcubed_f1 = evaluation_result["document_metrics"]["bcubed_f1"]
-        
-        # Setup plot
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # Create precision pie chart
-        precision_sizes = [bcubed_precision, 1 - bcubed_precision]
-        ax1.pie(precision_sizes, explode=(0.1, 0), 
-                labels=['Correct', 'Incorrect'],
-                colors=['#66b3ff', '#e6e6e6'],
-                autopct='%1.1f%%', shadow=True, startangle=90)
-        ax1.set_title(f'B³ Precision: {bcubed_precision:.4f}')
-        
-        # Create recall pie chart
-        recall_sizes = [bcubed_recall, 1 - bcubed_recall]
-        ax2.pie(recall_sizes, explode=(0.1, 0), 
-                labels=['Found', 'Missed'],
-                colors=['#99ff99', '#e6e6e6'],
-                autopct='%1.1f%%', shadow=True, startangle=90)
-        ax2.set_title(f'B³ Recall: {bcubed_recall:.4f}')
-        
-        # Create F1 pie chart
-        f1_sizes = [bcubed_f1, 1 - bcubed_f1]
-        ax3.pie(f1_sizes, explode=(0.1, 0), 
-                labels=['F1 Score', 'Remainder'],
-                colors=['#ffcc99', '#e6e6e6'],
-                autopct='%1.1f%%', shadow=True, startangle=90)
-        ax3.set_title(f'B³ F1 Score: {bcubed_f1:.4f}')
-        
-        # Set title
-        if title:
-            fig.suptitle(title, fontsize=16)
-        else:
-            fig.suptitle(f"B-Cubed Metrics: {evaluation_result['sample_method']}", fontsize=16)
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved B-Cubed metrics visualization to: {output_path}")
-        
-        return plt.gcf()
-
-    def visualize_comparative_metrics(
-        self, 
-        evaluation_results: Dict[str, Dict], 
-        metrics_type: str = "document",
-        metrics: Optional[List[str]] = None,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Create a comparison chart for multiple models and selected metrics
-        
-        Args:
-            evaluation_results: Dictionary mapping method names to evaluation results
-            metrics_type: Type of metrics to compare ('document' or 'topic_word')
-            metrics: List of specific metrics to include (None for all)
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Create data for plot
-        methods = list(evaluation_results.keys())
-        
-        # Define default metrics based on type
-        if metrics_type == "document":
-            if metrics is None:
-                metrics = ["adjusted_rand_index", "normalized_mutual_info", "omega_index", 
-                        "bcubed_precision", "bcubed_recall", "bcubed_f1"]
-            metric_source = "document_metrics"
-        else:  # topic_word
-            if metrics is None:
-                metrics = ["precision", "recall", "f1_score"]
-            metric_source = "topic_word_metrics.hungarian"  # Default to Hungarian
-        
-        # Define nice labels
-        metric_labels = {
-            "adjusted_rand_index": "ARI",
-            "normalized_mutual_info": "NMI",
-            "omega_index": "Omega",
-            "bcubed_precision": "B³ Precision",
-            "bcubed_recall": "B³ Recall",
-            "bcubed_f1": "B³ F1",
-            "precision": "Precision",
-            "recall": "Recall",
-            "f1_score": "F1 Score"
-        }
-        
-        # Create DataFrame for plotting
-        data = []
-        for method in methods:
-            result = evaluation_results[method]
-            
-            # Handle nested access for topic_word metrics
-            if "." in metric_source:
-                parts = metric_source.split(".")
-                source = result
-                for part in parts:
-                    source = source.get(part, {})
-            else:
-                source = result.get(metric_source, {})
-            
-            # Extract metric values
-            for metric in metrics:
-                value = source.get(metric, 0.0)
-                data.append({
-                    "Method": method,
-                    "Metric": metric_labels.get(metric, metric),
-                    "Value": value
-                })
-        
-        df = pd.DataFrame(data)
-        
-        # Setup plot
-        plt.figure(figsize=(12, 8))
-        
-        # Create grouped bar chart
-        ax = sns.barplot(x="Metric", y="Value", hue="Method", data=df)
-        
-        # Add value labels on top of each bar
-        for container in ax.containers:
-            ax.bar_label(container, fmt='%.3f', padding=3)
-        
-        # Add labels and legend
-        plt.xlabel('Metric', fontweight='bold')
-        plt.ylabel('Score', fontweight='bold')
-        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
-        
-        # Set title
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"{metrics_type.capitalize()} Metrics Comparison")
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved comparative metrics visualization to: {output_path}")
-        
-        return plt.gcf()
-
-    def visualize_coverage_ratio(
-        self,
-        evaluation_result: Dict,
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
-        """
-        Create a visualization showing coverage ratio of sample vs. reference
-        
-        Args:
-            evaluation_result: Evaluation result dictionary
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
-            
-        Returns:
-            Matplotlib Figure object
-        """
-        # Extract data
-        common_count = evaluation_result["common_docs_count"]
-        reference_count = evaluation_result["reference_docs_count"]
-        sample_count = evaluation_result["sample_docs_count"]
-        
-        # Calculate percentages
-        coverage_pct = (common_count / reference_count) * 100
-        sample_uniqueness = ((sample_count - common_count) / sample_count) * 100 if sample_count > 0 else 0
-        
-        # Setup plot
-        plt.figure(figsize=(10, 6))
-        
-        # Create stacked bar for reference dataset
-        plt.bar(['Reference Dataset'], [reference_count], label='Reference Documents',
-                color='#8c96c6', edgecolor='white')
-        
-        # Create stacked bar for sample dataset
-        plt.bar(['Sample Dataset'], [common_count], label='Common Documents',
-                color='#4daf4a', edgecolor='white')
-        plt.bar(['Sample Dataset'], [sample_count - common_count], bottom=[common_count],
-                label='Sample-Only Documents', color='#fc8d59', edgecolor='white')
-        
-        # Add labels
-        for i, v in enumerate([reference_count]):
-            plt.text(0, v + 100, f"{v:,}", ha='center')
-            
-        plt.text(1, common_count/2, f"{common_count:,}\n({coverage_pct:.1f}%)", ha='center', va='center')
-        if sample_count - common_count > 0:
-            plt.text(1, common_count + (sample_count - common_count)/2, 
-                    f"{sample_count - common_count:,}\n({sample_uniqueness:.1f}%)", 
-                    ha='center', va='center')
-        
-        # Set title and labels
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"Document Coverage: {evaluation_result['sample_method']}")
-        
-        plt.ylabel('Number of Documents')
-        plt.xticks(rotation=0)
-        
-        # Add legend
-        plt.legend(loc='upper right')
-        
-        # Use log scale if reference is much larger
-        if reference_count > sample_count * 10:
-            plt.yscale('log')
-            plt.ylabel('Number of Documents (log scale)')
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved coverage ratio visualization to: {output_path}")
-        
-        return plt.gcf()
-    
-    def calculate_topic_semantic_similarity(
-        self,
-        reference_topic_words: Dict[int, List[Tuple[str, float]]],
-        sample_topic_words: Dict[int, List[Tuple[str, float]]],
-        top_n: int = 10
-    ) -> Dict[int, Dict[int, float]]:
-        """
-        Calculate semantic similarity between topic words using embeddings
-        
-        Args:
-            reference_topic_words: Reference topic words dictionary
-            sample_topic_words: Sample topic words dictionary
-            top_n: Number of top words to consider
-            
-        Returns:
-            Dictionary mapping reference topics to dictionaries mapping sample topics to similarity scores
-        """
-        # Skip outlier topic (-1)
-        ref_topics = {k: v for k, v in reference_topic_words.items() if k != -1}
-        sample_topics = {k: v for k, v in sample_topic_words.items() if k != -1}
-        
         # Check if we have any valid topics to compare
         if not ref_topics or not sample_topics:
             logger.warning("No valid topics found for semantic similarity calculation")
@@ -1471,135 +789,174 @@ class TopicEvaluator:
         
         return plt.gcf()
     
-    def visualize_document_metrics(
+    def evaluate_topic_model(
         self,
-        evaluation_results: Dict[str, Dict],
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
+        reference_result: Dict,
+        sample_result: Dict,
+        top_n_words: int = 10,
+        force_recompute: bool = False
+    ) -> Dict:
         """
-        Visualize document-level metrics for multiple evaluations
+        Evaluate a topic model against a reference model
         
         Args:
-            evaluation_results: Dictionary mapping names to evaluation results
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
+            reference_result: Reference topic model result
+            sample_result: Sample topic model result
+            top_n_words: Number of top words to consider for word-level metrics
+            force_recompute: Whether to force recomputing evaluation
             
         Returns:
-            Matplotlib Figure object
+            Dictionary with evaluation results
         """
-        # Extract metrics
-        names = list(evaluation_results.keys())
-        metrics = list(evaluation_results[names[0]]["document_metrics"].keys())
+        # Extract method names
+        reference_method = reference_result["method"]
+        sample_method = sample_result["method"]
         
-        # Create data
-        data = []
-        for name in names:
-            for metric in metrics:
-                value = evaluation_results[name]["document_metrics"][metric]
-                data.append({
-                    "Method": name,
-                    "Metric": metric,
-                    "Value": value
-                })
+        # Generate cache path
+        cache_path = self._get_cache_path(reference_method, sample_method)
         
-        # Convert to DataFrame
-        df = pd.DataFrame(data)
+        # Check cache
+        if not force_recompute and os.path.exists(cache_path):
+            logger.info(f"Loading evaluation results from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
         
-        # Create figure
-        plt.figure(figsize=(14, 8))
+        logger.info(f"Evaluating topic model: {sample_method} against {reference_method}...")
         
-        # Plot grouped bar chart
-        ax = sns.barplot(x="Metric", y="Value", hue="Method", data=df)
+        # Extract topic assignments and documents
+        reference_topics = reference_result["topic_model_result"]["topics"]
+        sample_topics = sample_result["topic_model_result"]["topics"]
         
-        # Add labels
-        plt.xlabel("Metric")
-        plt.ylabel("Score")
+        # Extract document info (using document text as identifier)
+        reference_docs = reference_result["topic_model_result"]["document_info"]["Document"].tolist()
+        sample_docs = sample_result["topic_model_result"]["document_info"]["Document"].tolist()
         
-        if title:
-            plt.title(title)
-        else:
-            plt.title("Document-Level Topic Evaluation Metrics")
+        # Calculate document-level metrics
+        ari = self.calculate_adjusted_rand_index(
+            reference_topics,
+            sample_topics,
+            reference_docs,
+            sample_docs
+        )
         
-        # Rotate x-axis labels
-        plt.xticks(rotation=45)
+        nmi = self.calculate_normalized_mutual_info(
+            reference_topics,
+            sample_topics,
+            reference_docs,
+            sample_docs
+        )
         
-        # Add legend
-        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
+        omega = self.calculate_omega_index(
+            reference_topics,
+            sample_topics,
+            reference_docs,
+            sample_docs
+        )
         
-        plt.tight_layout()
+        bcubed_precision, bcubed_recall, bcubed_f1 = self.calculate_bcubed_precision_recall(
+            reference_topics,
+            sample_topics,
+            reference_docs,
+            sample_docs
+        )
         
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved document metrics visualization to: {output_path}")
+        # Calculate semantic similarity between topics
+        topic_similarity = self.calculate_topic_semantic_similarity(
+            reference_result["topic_model_result"]["topic_words"],
+            sample_result["topic_model_result"]["topic_words"],
+            top_n=top_n_words
+        )
         
-        return plt.gcf()
+        # Calculate topic word level metrics using topic similarity
+        # Greedy matching
+        word_precision_greedy, word_recall_greedy, word_f1_greedy = self.calculate_topic_word_precision_recall_greedy(
+            reference_result["topic_model_result"]["topic_words"],
+            sample_result["topic_model_result"]["topic_words"],
+            top_n=top_n_words
+        )
+        
+        # Hungarian matching
+        word_precision_hungarian, word_recall_hungarian, word_f1_hungarian, matched_pairs = self.calculate_topic_word_precision_recall_hungarian(
+            reference_result["topic_model_result"]["topic_words"],
+            sample_result["topic_model_result"]["topic_words"],
+            top_n=top_n_words
+        )
+        
+        # Build result dictionary
+        result = {
+            "reference_method": reference_method,
+            "sample_method": sample_method,
+            "document_metrics": {
+                "adjusted_rand_index": ari,
+                "normalized_mutual_info": nmi,
+                "omega_index": omega,
+                "bcubed_precision": bcubed_precision,
+                "bcubed_recall": bcubed_recall,
+                "bcubed_f1": bcubed_f1
+            },
+            "topic_word_metrics": {
+                "greedy": {
+                    "precision": word_precision_greedy,
+                    "recall": word_recall_greedy,
+                    "f1_score": word_f1_greedy
+                },
+                "hungarian": {
+                    "precision": word_precision_hungarian,
+                    "recall": word_recall_hungarian,
+                    "f1_score": word_f1_hungarian,
+                    "matched_pairs": matched_pairs
+                }
+            },
+            "topic_word_overlap": topic_similarity,  # Use semantic similarity instead of word overlap
+            "common_docs_count": len(set(reference_docs).intersection(set(sample_docs))),
+            "reference_docs_count": len(reference_docs),
+            "sample_docs_count": len(sample_docs)
+        }
+        
+        # Cache results
+        logger.info(f"Caching evaluation results to: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(result, f)
+        
+        return result
     
-    def visualize_topic_word_metrics(
+    def evaluate_multiple_models(
         self,
-        evaluation_results: Dict[str, Dict],
-        matching_method: str = "hungarian",
-        output_path: Optional[str] = None,
-        title: Optional[str] = None
-    ) -> plt.Figure:
+        reference_result: Dict,
+        sample_results: Dict[str, Dict],
+        top_n_words: int = 10,
+        force_recompute: bool = False
+    ) -> Dict[str, Dict]:
         """
-        Visualize topic word metrics for multiple evaluations
+        Evaluate multiple topic models against a reference model
         
         Args:
-            evaluation_results: Dictionary mapping names to evaluation results
-            matching_method: Method for matching ('greedy' or 'hungarian')
-            output_path: Optional path to save visualization
-            title: Optional title for the plot
+            reference_result: Reference topic model result
+            sample_results: Dictionary mapping sample names to results
+            top_n_words: Number of top words to consider for word-level metrics
+            force_recompute: Whether to force recomputing evaluation
             
         Returns:
-            Matplotlib Figure object
+            Dictionary mapping sample names to evaluation results
         """
-        # Extract metrics
-        names = list(evaluation_results.keys())
-        metrics = ["precision", "recall", "f1_score"]
+        evaluation_results = {}
         
-        # Create data
-        data = []
-        for name in names:
-            for metric in metrics:
-                value = evaluation_results[name]["topic_word_metrics"][matching_method][metric]
-                data.append({
-                    "Method": name,
-                    "Metric": metric,
-                    "Value": value
-                })
+        for name, result in sample_results.items():
+            logger.info(f"Evaluating model: {name}")
+            
+            # Run evaluation
+            eval_result = self.evaluate_topic_model(
+                reference_result=reference_result,
+                sample_result=result,
+                top_n_words=top_n_words,
+                force_recompute=force_recompute
+            )
+            
+            evaluation_results[name] = eval_result
         
-        # Convert to DataFrame
-        df = pd.DataFrame(data)
-        
-        # Create figure
-        plt.figure(figsize=(12, 8))
-        
-        # Plot grouped bar chart
-        ax = sns.barplot(x="Metric", y="Value", hue="Method", data=df)
-        
-        # Add labels
-        plt.xlabel("Metric")
-        plt.ylabel("Score")
-        
-        if title:
-            plt.title(title)
-        else:
-            plt.title(f"Topic Word Metrics ({matching_method.title()} Matching)")
-        
-        # Add legend
-        plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
-        
-        plt.tight_layout()
-        
-        # Save if requested
-        if output_path:
-            plt.savefig(output_path, dpi=300)
-            logger.info(f"Saved topic word metrics visualization to: {output_path}")
-        
-        return plt.gcf()
-
+        return evaluation_results
+    
     def export_evaluation_results(
         self,
         evaluation_results: Dict[str, Dict],
@@ -1738,307 +1095,134 @@ class TopicEvaluator:
                     plt.close()
                 except Exception as e:
                     logger.error(f"Error generating topic similarity matrix for {name}: {str(e)}")
-                
-                # Try each visualization separately to avoid one failure affecting others
-                try:
-                    # Document metrics radar chart
-                    radar_path = os.path.join(sample_dir, "document_metrics_radar.png")
-                    self.visualize_document_metrics_radar(
-                        result,
-                        output_path=radar_path,
-                        title=f"Document Metrics: {result['sample_method']}"
-                    )
-                    plt.close()
-                except Exception as e:
-                    logger.error(f"Error generating radar chart for {name}: {str(e)}")
-                
-                try:
-                    # Topic word metrics comparison
-                    topic_compare_path = os.path.join(sample_dir, "topic_word_metrics_comparison.png")
-                    self.visualize_topic_word_metrics_comparison(
-                        result,
-                        output_path=topic_compare_path,
-                        title=f"Topic Word Metrics: {result['sample_method']}"
-                    )
-                    plt.close()
-                except Exception as e:
-                    logger.error(f"Error generating topic metrics comparison for {name}: {str(e)}")
-                
-                try:
-                    # B-Cubed metrics visualization
-                    bcubed_path = os.path.join(sample_dir, "bcubed_metrics.png")
-                    self.visualize_bcubed_metrics(
-                        result,
-                        output_path=bcubed_path,
-                        title=f"B-Cubed Metrics: {result['sample_method']}"
-                    )
-                    plt.close()
-                except Exception as e:
-                    logger.error(f"Error generating B-Cubed metrics for {name}: {str(e)}")
-                
-                try:
-                    # Coverage ratio visualization
-                    coverage_path = os.path.join(sample_dir, "coverage_ratio.png")
-                    self.visualize_coverage_ratio(
-                        result,
-                        output_path=coverage_path,
-                        title=f"Document Coverage: {result['sample_method']}"
-                    )
-                    plt.close()
-                except Exception as e:
-                    logger.error(f"Error generating coverage ratio for {name}: {str(e)}")
             
             output_paths[name] = sample_dir
-        
-        # Create comparative visualizations if multiple samples
-        if len(evaluation_results) > 1 and create_visualizations:
-            try:
-                # Document metrics
-                doc_metrics_path = os.path.join(ref_dir, "document_metrics.png")
-                self.visualize_document_metrics(
-                    evaluation_results,
-                    output_path=doc_metrics_path,
-                    title=f"Document-Level Topic Evaluation Metrics (Reference: {reference_method})"
-                )
-                plt.close()
-                
-                # Comparative document metrics (NEW)
-                comparative_doc_path = os.path.join(ref_dir, "comparative_document_metrics.png")
-                self.visualize_comparative_metrics(
-                    evaluation_results,
-                    metrics_type="document",
-                    metrics=["adjusted_rand_index", "normalized_mutual_info", "omega_index"],
-                    output_path=comparative_doc_path,
-                    title=f"Document Clustering Metrics Comparison (Reference: {reference_method})"
-                )
-                plt.close()
-                
-                # Comparative B-Cubed metrics (NEW)
-                comparative_bcubed_path = os.path.join(ref_dir, "comparative_bcubed_metrics.png")
-                self.visualize_comparative_metrics(
-                    evaluation_results,
-                    metrics_type="document",
-                    metrics=["bcubed_precision", "bcubed_recall", "bcubed_f1"],
-                    output_path=comparative_bcubed_path,
-                    title=f"B-Cubed Metrics Comparison (Reference: {reference_method})"
-                )
-                plt.close()
-                
-                # Topic word metrics (Greedy)
-                word_metrics_greedy_path = os.path.join(ref_dir, "topic_word_metrics_greedy.png")
-                self.visualize_topic_word_metrics(
-                    evaluation_results,
-                    matching_method="greedy",
-                    output_path=word_metrics_greedy_path,
-                    title=f"Topic Word Metrics with Greedy Matching (Reference: {reference_method})"
-                )
-                plt.close()
-                
-                # Topic word metrics (Hungarian)
-                word_metrics_hungarian_path = os.path.join(ref_dir, "topic_word_metrics_hungarian.png")
-                self.visualize_topic_word_metrics(
-                    evaluation_results,
-                    matching_method="hungarian",
-                    output_path=word_metrics_hungarian_path,
-                    title=f"Topic Word Metrics with Hungarian Matching (Reference: {reference_method})"
-                )
-                plt.close()
-            except Exception as e:
-                logger.error(f"Error generating comparative visualizations: {str(e)}")
         
         return output_paths
 
 
 def main():
     """Main function to evaluate topic models using FULL_DATASET as the gold standard"""
-    import os
-    import pickle
-    from topic_modelling import TopicModelingMethod
+    from datasets import load_dataset
     
-    # Define constants
+    # ===== CONFIGURATION PARAMETERS =====
+    
+    # Corpus and cache configuration - should match topic_modelling.py
+    CORPUS_SUBSET_SIZE = 10000  # Set to None for full corpus
     CACHE_DIR = "cache"
-    TOPIC_MODELING_CACHE_DIR = CACHE_DIR
     OUTPUT_DIR = "results/evaluation"
+    
+    # Evaluation parameters
+    TOP_N_WORDS = 10
+    FORCE_RECOMPUTE = False
+    
+    # Reference method (gold standard)
+    REFERENCE_METHOD = TopicModelingMethod.FULL_DATASET.value
+    
+    # Log level
+    LOG_LEVEL = 'INFO'
     
     # Configure logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, LOG_LEVEL),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Load topic modeling results from cache - use the specific path from topic_modeling.py
-    topic_modeling_results_path = os.path.join(TOPIC_MODELING_CACHE_DIR, "all_topic_model_results.pkl")
-    
-    logger.info(f"Loading topic modeling results from: {topic_modeling_results_path}")
-    
-    if os.path.exists(topic_modeling_results_path):
-        with open(topic_modeling_results_path, "rb") as f:
-            topic_models_by_query = pickle.load(f)
-    else:
-        logger.warning(f"Topic modeling results not found at {topic_modeling_results_path}")
-        logger.info("Searching for individual topic model caches...")
-        
-        # Fall back to individual model caches if needed
-        topic_model_files = []
-        for root, dirs, files in os.walk(TOPIC_MODELING_CACHE_DIR):
-            for file in files:
-                if file.startswith("topic_model_") and file.endswith(".pkl"):
-                    topic_model_files.append(os.path.join(root, file))
-        
-        if topic_model_files:
-            logger.info(f"Found {len(topic_model_files)} individual topic model files")
-            
-            # Load individual files
-            topic_models_by_query = {"query_level": {}}
-            for file_path in topic_model_files:
-                with open(file_path, "rb") as f:
-                    model_result = pickle.load(f)
-                
-                # Extract method and query info
-                method = os.path.basename(file_path).replace("topic_model_", "").replace(".pkl", "")
-                query_id = model_result.get("query_id", "unknown")
-                
-                if query_id not in topic_models_by_query["query_level"]:
-                    topic_models_by_query["query_level"][query_id] = {}
-                
-                topic_models_by_query["query_level"][query_id][method] = model_result
-        else:
-            logger.error("No topic modeling results found. Please run topic_modeling.py first.")
-            return None
+    # Load datasets for metadata
+    logger.info("Loading datasets for metadata...")
+    corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
+    queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
+    qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
+    logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
     # Initialize evaluator
-    evaluator = TopicEvaluator(cache_dir=os.path.join(CACHE_DIR, "topic_evaluation"))
+    evaluator = TopicEvaluator(
+        cache_dir=CACHE_DIR,
+        corpus_subset_size=CORPUS_SUBSET_SIZE
+    )
     
-    # Process each query
+    # Load topic modeling results from cache
+    logger.info("Loading topic modeling results from cache...")
+    topic_models_registry = evaluator.load_topic_model_registry()
+    
+    if not topic_models_registry:
+        logger.error("No topic modeling results found. Please run topic_modelling.py first.")
+        return None
+    
+    logger.info(f"Found topic models for {len(topic_models_registry)} query/corpus levels")
+    
+    # Process each query/corpus level
     all_evaluation_results = {}
     
-    for query_id, methods in topic_models_by_query.items():
-        if query_id == "corpus_level":
-            # Skip corpus level for now - we'll process it separately
+    for query_level, methods_results in topic_models_registry.items():
+        logger.info(f"Evaluating topic models for: {query_level}")
+        
+        # Check if reference method is available
+        if REFERENCE_METHOD not in methods_results:
+            logger.warning(f"Reference method '{REFERENCE_METHOD}' not found for {query_level}. Available: {list(methods_results.keys())}")
             continue
         
-        logger.info(f"Evaluating topic models for query: {query_id}")
+        # Get reference result
+        reference_result = methods_results[REFERENCE_METHOD]
         
-        # Filter to topic model results
-        topic_results = {}
-        for method_name, result in methods.items():
-            # Extract the topic model result
-            if "topic_model_result" in result:
-                topic_results[method_name] = result["topic_model_result"]
-            else:
-                topic_results[method_name] = result
+        # Create samples dictionary with all but reference
+        samples = {name: result for name, result in methods_results.items() 
+                  if name != REFERENCE_METHOD}
         
-        if not topic_results:
-            logger.warning(f"No topic model results found for query {query_id}")
+        if not samples:
+            logger.warning(f"Only reference model found for {query_level}, cannot evaluate")
             continue
         
-        # Always use FULL_DATASET as the reference (gold standard) if available
-        if TopicModelingMethod.FULL_DATASET.value in topic_results:
-            reference_method = TopicModelingMethod.FULL_DATASET.value
-            reference_result = topic_results[reference_method]
-            
-            # Create samples dictionary with all but reference
-            samples = {name: result for name, result in topic_results.items() 
-                      if name != reference_method}
-            
-            if not samples:
-                logger.warning(f"Only reference model found for query {query_id}, cannot evaluate")
-                continue
-            
-            # Run evaluation
-            evaluation_results = evaluator.evaluate_multiple_models(
-                reference_result=reference_result,
-                sample_results=samples,
-                top_n_words=10,
-                force_recompute=False
-            )
-            
-            # Export results
-            query_output_dir = os.path.join(OUTPUT_DIR, f"query_{query_id}")
-            evaluator.export_evaluation_results(
-                evaluation_results=evaluation_results,
-                reference_method=reference_method,
-                output_dir=query_output_dir,
-                create_visualizations=True
-            )
-            
-            # Store results
-            all_evaluation_results[query_id] = {
-                "reference_method": reference_method,
-                "evaluation_results": evaluation_results
-            }
-        else:
-            logger.warning(f"FULL_DATASET model not found for query {query_id}, skipping evaluation")
-    
-    # Process corpus level if available
-    if "corpus_level" in topic_models_by_query:
-        logger.info("Evaluating topic models at corpus level")
+        # Run evaluation
+        evaluation_results = evaluator.evaluate_multiple_models(
+            reference_result=reference_result,
+            sample_results=samples,
+            top_n_words=TOP_N_WORDS,
+            force_recompute=FORCE_RECOMPUTE
+        )
         
-        corpus_methods = topic_models_by_query["corpus_level"]
+        # Export results
+        level_output_dir = os.path.join(OUTPUT_DIR, query_level)
+        evaluator.export_evaluation_results(
+            evaluation_results=evaluation_results,
+            reference_method=REFERENCE_METHOD,
+            output_dir=level_output_dir,
+            create_visualizations=True
+        )
         
-        # Extract topic model results
-        corpus_topic_results = {}
-        for method_name, result in corpus_methods.items():
-            if "topic_model_result" in result:
-                corpus_topic_results[method_name] = result["topic_model_result"]
-            else:
-                corpus_topic_results[method_name] = result
-        
-        # Always use FULL_DATASET as reference for corpus-level evaluation
-        if TopicModelingMethod.FULL_DATASET.value in corpus_topic_results:
-            corpus_reference_method = TopicModelingMethod.FULL_DATASET.value
-            corpus_reference_result = corpus_topic_results[corpus_reference_method]
-            
-            # Create samples dictionary with all but reference
-            corpus_samples = {name: result for name, result in corpus_topic_results.items() 
-                             if name != corpus_reference_method}
-            
-            if corpus_samples:
-                # Run evaluation
-                corpus_evaluation_results = evaluator.evaluate_multiple_models(
-                    reference_result=corpus_reference_result,
-                    sample_results=corpus_samples,
-                    top_n_words=10,
-                    force_recompute=False
-                )
-                
-                # Export results
-                corpus_output_dir = os.path.join(OUTPUT_DIR, "corpus_level")
-                evaluator.export_evaluation_results(
-                    evaluation_results=corpus_evaluation_results,
-                    reference_method=corpus_reference_method,
-                    output_dir=corpus_output_dir,
-                    create_visualizations=True
-                )
-                
-                # Store results
-                all_evaluation_results["corpus_level"] = {
-                    "reference_method": corpus_reference_method,
-                    "evaluation_results": corpus_evaluation_results
-                }
-            else:
-                logger.warning("Only FULL_DATASET model found at corpus level, cannot evaluate")
-        else:
-            logger.warning("FULL_DATASET model not found at corpus level, skipping evaluation")
+        # Store results
+        all_evaluation_results[query_level] = {
+            "reference_method": REFERENCE_METHOD,
+            "evaluation_results": evaluation_results
+        }
     
     # Print summary of all results
     logger.info("\n===== TOPIC EVALUATION SUMMARY =====")
-    for query_id, result in all_evaluation_results.items():
-        reference_method = result["reference_method"]
+    logger.info(f"Reference Method: {REFERENCE_METHOD}")
+    logger.info(f"Corpus Subset Size: {CORPUS_SUBSET_SIZE if CORPUS_SUBSET_SIZE else 'full'}")
+    
+    for query_level, result in all_evaluation_results.items():
         evaluation_results = result["evaluation_results"]
         
-        logger.info(f"\nResults for query: {query_id} (Reference: {reference_method})")
-        logger.info(f"{'Method':<30} {'ARI':<8} {'Omega':<8} {'Word F1':<8}")
-        logger.info("-" * 55)
+        logger.info(f"\nResults for {query_level}:")
+        logger.info(f"{'Method':<30} {'ARI':<8} {'Omega':<8} {'Word F1':<8} {'Docs':<8}")
+        logger.info("-" * 65)
         
         for method, eval_result in evaluation_results.items():
             ari = eval_result["document_metrics"]["adjusted_rand_index"]
             omega = eval_result["document_metrics"]["omega_index"]
             word_f1 = eval_result["topic_word_metrics"]["hungarian"]["f1_score"]
+            docs = eval_result["sample_docs_count"]
             
-            logger.info(f"{method:<30} {ari:.4f}  {omega:.4f}  {word_f1:.4f}")
+            logger.info(f"{method:<30} {ari:.4f}  {omega:.4f}  {word_f1:.4f}  {docs:<8}")
     
     logger.info(f"\nDetailed evaluation results exported to {OUTPUT_DIR}")
+    
+    # Print corpus cache info
+    logger.info(f"\n===== CACHE INFORMATION =====")
+    logger.info(f"Corpus cache directory: {evaluator.corpus_cache_dir}")
+    logger.info(f"Topic models cache: {os.path.join(evaluator.corpus_cache_dir, 'topic_models')}")
+    logger.info(f"Evaluation cache: {evaluator.evaluation_cache_dir}")
     
     return all_evaluation_results
 

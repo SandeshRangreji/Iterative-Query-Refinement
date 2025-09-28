@@ -6,13 +6,30 @@ import torch
 from typing import List, Dict, Tuple, Union, Optional, Any, Callable
 from collections import defaultdict
 import pickle
+import json
+import random
+import hashlib
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 import umap
 from tqdm import tqdm
 from enum import Enum
-import random
-import hashlib
+
+# GPU imports with fallback
+try:
+    import cupy as cp
+    import cuml
+    from cuml.cluster import KMeans as cuMLKMeans
+    from cuml.manifold import UMAP as cuMLUMAP
+    GPU_AVAILABLE = True
+    logger_gpu = logging.getLogger(__name__ + ".gpu")
+    logger_gpu.info("GPU libraries (CuPy, cuML) successfully imported")
+except ImportError as e:
+    GPU_AVAILABLE = False
+    cp = None
+    cuml = None
+    logger_gpu = logging.getLogger(__name__ + ".gpu")
+    logger_gpu.warning(f"GPU libraries not available: {e}")
 
 # Import from other modules
 from search import (
@@ -55,13 +72,62 @@ class RepresentativeSelectionMethod(str, Enum):
     MAX_PROBABILITY = "max_probability"
 
 class SamplingMethod(str, Enum):
-    """Enum for sampling methods"""
+    """Enum for sampling methods - aligned with TopicModelingMethod"""
     FULL_DATASET = "full_dataset"
-    RETRIEVAL = "retrieval"
+    DIRECT_RETRIEVAL = "direct_retrieval"  # Aligned with TopicModelingMethod
     QUERY_EXPANSION = "query_expansion"
-    UNIFORM = "uniform"
-    RANDOM = "random"
-    CLUSTERING = "clustering"
+    CLUSTER_AFTER_RETRIEVAL = "cluster_after_retrieval"
+    CLUSTER_AFTER_EXPANSION = "cluster_after_expansion"
+    UNIFORM_SAMPLING = "uniform_sampling"
+
+# Mapping for backward compatibility and method name consistency
+SAMPLING_METHOD_MAPPING = {
+    # Old names -> New canonical names
+    "retrieval": "direct_retrieval",
+    "random": "uniform_sampling",  # Random is essentially uniform sampling
+    "clustering": "cluster_after_retrieval",  # Default clustering source
+}
+
+class GPUUtils:
+    """Utility class for GPU operations and memory management"""
+    
+    @staticmethod
+    def is_gpu_available() -> bool:
+        """Check if GPU and required libraries are available"""
+        return GPU_AVAILABLE and cp is not None and cuml is not None
+    
+    @staticmethod
+    def get_gpu_memory_info() -> Dict[str, float]:
+        """Get GPU memory information in GB"""
+        if not GPUUtils.is_gpu_available():
+            return {"total": 0, "used": 0, "free": 0}
+        
+        try:
+            mempool = cp.get_default_memory_pool()
+            device = cp.cuda.Device()
+            total_bytes = device.mem_info[1]
+            used_bytes = mempool.used_bytes()
+            free_bytes = total_bytes - used_bytes
+            
+            return {
+                "total": total_bytes / (1024**3),
+                "used": used_bytes / (1024**3), 
+                "free": free_bytes / (1024**3)
+            }
+        except Exception as e:
+            logger_gpu.warning(f"Error getting GPU memory info: {e}")
+            return {"total": 0, "used": 0, "free": 0}
+    
+    @staticmethod
+    def clear_gpu_cache():
+        """Clear GPU memory cache"""
+        if GPUUtils.is_gpu_available():
+            try:
+                mempool = cp.get_default_memory_pool()
+                mempool.free_all_blocks()
+                logger_gpu.info("GPU memory cache cleared")
+            except Exception as e:
+                logger_gpu.warning(f"Error clearing GPU cache: {e}")
 
 class Sampler:
     """Class for sampling documents from a corpus using various methods"""
@@ -77,6 +143,7 @@ class Sampler:
         embedding_model_name: str = "all-mpnet-base-v2",
         cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         dataset_name: str = "trec-covid",
+        corpus_subset_size: Optional[int] = None,
         random_seed: int = 42
     ):
         """
@@ -92,9 +159,11 @@ class Sampler:
             embedding_model_name: Name of the embedding model to use
             cross_encoder_model_name: Name of the cross-encoder model to use
             dataset_name: Name of the dataset for caching
+            corpus_subset_size: Optional size for corpus subset (None for full corpus)
             random_seed: Random seed for reproducibility
         """
-        self.corpus_dataset = corpus_dataset
+        self.original_corpus_dataset = corpus_dataset
+        self.corpus_subset_size = corpus_subset_size
         self.queries_dataset = queries_dataset
         self.qrels_dataset = qrels_dataset
         self.embedding_model_name = embedding_model_name
@@ -107,6 +176,23 @@ class Sampler:
         np.random.seed(random_seed)
         random.seed(random_seed)
         torch.manual_seed(random_seed)
+        
+        # Create corpus subset if specified
+        if corpus_subset_size is not None and corpus_subset_size < len(corpus_dataset):
+            logger.info(f"Creating corpus subset of size {corpus_subset_size} from {len(corpus_dataset)} documents")
+            indices = random.sample(range(len(corpus_dataset)), corpus_subset_size)
+            indices.sort()  # Sort for reproducibility
+            self.corpus_dataset = [corpus_dataset[i] for i in indices]
+            self.corpus_subset_indices = indices
+        else:
+            self.corpus_dataset = corpus_dataset
+            self.corpus_subset_indices = None
+        
+        # Determine corpus size for cache paths
+        if corpus_subset_size is None:
+            self.corpus_cache_size = len(corpus_dataset)
+        else:
+            self.corpus_cache_size = min(corpus_subset_size, len(corpus_dataset))
         
         # Create cache directory if it doesn't exist
         os.makedirs(cache_dir, exist_ok=True)
@@ -136,34 +222,70 @@ class Sampler:
             doc_embeddings=self.doc_embeddings,
             cross_encoder_model_name=cross_encoder_model_name
         )
+        
+        # Initialize query expander and keyword extractor
+        self._initialize_query_tools()
+    
+    def _generate_corpus_cache_dir(self) -> str:
+        """Generate corpus-specific cache directory"""
+        if self.corpus_subset_size is None:
+            corpus_size_str = "full"
+        else:
+            corpus_size_str = f"{self.corpus_cache_size}"
+        
+        return os.path.join(self.cache_dir, f"corpus{corpus_size_str}")
     
     def _initialize_indices_and_models(self, force_reindex: bool = False):
         """
-        Initialize or load indices and models
+        Initialize or load indices and models for the corpus subset
         
         Args:
             force_reindex: Whether to force rebuilding indices
         """
-        logger.info("Initializing indices and models...")
+        logger.info(f"Initializing indices and models for corpus size: {len(self.corpus_dataset)}...")
+        
+        # Generate corpus-specific cache paths
+        corpus_cache_dir = self._generate_corpus_cache_dir()
         
         # Build BM25 index
+        bm25_cache_path = os.path.join(corpus_cache_dir, "indices", "bm25_index.pkl")
         self.bm25, self.corpus_texts, self.corpus_ids = self.index_manager.build_bm25_index(
             self.corpus_dataset,
-            dataset_name=self.dataset_name,
+            cache_path=bm25_cache_path,
             force_reindex=force_reindex
         )
         
         # Build SBERT index
+        sbert_cache_path = os.path.join(corpus_cache_dir, "indices", "sbert_index.pt")
         self.sbert_model, self.doc_embeddings = self.index_manager.build_sbert_index(
             self.corpus_texts,
             model_name=self.embedding_model_name,
-            dataset_name=self.dataset_name,
             batch_size=64,
+            cache_path=sbert_cache_path,
             force_reindex=force_reindex
         )
         
         # Create mapping from corpus IDs to indices
         self.corpus_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(self.corpus_ids)}
+    
+    def _initialize_query_tools(self):
+        """Initialize query expander and keyword extractor"""
+        # Initialize keyword extractor
+        self.keyword_extractor = KeywordExtractor(
+            keybert_model=self.sbert_model,
+            cache_dir=self._generate_corpus_cache_dir(),
+            top_k_docs=1000,
+            top_n_docs_for_extraction=10
+        )
+        
+        # Initialize query expander
+        self.query_expander = QueryExpander(
+            preprocessor=self.preprocessor,
+            index_manager=self.index_manager,
+            cache_dir=self._generate_corpus_cache_dir(),
+            sbert_model_name=self.embedding_model_name,
+            cross_encoder_model_name=self.cross_encoder_model_name
+        )
     
     def _get_doc_texts_from_ids(self, doc_ids: List[str]) -> List[str]:
         """Get document texts from document IDs"""
@@ -174,28 +296,39 @@ class Sampler:
         indices = [self.corpus_id_to_idx[doc_id] for doc_id in doc_ids]
         return self.doc_embeddings[indices]
     
-    def _generate_source_cache_path(
+    def _generate_method_cache_path(
         self,
         method: SamplingMethod,
-        config: Dict[str, Any]
+        config: Dict[str, Any],
+        query_id: Optional[str] = None
     ) -> str:
-        """Generate cache path for source document sampling"""
-        cache_dir = os.path.join("cache", "sampling", "source_docs")
+        """Generate cache path for sampling method with corpus size and query info"""
+        corpus_cache_dir = self._generate_corpus_cache_dir()
         
+        # Determine cache subdirectory based on method type
+        if query_id is not None:
+            # Query-specific methods
+            cache_subdir = os.path.join("sampling", "query_specific", f"query_{query_id}")
+        else:
+            # Corpus-level methods
+            cache_subdir = os.path.join("sampling", "corpus_level")
+        
+        cache_dir = os.path.join(corpus_cache_dir, cache_subdir)
+        
+        # Generate filename based on method and config
         if method == SamplingMethod.FULL_DATASET:
-            filename = "full_dataset_all.pkl"
-        elif method == SamplingMethod.RANDOM:
-            filename = f"random_k{config['sample_size']}.pkl"
-        elif method == SamplingMethod.UNIFORM:
-            filename = f"uniform_k{config['sample_size']}.pkl"
-        elif method == SamplingMethod.RETRIEVAL:
+            filename = "full_dataset.pkl"
+        elif method == SamplingMethod.UNIFORM_SAMPLING:
+            sample_size = config.get('sample_size', 1000)
+            filename = f"uniform_sampling_k{sample_size}.pkl"
+        elif method == SamplingMethod.DIRECT_RETRIEVAL:
             retrieval_method = config.get('retrieval_method', 'hybrid')
             if hasattr(retrieval_method, 'value'):
                 retrieval_method = retrieval_method.value
             top_k = config.get('top_k', 1000)
             use_mmr = config.get('use_mmr', False)
             use_cross_encoder = config.get('use_cross_encoder', False)
-            filename = f"retrieval_{retrieval_method}_k{top_k}_mmr-{str(use_mmr).lower()}_cross-{str(use_cross_encoder).lower()}.pkl"
+            filename = f"direct_retrieval_{retrieval_method}_k{top_k}_mmr-{str(use_mmr).lower()}_cross-{str(use_cross_encoder).lower()}.pkl"
         elif method == SamplingMethod.QUERY_EXPANSION:
             exp_method = config.get('expansion_method', 'keybert')
             if hasattr(exp_method, 'value'):
@@ -206,44 +339,19 @@ class Sampler:
             if hasattr(strategy, 'value'):
                 strategy = strategy.value.replace('_', '-')
             top_k = config.get('top_k', 1000)
-            filename = f"expansion_{exp_method}-k{num_kw}-div{diversity}_{strategy}_k{top_k}.pkl"
+            filename = f"query_expansion_{exp_method}-k{num_kw}-div{diversity}_{strategy}_k{top_k}.pkl"
+        elif method in [SamplingMethod.CLUSTER_AFTER_RETRIEVAL, SamplingMethod.CLUSTER_AFTER_EXPANSION]:
+            source_method = config.get('source_method', 'full_dataset')
+            sample_size = config.get('sample_size', 1000)
+            clustering_method = config.get('clustering_method', 'kmeans')
+            n_components = config.get('n_components', 50)
+            filename = f"{method.value}_{source_method}_k{sample_size}_{clustering_method}_dim{n_components}.pkl"
         else:
             # Fallback
             method_str = method.value if hasattr(method, 'value') else str(method)
             sample_size = config.get('sample_size', 1000)
             filename = f"{method_str}_k{sample_size}.pkl"
         
-        return os.path.join(cache_dir, filename)
-    
-    def _generate_reduction_cache_path(
-        self,
-        method: str,
-        n_components: int,
-        source_hash: str
-    ) -> str:
-        """Generate cache path for dimensionality reduction"""
-        cache_dir = os.path.join("cache", "sampling", "embeddings")
-        
-        if method.lower() == "umap":
-            filename = f"reduced_umap_n{n_components}_neighbors15_cosine_{source_hash}.npy"
-        elif method.lower() == "pca":
-            filename = f"reduced_pca_n{n_components}_{source_hash}.npy"
-        else:
-            filename = f"reduced_{method}_n{n_components}_{source_hash}.npy"
-        
-        return os.path.join(cache_dir, filename)
-    
-    def _generate_clustering_cache_path(
-        self,
-        n_clusters: int,
-        batch_size: int,
-        max_iter: int,
-        n_init: int,
-        source_hash: str
-    ) -> str:
-        """Generate cache path for clustering results"""
-        cache_dir = os.path.join("cache", "sampling", "clusters")
-        filename = f"kmeans_n{n_clusters}_batch{batch_size}_iter{max_iter}_init{n_init}_{source_hash}.pkl"
         return os.path.join(cache_dir, filename)
     
     def _create_source_hash(self, source_doc_ids: List[str]) -> str:
@@ -260,61 +368,94 @@ class Sampler:
         hash_obj = hashlib.md5(ids_str.encode())
         return hash_obj.hexdigest()[:8]
     
+    def save_query_centric_registry(self, all_results: Dict[str, Dict[str, Dict]]) -> str:
+        """
+        Save query-centric registry of all sampling results
+        
+        Args:
+            all_results: Dictionary with structure {query_id: {method_name: result_dict}}
+            
+        Returns:
+            Path to saved registry file
+        """
+        registry = {}
+        
+        for query_level, methods_results in all_results.items():
+            registry[query_level] = {}
+            
+            for method_name, result_dict in methods_results.items():
+                # Extract cache path from result if available
+                cache_path = result_dict.get("cache_path", "")
+                
+                # Store essential metadata
+                registry[query_level][method_name] = {
+                    "cache_path": cache_path,
+                    "method": result_dict.get("method", method_name),
+                    "config": result_dict.get("config", {}),
+                    "sampled_docs": result_dict.get("sampled_docs", 0),
+                    "total_docs": result_dict.get("total_docs", len(self.corpus_dataset)),
+                    "sampling_rate": result_dict.get("sampling_rate", 0.0),
+                    "corpus_subset_size": self.corpus_subset_size
+                }
+        
+        # Save registry
+        corpus_cache_dir = self._generate_corpus_cache_dir()
+        registry_path = os.path.join(corpus_cache_dir, "sampling_registry.json")
+        
+        os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+        with open(registry_path, "w") as f:
+            json.dump(registry, f, indent=2)
+        
+        logger.info(f"Saved sampling registry to: {registry_path}")
+        return registry_path
+    
+    def load_query_centric_registry(self) -> Dict:
+        """Load query-centric registry"""
+        corpus_cache_dir = self._generate_corpus_cache_dir()
+        registry_path = os.path.join(corpus_cache_dir, "sampling_registry.json")
+        
+        if os.path.exists(registry_path):
+            with open(registry_path, "r") as f:
+                return json.load(f)
+        else:
+            logger.warning(f"Registry not found at: {registry_path}")
+            return {}
+    
+    def _reconstruct_cache_path(
+        self,
+        method: str,
+        config: Dict,
+        query_id: Optional[str] = None
+    ) -> str:
+        """Fallback method to reconstruct cache path if not in registry"""
+        # Convert method name if needed
+        canonical_method = SAMPLING_METHOD_MAPPING.get(method, method)
+        
+        try:
+            sampling_method = SamplingMethod(canonical_method)
+            return self._generate_method_cache_path(sampling_method, config, query_id)
+        except ValueError:
+            logger.error(f"Unknown sampling method: {method}")
+            return ""
+    
     def sample_full_dataset(self) -> Dict:
         """Return the full dataset with no sampling"""
         logger.info(f"Returning full dataset ({len(self.corpus_ids)} documents)...")
         
+        # Generate cache path
+        config = {"sample_size": len(self.corpus_ids)}
+        cache_path = self._generate_method_cache_path(SamplingMethod.FULL_DATASET, config)
+        
         result = {
-            "method": SamplingMethod.FULL_DATASET,
-            "config": {"sample_size": len(self.corpus_ids)},
+            "method": SamplingMethod.FULL_DATASET.value,
+            "config": config,
             "total_docs": len(self.corpus_ids),
             "sampled_docs": len(self.corpus_ids),
             "sampling_rate": 1.0,
             "sample_ids": self.corpus_ids,
-            "sample_texts": self.corpus_texts
+            "sample_texts": self.corpus_texts,
+            "cache_path": cache_path
         }
-        
-        return result
-    
-    def sample_random(self, sample_size: int, force_regenerate: bool = False) -> Dict:
-        """Perform simple random sampling of documents"""
-        logger.info(f"Performing random sampling (size: {sample_size})...")
-        
-        config = {"sample_size": sample_size}
-        cache_path = self._generate_source_cache_path(SamplingMethod.RANDOM, config)
-        
-        # Check cache
-        if not force_regenerate and os.path.exists(cache_path):
-            logger.info(f"Loading random sample from cache: {cache_path}")
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
-        
-        # Ensure sample size doesn't exceed corpus size
-        actual_sample_size = min(sample_size, len(self.corpus_ids))
-        
-        # Randomly select indices
-        indices = sorted(random.sample(range(len(self.corpus_ids)), actual_sample_size))
-        
-        # Get corresponding document IDs and texts
-        sampled_ids = [self.corpus_ids[i] for i in indices]
-        sampled_texts = [self.corpus_texts[i] for i in indices]
-        
-        # Prepare result
-        result = {
-            "method": SamplingMethod.RANDOM,
-            "config": config,
-            "total_docs": len(self.corpus_ids),
-            "sampled_docs": len(sampled_ids),
-            "sampling_rate": len(sampled_ids) / len(self.corpus_ids),
-            "sample_ids": sampled_ids,
-            "sample_texts": sampled_texts,
-            "sample_indices": indices
-        }
-        
-        # Cache result
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, "wb") as f:
-            pickle.dump(result, f)
         
         return result
     
@@ -323,7 +464,7 @@ class Sampler:
         logger.info(f"Performing uniform sampling (size: {sample_size})...")
         
         config = {"sample_size": sample_size}
-        cache_path = self._generate_source_cache_path(SamplingMethod.UNIFORM, config)
+        cache_path = self._generate_method_cache_path(SamplingMethod.UNIFORM_SAMPLING, config)
         
         # Check cache
         if not force_regenerate and os.path.exists(cache_path):
@@ -385,7 +526,7 @@ class Sampler:
         
         # Prepare result
         result = {
-            "method": SamplingMethod.UNIFORM,
+            "method": SamplingMethod.UNIFORM_SAMPLING.value,
             "config": config,
             "total_docs": len(self.corpus_ids),
             "sampled_docs": len(sampled_ids),
@@ -393,6 +534,7 @@ class Sampler:
             "sample_ids": sampled_ids,
             "sample_texts": sampled_texts,
             "sample_indices": sampled_indices,
+            "cache_path": cache_path,
             "bin_info": {
                 "num_bins": num_bins,
                 "bin_edges": bin_edges.tolist(),
@@ -408,8 +550,10 @@ class Sampler:
         
         return result
     
-    def sample_retrieval(
+    def sample_direct_retrieval(
         self,
+        query_id: str,
+        query_text: str,
         sample_size: int,
         retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
         hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
@@ -419,10 +563,7 @@ class Sampler:
         mmr_lambda: float = 0.5,
         force_regenerate: bool = False
     ) -> Dict:
-        """Sample documents based on retrieval results"""
-        if self.queries_dataset is None:
-            raise ValueError("Queries dataset is required for retrieval-based sampling")
-        
+        """Sample documents based on direct retrieval results"""
         # Create config dictionary for cache path
         config = {
             "sample_size": sample_size,
@@ -435,20 +576,19 @@ class Sampler:
         }
         
         # Generate cache path
-        cache_path = self._generate_source_cache_path(SamplingMethod.RETRIEVAL, config)
+        cache_path = self._generate_method_cache_path(SamplingMethod.DIRECT_RETRIEVAL, config, query_id)
         
         # Check cache
         if not force_regenerate and os.path.exists(cache_path):
-            logger.info(f"Loading retrieval sampling results from cache: {cache_path}")
+            logger.info(f"Loading direct retrieval sampling results from cache: {cache_path}")
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
         
-        logger.info(f"Performing retrieval-based sampling (size: {sample_size})...")
+        logger.info(f"Performing direct retrieval sampling for query {query_id} (size: {sample_size})...")
         
-        # Run search for all queries
-        query_results = run_search_for_multiple_queries(
-            search_engine=self.search_engine,
-            queries_dataset=self.queries_dataset,
+        # Perform search
+        results = self.search_engine.search(
+            query=query_text,
             top_k=top_k,
             method=retrieval_method,
             hybrid_strategy=hybrid_strategy,
@@ -457,41 +597,29 @@ class Sampler:
             use_cross_encoder=use_cross_encoder
         )
         
-        # Collect all unique document IDs from results
-        all_doc_ids = set()
-        doc_scores = defaultdict(float)  # Store highest score for each document
-        
-        for query_id, results in query_results.items():
-            for doc_id, score in results:
-                all_doc_ids.add(doc_id)
-                # Keep the highest score across all queries
-                doc_scores[doc_id] = max(doc_scores[doc_id], score)
-        
-        # Sort documents by score
-        sorted_doc_ids = sorted(all_doc_ids, key=lambda x: doc_scores[x], reverse=True)
-        
         # Select top-k documents if we retrieved more than requested
-        if len(sorted_doc_ids) > sample_size:
-            sampled_ids = sorted_doc_ids[:sample_size]
+        if len(results) > sample_size:
+            sampled_results = results[:sample_size]
         else:
-            # If we didn't retrieve enough documents, use all retrieved docs
-            sampled_ids = sorted_doc_ids
+            sampled_results = results
         
-        # Get texts for sampled documents
+        # Extract document IDs and get texts
+        sampled_ids = [doc_id for doc_id, _ in sampled_results]
         sampled_texts = self._get_doc_texts_from_ids(sampled_ids)
         
         # Prepare result
         result = {
-            "method": SamplingMethod.RETRIEVAL,
+            "method": SamplingMethod.DIRECT_RETRIEVAL.value,
             "config": config,
+            "query_id": query_id,
+            "query_text": query_text,
             "total_docs": len(self.corpus_ids),
-            "total_queries": len(self.queries_dataset),
-            "retrieved_docs": len(all_doc_ids),
             "sampled_docs": len(sampled_ids),
             "sampling_rate": len(sampled_ids) / len(self.corpus_ids),
             "sample_ids": sampled_ids,
             "sample_texts": sampled_texts,
-            "raw_query_results": query_results
+            "cache_path": cache_path,
+            "raw_results": results
         }
         
         # Cache results
@@ -503,6 +631,8 @@ class Sampler:
     
     def sample_query_expansion(
         self,
+        query_id: str,
+        query_text: str,
         sample_size: int,
         expansion_method: QueryExpansionMethod = QueryExpansionMethod.KEYBERT,
         combination_strategy: QueryCombinationStrategy = QueryCombinationStrategy.WEIGHTED_RRF,
@@ -518,9 +648,6 @@ class Sampler:
         force_regenerate_keywords: bool = False
     ) -> Dict:
         """Sample documents based on query expansion results"""
-        if self.queries_dataset is None:
-            raise ValueError("Queries dataset is required for query expansion sampling")
-        
         # Create config dictionary for cache path
         config = {
             "sample_size": sample_size,
@@ -537,7 +664,7 @@ class Sampler:
         }
         
         # Generate cache path
-        cache_path = self._generate_source_cache_path(SamplingMethod.QUERY_EXPANSION, config)
+        cache_path = self._generate_method_cache_path(SamplingMethod.QUERY_EXPANSION, config, query_id)
         
         # Check cache
         if not force_regenerate and os.path.exists(cache_path):
@@ -545,19 +672,14 @@ class Sampler:
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
         
-        logger.info(f"Performing query expansion sampling (size: {sample_size})...")
+        logger.info(f"Performing query expansion sampling for query {query_id} (size: {sample_size})...")
         
-        # Initialize keyword extractor
-        keyword_extractor = KeywordExtractor(
-            keybert_model=self.sbert_model,
-            cache_dir=self.cache_dir,
-            top_k_docs=top_k,
-            top_n_docs_for_extraction=10
-        )
+        # Create single-query dataset for the tools
+        single_query_dataset = [{"_id": query_id, "text": query_text}]
         
         # Extract keywords
-        all_keywords = keyword_extractor.extract_keywords_for_queries(
-            queries_dataset=self.queries_dataset,
+        all_keywords = self.keyword_extractor.extract_keywords_for_queries(
+            queries_dataset=single_query_dataset,
             corpus_dataset=self.corpus_dataset,
             num_keywords=num_keywords,
             diversity=diversity,
@@ -566,31 +688,21 @@ class Sampler:
             dataset_name=self.dataset_name
         )
         
-        # Initialize query expander
-        query_expander = QueryExpander(
-            preprocessor=self.preprocessor,
-            index_manager=self.index_manager,
-            cache_dir=self.cache_dir,
-            sbert_model_name=self.embedding_model_name,
-            cross_encoder_model_name=self.cross_encoder_model_name
-        )
-        
         # Run baseline search
-        baseline_results = query_expander.run_baseline_search(
-            queries_dataset=self.queries_dataset,
-            corpus_dataset=self.corpus_dataset,
-            search_engine=self.search_engine,
-            retrieval_method=retrieval_method,
-            hybrid_strategy=hybrid_strategy,
-            top_k=top_k,
-            use_mmr=use_mmr,
-            use_cross_encoder=use_cross_encoder,
-            force_regenerate=force_regenerate
-        )
+        baseline_results = {
+            int(query_id): self.search_engine.search(
+                query=query_text,
+                top_k=top_k,
+                method=retrieval_method,
+                hybrid_strategy=hybrid_strategy,
+                use_mmr=use_mmr,
+                use_cross_encoder=use_cross_encoder
+            )
+        }
         
         # Run query expansion
-        expansion_results = query_expander.expand_queries(
-            queries_dataset=self.queries_dataset,
+        expansion_results = self.query_expander.expand_queries(
+            queries_dataset=single_query_dataset,
             corpus_dataset=self.corpus_dataset,
             baseline_results=baseline_results,
             search_engine=self.search_engine,
@@ -624,7 +736,6 @@ class Sampler:
         if len(sorted_doc_ids) > sample_size:
             sampled_ids = sorted_doc_ids[:sample_size]
         else:
-            # If we didn't retrieve enough documents, use all retrieved docs
             sampled_ids = sorted_doc_ids
         
         # Get texts for sampled documents
@@ -632,16 +743,19 @@ class Sampler:
         
         # Prepare result
         result = {
-            "method": SamplingMethod.QUERY_EXPANSION,
+            "method": SamplingMethod.QUERY_EXPANSION.value,
             "config": config,
+            "query_id": query_id,
+            "query_text": query_text,
             "total_docs": len(self.corpus_ids),
-            "total_queries": len(self.queries_dataset),
             "retrieved_docs": len(all_doc_ids),
             "sampled_docs": len(sampled_ids),
             "sampling_rate": len(sampled_ids) / len(self.corpus_ids),
             "sample_ids": sampled_ids,
             "sample_texts": sampled_texts,
-            "expansion_results": expansion_results
+            "cache_path": cache_path,
+            "expansion_results": expansion_results,
+            "keywords": all_keywords.get(query_id, [])
         }
         
         # Cache results
@@ -656,9 +770,12 @@ class Sampler:
         sample_size: int,
         source_method: SamplingMethod = SamplingMethod.FULL_DATASET,
         source_config: Optional[Dict] = None,
+        query_id: Optional[str] = None,
+        query_text: Optional[str] = None,
         dim_reduction_method: DimensionReductionMethod = DimensionReductionMethod.UMAP,
         n_components: int = 50,
         rep_selection_method: RepresentativeSelectionMethod = RepresentativeSelectionMethod.CENTROID,
+        use_gpu: bool = True,
         batch_size: int = 1000,
         max_iter: int = 100,
         n_init: int = 3,
@@ -675,9 +792,12 @@ class Sampler:
             sample_size: Target sample size (will be exact number of clusters)
             source_method: Method for obtaining documents to cluster
             source_config: Configuration for source method
+            query_id: Query ID (for query-based source methods)
+            query_text: Query text (for query-based source methods)
             dim_reduction_method: Method for dimensionality reduction
             n_components: Number of components for reduced space
             rep_selection_method: Method for selecting representatives
+            use_gpu: Whether to use GPU acceleration
             batch_size: Batch size for Mini-Batch KMeans
             max_iter: Maximum iterations for Mini-Batch KMeans
             n_init: Number of initializations for Mini-Batch KMeans
@@ -690,13 +810,54 @@ class Sampler:
         Returns:
             Dictionary with sampling results
         """
+        # Create config for this clustering operation
+        clustering_config = {
+            "sample_size": sample_size,
+            "source_method": source_method.value,
+            "source_config": source_config or {},
+            "dim_reduction_method": dim_reduction_method.value,
+            "n_components": n_components,
+            "rep_selection_method": rep_selection_method.value,
+            "use_gpu": use_gpu,
+            "batch_size": batch_size,
+            "max_iter": max_iter,
+            "n_init": n_init
+        }
+        
+        # Determine method name for cache path
+        if source_method == SamplingMethod.DIRECT_RETRIEVAL:
+            method_name = SamplingMethod.CLUSTER_AFTER_RETRIEVAL
+        elif source_method == SamplingMethod.QUERY_EXPANSION:
+            method_name = SamplingMethod.CLUSTER_AFTER_EXPANSION
+        else:
+            # For other source methods, use generic clustering name
+            method_name = SamplingMethod.CLUSTER_AFTER_RETRIEVAL  # Default
+        
+        # Generate cache path
+        cache_path = self._generate_method_cache_path(method_name, clustering_config, query_id)
+        
+        # Check cache
+        if not force_recompute and os.path.exists(cache_path):
+            logger.info(f"Loading clustering sampling results from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        
         # Get source documents based on method
         logger.info(f"Getting source documents using {source_method.value}...")
         
         if source_method == SamplingMethod.FULL_DATASET:
             source_result = self.sample_full_dataset()
-        elif source_method == SamplingMethod.RETRIEVAL:
-            source_result = self.sample_retrieval(
+        elif source_method == SamplingMethod.UNIFORM_SAMPLING:
+            source_result = self.sample_uniform(
+                sample_size=source_config.get("sample_size", sample_size * 5),
+                force_regenerate=force_source_regenerate
+            )
+        elif source_method == SamplingMethod.DIRECT_RETRIEVAL:
+            if query_id is None or query_text is None:
+                raise ValueError("query_id and query_text are required for direct retrieval source method")
+            source_result = self.sample_direct_retrieval(
+                query_id=query_id,
+                query_text=query_text,
                 sample_size=source_config.get("sample_size", sample_size * 5),
                 retrieval_method=source_config.get("retrieval_method", RetrievalMethod.HYBRID),
                 hybrid_strategy=source_config.get("hybrid_strategy", HybridStrategy.SIMPLE_SUM),
@@ -706,7 +867,11 @@ class Sampler:
                 force_regenerate=force_source_regenerate
             )
         elif source_method == SamplingMethod.QUERY_EXPANSION:
+            if query_id is None or query_text is None:
+                raise ValueError("query_id and query_text are required for query expansion source method")
             source_result = self.sample_query_expansion(
+                query_id=query_id,
+                query_text=query_text,
                 sample_size=source_config.get("sample_size", sample_size * 3),
                 expansion_method=source_config.get("expansion_method", QueryExpansionMethod.KEYBERT),
                 combination_strategy=source_config.get("combination_strategy", QueryCombinationStrategy.WEIGHTED_RRF),
@@ -738,8 +903,10 @@ class Sampler:
         if dim_reduction_method != DimensionReductionMethod.NONE:
             logger.info(f"Reducing dimensions with {dim_reduction_method.value} to {n_components} components...")
             
-            reduction_cache_path = self._generate_reduction_cache_path(
-                dim_reduction_method.value, n_components, source_hash
+            corpus_cache_dir = self._generate_corpus_cache_dir()
+            reduction_cache_path = os.path.join(
+                corpus_cache_dir, "embeddings", 
+                f"reduced_{dim_reduction_method.value}_n{n_components}_{source_hash}.npy"
             )
             
             if not force_reduction and os.path.exists(reduction_cache_path):
@@ -749,7 +916,8 @@ class Sampler:
                 reduced_embeddings = self._reduce_dimensions(
                     embeddings_np, 
                     method=dim_reduction_method.value, 
-                    n_components=n_components
+                    n_components=n_components,
+                    use_gpu=use_gpu
                 )
                 # Save to cache
                 os.makedirs(os.path.dirname(reduction_cache_path), exist_ok=True)
@@ -758,33 +926,18 @@ class Sampler:
             reduced_embeddings = embeddings_np
         
         # Perform clustering
-        logger.info(f"Clustering with KMeans (n_clusters={n_clusters})...")
+        logger.info(f"Clustering with KMeans (n_clusters={n_clusters}, use_gpu={use_gpu})...")
         
-        clustering_cache_path = self._generate_clustering_cache_path(
-            n_clusters, batch_size, max_iter, n_init, source_hash
+        labels, cluster_info = self._cluster_documents(
+            reduced_embeddings, 
+            n_clusters=n_clusters, 
+            use_gpu=use_gpu,
+            batch_size=batch_size,
+            max_iter=max_iter,
+            n_init=n_init,
+            max_no_improvement=max_no_improvement,
+            reassignment_ratio=reassignment_ratio
         )
-        
-        if not force_recompute and os.path.exists(clustering_cache_path):
-            logger.info(f"Loading clustering results from cache: {clustering_cache_path}")
-            with open(clustering_cache_path, "rb") as f:
-                cluster_data = pickle.load(f)
-                labels = cluster_data["labels"]
-                cluster_info = cluster_data["cluster_info"]
-        else:
-            labels, cluster_info = self._cluster_documents(
-                reduced_embeddings, 
-                n_clusters=n_clusters, 
-                batch_size=batch_size,
-                max_iter=max_iter,
-                n_init=n_init,
-                max_no_improvement=max_no_improvement,
-                reassignment_ratio=reassignment_ratio
-            )
-            # Save to cache
-            os.makedirs(os.path.dirname(clustering_cache_path), exist_ok=True)
-            cluster_data = {"labels": labels, "cluster_info": cluster_info}
-            with open(clustering_cache_path, "wb") as f:
-                pickle.dump(cluster_data, f)
         
         # Select representatives (exactly 1 per cluster = sample_size documents)
         logger.info(f"Selecting representatives with {rep_selection_method.value}...")
@@ -801,20 +954,10 @@ class Sampler:
         
         # Prepare result
         result = {
-            "method": SamplingMethod.CLUSTERING,
-            "config": {
-                "sample_size": sample_size,
-                "source_method": source_method.value,
-                "source_config": source_config,
-                "dim_reduction_method": dim_reduction_method.value,
-                "n_components": n_components,
-                "clustering_method": ClusteringMethod.KMEANS.value,
-                "rep_selection_method": rep_selection_method.value,
-                "n_clusters": n_clusters,
-                "batch_size": batch_size,
-                "max_iter": max_iter,
-                "n_init": n_init
-            },
+            "method": method_name.value,
+            "config": clustering_config,
+            "query_id": query_id,
+            "query_text": query_text,
             "source_method": source_method.value,
             "source_config": source_config,
             "total_docs": len(self.corpus_ids),
@@ -823,12 +966,19 @@ class Sampler:
             "sampling_rate": len(sampled_ids) / len(self.corpus_ids),
             "sample_ids": sampled_ids,
             "sample_texts": sampled_texts,
+            "cache_path": cache_path,
             "cluster_info": cluster_info,
             "dim_reduction_info": {
                 "method": dim_reduction_method.value,
-                "n_components": n_components
+                "n_components": n_components,
+                "use_gpu": use_gpu
             }
         }
+        
+        # Cache results
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(result, f)
         
         return result
     
@@ -837,11 +987,40 @@ class Sampler:
         embeddings: np.ndarray,
         method: str = "umap",
         n_components: int = 50,
+        use_gpu: bool = True,
         random_state: int = 42
     ) -> np.ndarray:
-        """Reduce dimensions of embeddings"""
+        """Reduce dimensions of embeddings with GPU support"""
         if method.lower() == "umap":
-            # UMAP for non-linear dimensionality reduction
+            if use_gpu and GPUUtils.is_gpu_available():
+                try:
+                    logger_gpu.info("Using GPU UMAP for dimensionality reduction")
+                    # Convert to cupy array
+                    embeddings_gpu = cp.asarray(embeddings)
+                    
+                    # Initialize cuML UMAP
+                    reducer = cuMLUMAP(
+                        n_components=n_components,
+                        metric='cosine',
+                        n_neighbors=15,
+                        min_dist=0.1,
+                        random_state=random_state
+                    )
+                    reduced_embeddings_gpu = reducer.fit_transform(embeddings_gpu)
+                    
+                    # Convert back to CPU numpy array
+                    reduced_embeddings = cp.asnumpy(reduced_embeddings_gpu)
+                    
+                    # Clear GPU cache
+                    GPUUtils.clear_gpu_cache()
+                    
+                    return reduced_embeddings
+                    
+                except Exception as e:
+                    logger_gpu.warning(f"GPU UMAP failed, falling back to CPU: {e}")
+            
+            # Fallback to CPU UMAP
+            logger.info("Using CPU UMAP for dimensionality reduction")
             reducer = umap.UMAP(
                 n_components=n_components,
                 metric='cosine',
@@ -852,7 +1031,8 @@ class Sampler:
             reduced_embeddings = reducer.fit_transform(embeddings)
             
         elif method.lower() == "pca":
-            # PCA for linear dimensionality reduction
+            # PCA (CPU only for now)
+            from sklearn.decomposition import PCA
             reducer = PCA(n_components=n_components, random_state=random_state)
             reduced_embeddings = reducer.fit_transform(embeddings)
             
@@ -865,6 +1045,7 @@ class Sampler:
         self,
         embeddings: np.ndarray,
         n_clusters: int = 100,
+        use_gpu: bool = True,
         batch_size: int = 1000,
         max_iter: int = 100,
         n_init: int = 3,
@@ -873,14 +1054,15 @@ class Sampler:
         random_state: int = 42
     ) -> Tuple[np.ndarray, Dict]:
         """
-        Cluster documents using Mini-Batch KMeans for exact cluster count control
+        Cluster documents using KMeans with GPU support
         
         Args:
             embeddings: Document embeddings
             n_clusters: Number of clusters (exact)
+            use_gpu: Whether to use GPU acceleration
             batch_size: Batch size for Mini-Batch KMeans
-            max_iter: Maximum iterations for Mini-Batch KMeans
-            n_init: Number of initializations for Mini-Batch KMeans
+            max_iter: Maximum iterations
+            n_init: Number of initializations
             max_no_improvement: Early stopping parameter
             reassignment_ratio: Controls reassignment frequency
             random_state: Random state for reproducibility
@@ -891,7 +1073,59 @@ class Sampler:
         # Adjust batch size based on dataset size for optimal performance
         actual_batch_size = min(batch_size, len(embeddings))
         
-        logger.info(f"Running Mini-Batch KMeans with {n_clusters} clusters, batch_size={actual_batch_size}")
+        if use_gpu and GPUUtils.is_gpu_available():
+            try:
+                logger_gpu.info(f"Using GPU KMeans with {n_clusters} clusters, batch_size={actual_batch_size}")
+                
+                # Convert to cupy array
+                embeddings_gpu = cp.asarray(embeddings)
+                
+                # Initialize cuML KMeans
+                clusterer = cuMLKMeans(
+                    n_clusters=n_clusters,
+                    random_state=random_state,
+                    n_init=n_init,
+                    max_iter=max_iter
+                )
+                
+                labels_gpu = clusterer.fit_predict(embeddings_gpu)
+                
+                # Convert results back to CPU
+                labels = cp.asnumpy(labels_gpu)
+                cluster_centers = cp.asnumpy(clusterer.cluster_centers_)
+                
+                # Calculate distances for probabilities
+                distances_gpu = clusterer.transform(embeddings_gpu)
+                distances = cp.asnumpy(distances_gpu)
+                
+                # Clear GPU cache
+                GPUUtils.clear_gpu_cache()
+                
+                # Calculate cluster assignment probabilities (distance-based, inverse)
+                probabilities = 1.0 / (1.0 + distances)
+                row_sums = probabilities.sum(axis=1, keepdims=True)
+                probabilities = probabilities / (row_sums + 1e-9)
+                
+                # Prepare cluster info
+                cluster_info = {
+                    "method": "gpu_kmeans",
+                    "n_clusters": n_clusters,
+                    "max_iter": max_iter,
+                    "n_init": n_init,
+                    "cluster_centers": cluster_centers,
+                    "cluster_sizes": np.bincount(labels, minlength=n_clusters).tolist(),
+                    "probabilities": probabilities,
+                    "use_gpu": True
+                }
+                
+                return labels, cluster_info
+                
+            except Exception as e:
+                logger_gpu.warning(f"GPU KMeans failed, falling back to CPU: {e}")
+                GPUUtils.clear_gpu_cache()
+        
+        # Fallback to CPU Mini-Batch KMeans
+        logger.info(f"Using CPU Mini-Batch KMeans with {n_clusters} clusters, batch_size={actual_batch_size}")
         
         clusterer = MiniBatchKMeans(
             n_clusters=n_clusters,
@@ -912,7 +1146,7 @@ class Sampler:
         
         # Normalize to sum to 1 per row
         row_sums = probabilities.sum(axis=1, keepdims=True)
-        probabilities = probabilities / (row_sums + 1e-9)  # Add small epsilon to avoid division by zero
+        probabilities = probabilities / (row_sums + 1e-9)
         
         # Prepare cluster info
         cluster_info = {
@@ -927,7 +1161,8 @@ class Sampler:
             "cluster_centers": clusterer.cluster_centers_,
             "cluster_sizes": np.bincount(labels, minlength=n_clusters).tolist(),
             "probabilities": probabilities,
-            "n_iter": clusterer.n_iter_
+            "n_iter": clusterer.n_iter_,
+            "use_gpu": False
         }
         
         return labels, cluster_info
@@ -1108,48 +1343,56 @@ def main():
     """Main function to demonstrate sampling functionality"""
     from datasets import load_dataset
     
-    # ===== CACHING CONTROL FLAGS =====
-    FORCE_REINDEX = False                      # For search indices
-    FORCE_REGENERATE_KEYWORDS = False          # For keyword extraction
-    FORCE_REGENERATE_RETRIEVAL = False         # For retrieval (baseline + expansion)
-    FORCE_REGENERATE_SOURCE = False            # For source document sampling
-    FORCE_RECOMPUTE_REDUCTION = False          # For dimensionality reduction
-    FORCE_RECOMPUTE_CLUSTERING = False         # For clustering specifically
+    # ===== CONFIGURATION PARAMETERS =====
     
-    # ===== DATASET PARAMETERS =====
-    DATASET_NAME = 'trec-covid'
-    
-    # ===== SAMPLING PARAMETERS =====
+    # Corpus and query configuration
+    CORPUS_SUBSET_SIZE = 10000  # Set to None for full corpus
+    QUERY_IDS = ["43", "1"]     # List of query IDs to process
     SAMPLE_SIZE = 1000
     
-    # ===== KEYWORD EXTRACTION PARAMETERS =====
+    # GPU configuration
+    USE_GPU = True
+    GPU_BATCH_SIZE = 2000
+    
+    # Caching control flags
+    FORCE_REINDEX = False
+    FORCE_REGENERATE_KEYWORDS = False
+    FORCE_REGENERATE_RETRIEVAL = False
+    FORCE_REGENERATE_SOURCE = False
+    FORCE_RECOMPUTE_REDUCTION = False
+    FORCE_RECOMPUTE_CLUSTERING = False
+    
+    # Dataset parameters
+    DATASET_NAME = 'trec-covid'
+    
+    # Keyword extraction parameters
     NUM_KEYWORDS = 10
     DIVERSITY = 0.7
     
-    # ===== RETRIEVAL PARAMETERS =====
+    # Retrieval parameters
     RETRIEVAL_METHOD = RetrievalMethod.HYBRID
     HYBRID_STRATEGY = HybridStrategy.SIMPLE_SUM
     TOP_K_DOCS = 1000
     USE_MMR = False
     USE_CROSS_ENCODER = False
     
-    # ===== CLUSTERING PARAMETERS =====
+    # Clustering parameters
     DIM_REDUCTION_METHOD = DimensionReductionMethod.UMAP
     N_COMPONENTS = 50
     REP_SELECTION_METHOD = RepresentativeSelectionMethod.CENTROID
     
-    # Mini-Batch KMeans parameters (optimized for speed)
-    BATCH_SIZE = 2000
+    # GPU-optimized clustering parameters
+    BATCH_SIZE = GPU_BATCH_SIZE if USE_GPU else 2000
     MAX_ITER = 50
     N_INIT = 2
     MAX_NO_IMPROVEMENT = 5
     REASSIGNMENT_RATIO = 0.005
     
-    # ===== MODEL PARAMETERS =====
+    # Model parameters
     EMBEDDING_MODEL = 'all-mpnet-base-v2'
     CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
     
-    # ===== OTHER PARAMETERS =====
+    # Other parameters
     CACHE_DIR = "cache"
     OUTPUT_DIR = "results/samples"
     LOG_LEVEL = 'INFO'
@@ -1160,6 +1403,15 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
+    # GPU availability check
+    if USE_GPU:
+        if GPUUtils.is_gpu_available():
+            gpu_info = GPUUtils.get_gpu_memory_info()
+            logger.info(f"GPU acceleration enabled. Memory: {gpu_info['total']:.1f}GB total, {gpu_info['free']:.1f}GB free")
+        else:
+            logger.warning("GPU requested but not available. Falling back to CPU.")
+            USE_GPU = False
+    
     # Load datasets
     logger.info("Loading datasets...")
     corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
@@ -1167,7 +1419,7 @@ def main():
     qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} relevance judgments")
     
-    # Initialize sampler
+    # Initialize sampler with corpus subset
     logger.info("Initializing sampler...")
     sampler = Sampler(
         corpus_dataset=corpus_dataset,
@@ -1177,65 +1429,68 @@ def main():
         embedding_model_name=EMBEDDING_MODEL,
         cross_encoder_model_name=CROSS_ENCODER_MODEL,
         dataset_name=DATASET_NAME,
+        corpus_subset_size=CORPUS_SUBSET_SIZE,
         random_seed=42
     )
     
-    # Force reindex if needed
-    if FORCE_REINDEX:
-        logger.info("Force reindexing enabled - rebuilding indices...")
-        sampler._initialize_indices_and_models(force_reindex=True)
+    # Dictionary to store all results for registry
+    all_results = {}
     
-    # Define sampling configurations
-    sampling_configs = [
-        {
-            "name": "Random Sample",
-            "method": SamplingMethod.RANDOM,
-            "sample_size": SAMPLE_SIZE
-        },
-        {
-            "name": "Uniform Sample",
-            "method": SamplingMethod.UNIFORM,
-            "sample_size": SAMPLE_SIZE
-        },
-        {
-            "name": "Retrieval Sample",
-            "method": SamplingMethod.RETRIEVAL,
-            "sample_size": SAMPLE_SIZE,
-            "retrieval_method": RETRIEVAL_METHOD,
-            "hybrid_strategy": HYBRID_STRATEGY,
-            "top_k": TOP_K_DOCS,
-            "use_mmr": USE_MMR,
-            "use_cross_encoder": USE_CROSS_ENCODER
-        },
-        {
-            "name": "Query Expansion Sample",
-            "method": SamplingMethod.QUERY_EXPANSION,
-            "sample_size": SAMPLE_SIZE,
-            "expansion_method": QueryExpansionMethod.KEYBERT,
-            "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
-            "num_keywords": NUM_KEYWORDS,
-            "diversity": DIVERSITY,
-            "retrieval_method": RETRIEVAL_METHOD,
-            "top_k": TOP_K_DOCS
-        },
-        {
-            "name": "Clustering (Full Dataset)",
-            "method": SamplingMethod.CLUSTERING,
-            "sample_size": SAMPLE_SIZE,
-            "source_method": SamplingMethod.FULL_DATASET,
-            "dim_reduction_method": DIM_REDUCTION_METHOD,
-            "n_components": N_COMPONENTS,
-            "rep_selection_method": REP_SELECTION_METHOD,
-            "batch_size": BATCH_SIZE,
-            "max_iter": MAX_ITER,
-            "n_init": N_INIT
-        },
-        {
-            "name": "Clustering (Retrieval)",
-            "method": SamplingMethod.CLUSTERING,
-            "sample_size": SAMPLE_SIZE,
-            "source_method": SamplingMethod.RETRIEVAL,
-            "source_config": {
+    # Get query texts
+    query_texts = {}
+    for query_item in queries_dataset:
+        if str(query_item["_id"]) in QUERY_IDS:
+            query_texts[str(query_item["_id"])] = query_item["text"]
+    
+    # Process each query individually
+    for query_id in QUERY_IDS:
+        if query_id not in query_texts:
+            logger.warning(f"Query ID {query_id} not found in dataset")
+            continue
+        
+        query_text = query_texts[query_id]
+        logger.info(f"\n===== PROCESSING QUERY {query_id}: '{query_text}' =====")
+        
+        query_results = {}
+        
+        # 1. Direct Retrieval
+        logger.info("Running direct retrieval sampling...")
+        direct_result = sampler.sample_direct_retrieval(
+            query_id=query_id,
+            query_text=query_text,
+            sample_size=SAMPLE_SIZE,
+            retrieval_method=RETRIEVAL_METHOD,
+            hybrid_strategy=HYBRID_STRATEGY,
+            top_k=TOP_K_DOCS,
+            use_mmr=USE_MMR,
+            use_cross_encoder=USE_CROSS_ENCODER,
+            force_regenerate=FORCE_REGENERATE_RETRIEVAL
+        )
+        query_results["direct_retrieval"] = direct_result
+        
+        # 2. Query Expansion
+        logger.info("Running query expansion sampling...")
+        expansion_result = sampler.sample_query_expansion(
+            query_id=query_id,
+            query_text=query_text,
+            sample_size=SAMPLE_SIZE,
+            expansion_method=QueryExpansionMethod.KEYBERT,
+            combination_strategy=QueryCombinationStrategy.WEIGHTED_RRF,
+            num_keywords=NUM_KEYWORDS,
+            diversity=DIVERSITY,
+            retrieval_method=RETRIEVAL_METHOD,
+            top_k=TOP_K_DOCS,
+            force_regenerate=FORCE_REGENERATE_RETRIEVAL,
+            force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS
+        )
+        query_results["query_expansion"] = expansion_result
+        
+        # 3. Clustering after Retrieval
+        logger.info("Running clustering after retrieval...")
+        cluster_retrieval_result = sampler.sample_clustering(
+            sample_size=SAMPLE_SIZE,
+            source_method=SamplingMethod.DIRECT_RETRIEVAL,
+            source_config={
                 "sample_size": SAMPLE_SIZE * 5,
                 "retrieval_method": RETRIEVAL_METHOD,
                 "hybrid_strategy": HYBRID_STRATEGY,
@@ -1243,125 +1498,113 @@ def main():
                 "use_mmr": USE_MMR,
                 "use_cross_encoder": USE_CROSS_ENCODER
             },
-            "dim_reduction_method": DIM_REDUCTION_METHOD,
-            "n_components": N_COMPONENTS,
-            "rep_selection_method": REP_SELECTION_METHOD,
-            "batch_size": BATCH_SIZE,
-            "max_iter": MAX_ITER,
-            "n_init": N_INIT
-        }
-    ]
-    
-    # Run all sampling configurations
-    logger.info("Running all sampling configurations...")
-    all_samples = {}
-    
-    for config in sampling_configs:
-        config_name = config.get("name", f"config_{len(all_samples)}")
-        method = config.get("method", SamplingMethod.RANDOM)
+            query_id=query_id,
+            query_text=query_text,
+            dim_reduction_method=DIM_REDUCTION_METHOD,
+            n_components=N_COMPONENTS,
+            rep_selection_method=REP_SELECTION_METHOD,
+            use_gpu=USE_GPU,
+            batch_size=BATCH_SIZE,
+            max_iter=MAX_ITER,
+            n_init=N_INIT,
+            force_recompute=FORCE_RECOMPUTE_CLUSTERING,
+            force_source_regenerate=FORCE_REGENERATE_SOURCE,
+            force_reduction=FORCE_RECOMPUTE_REDUCTION
+        )
+        query_results["cluster_after_retrieval"] = cluster_retrieval_result
         
-        logger.info(f"Processing {config_name} with method {method}...")
+        # 4. Clustering after Expansion
+        logger.info("Running clustering after expansion...")
+        cluster_expansion_result = sampler.sample_clustering(
+            sample_size=SAMPLE_SIZE,
+            source_method=SamplingMethod.QUERY_EXPANSION,
+            source_config={
+                "sample_size": SAMPLE_SIZE * 3,
+                "expansion_method": QueryExpansionMethod.KEYBERT,
+                "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF,
+                "num_keywords": NUM_KEYWORDS,
+                "diversity": DIVERSITY,
+                "retrieval_method": RETRIEVAL_METHOD,
+                "top_k": SAMPLE_SIZE * 3
+            },
+            query_id=query_id,
+            query_text=query_text,
+            dim_reduction_method=DIM_REDUCTION_METHOD,
+            n_components=N_COMPONENTS,
+            rep_selection_method=REP_SELECTION_METHOD,
+            use_gpu=USE_GPU,
+            batch_size=BATCH_SIZE,
+            max_iter=MAX_ITER,
+            n_init=N_INIT,
+            force_recompute=FORCE_RECOMPUTE_CLUSTERING,
+            force_source_regenerate=FORCE_REGENERATE_SOURCE,
+            force_reduction=FORCE_RECOMPUTE_REDUCTION
+        )
+        query_results["cluster_after_expansion"] = cluster_expansion_result
         
-        try:
-            if method == SamplingMethod.RANDOM:
-                result = sampler.sample_random(
-                    sample_size=config.get("sample_size", SAMPLE_SIZE),
-                    force_regenerate=FORCE_REGENERATE_SOURCE
-                )
-            
-            elif method == SamplingMethod.UNIFORM:
-                result = sampler.sample_uniform(
-                    sample_size=config.get("sample_size", SAMPLE_SIZE),
-                    force_regenerate=FORCE_REGENERATE_SOURCE
-                )
-            
-            elif method == SamplingMethod.RETRIEVAL:
-                result = sampler.sample_retrieval(
-                    sample_size=config.get("sample_size", SAMPLE_SIZE),
-                    retrieval_method=config.get("retrieval_method", RETRIEVAL_METHOD),
-                    hybrid_strategy=config.get("hybrid_strategy", HYBRID_STRATEGY),
-                    top_k=config.get("top_k", TOP_K_DOCS),
-                    use_mmr=config.get("use_mmr", USE_MMR),
-                    use_cross_encoder=config.get("use_cross_encoder", USE_CROSS_ENCODER),
-                    force_regenerate=FORCE_REGENERATE_RETRIEVAL
-                )
-            
-            elif method == SamplingMethod.QUERY_EXPANSION:
-                result = sampler.sample_query_expansion(
-                    sample_size=config.get("sample_size", SAMPLE_SIZE),
-                    expansion_method=config.get("expansion_method", QueryExpansionMethod.KEYBERT),
-                    combination_strategy=config.get("combination_strategy", QueryCombinationStrategy.WEIGHTED_RRF),
-                    num_keywords=config.get("num_keywords", NUM_KEYWORDS),
-                    diversity=config.get("diversity", DIVERSITY),
-                    retrieval_method=config.get("retrieval_method", RETRIEVAL_METHOD),
-                    top_k=config.get("top_k", TOP_K_DOCS),
-                    force_regenerate=FORCE_REGENERATE_RETRIEVAL,
-                    force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS
-                )
-            
-            elif method == SamplingMethod.CLUSTERING:
-                result = sampler.sample_clustering(
-                    sample_size=config.get("sample_size", SAMPLE_SIZE),
-                    source_method=config.get("source_method", SamplingMethod.FULL_DATASET),
-                    source_config=config.get("source_config"),
-                    dim_reduction_method=config.get("dim_reduction_method", DIM_REDUCTION_METHOD),
-                    n_components=config.get("n_components", N_COMPONENTS),
-                    rep_selection_method=config.get("rep_selection_method", REP_SELECTION_METHOD),
-                    batch_size=config.get("batch_size", BATCH_SIZE),
-                    max_iter=config.get("max_iter", MAX_ITER),
-                    n_init=config.get("n_init", N_INIT),
-                    max_no_improvement=config.get("max_no_improvement", MAX_NO_IMPROVEMENT),
-                    reassignment_ratio=config.get("reassignment_ratio", REASSIGNMENT_RATIO),
-                    force_recompute=FORCE_RECOMPUTE_CLUSTERING,
-                    force_source_regenerate=FORCE_REGENERATE_SOURCE,
-                    force_reduction=FORCE_RECOMPUTE_REDUCTION
-                )
-            
-            else:
-                raise ValueError(f"Unknown sampling method: {method}")
-            
-            all_samples[config_name] = result
-            logger.info(f"Successfully processed {config_name}: {result['sampled_docs']} documents sampled")
-            
-        except Exception as e:
-            logger.error(f"Error processing {config_name}: {str(e)}")
-            continue
+        # Store query results
+        all_results[f"query_{query_id}"] = query_results
+        
+        # Print query summary
+        logger.info(f"Query {query_id} completed:")
+        for method, result in query_results.items():
+            logger.info(f"  {method}: {result['sampled_docs']} documents")
     
-    # Compare samples
-    logger.info("Comparing samples...")
-    comparison = sampler.compare_samples(
-        all_samples,
-        evaluation_metrics=["diversity", "coverage", "overlap"]
+    # Process corpus-level methods
+    logger.info("\n===== PROCESSING CORPUS-LEVEL METHODS =====")
+    corpus_results = {}
+    
+    # 1. Full Dataset
+    logger.info("Running full dataset sampling...")
+    full_result = sampler.sample_full_dataset()
+    corpus_results["full_dataset"] = full_result
+    
+    # 2. Uniform Sampling
+    logger.info("Running uniform sampling...")
+    uniform_result = sampler.sample_uniform(
+        sample_size=SAMPLE_SIZE,
+        force_regenerate=FORCE_REGENERATE_SOURCE
     )
+    corpus_results["uniform_sampling"] = uniform_result
     
-    # Print results summary
-    logger.info("\n===== SAMPLING RESULTS SUMMARY =====")
-    logger.info(f"{'Method':<40} {'Size':<10} {'Coverage':<10} {'Diversity':<10}")
-    logger.info("-" * 70)
+    # Store corpus results
+    all_results["corpus_level"] = corpus_results
     
-    for name, result in all_samples.items():
-        size = result["sampled_docs"]
-        
-        # Get coverage score if available
-        coverage = comparison.get("metrics", {}).get("coverage", {}).get(name, {}).get("coverage_score", 0)
-        
-        # Get diversity score if available
-        diversity = comparison.get("metrics", {}).get("diversity", {}).get(name, {}).get("mean_distance", 0)
-        
-        logger.info(f"{name:<40} {size:<10} {coverage:.4f}     {diversity:.4f}")
+    # Print corpus-level summary
+    logger.info("Corpus-level methods completed:")
+    for method, result in corpus_results.items():
+        logger.info(f"  {method}: {result['sampled_docs']} documents")
     
-    # Print cache structure info
-    logger.info(f"\n===== CACHE STRUCTURE =====")
-    logger.info(f"Search indices: cache/indices/")
-    logger.info(f"Keywords: cache/keywords/")
-    logger.info(f"Retrieval: cache/retrieval/")
-    logger.info(f"Source sampling: cache/sampling/source_docs/")
-    logger.info(f"Embeddings: cache/sampling/embeddings/")
-    logger.info(f"Clustering: cache/sampling/clusters/")
+    # Save query-centric registry
+    logger.info("\n===== SAVING REGISTRY =====")
+    registry_path = sampler.save_query_centric_registry(all_results)
     
-    logger.info(f"\nSampling complete. Cache organized by module and parameters.")
+    # Performance summary
+    logger.info("\n===== PERFORMANCE SUMMARY =====")
+    if USE_GPU and GPUUtils.is_gpu_available():
+        final_gpu_info = GPUUtils.get_gpu_memory_info()
+        logger.info(f"GPU Memory: {final_gpu_info['used']:.1f}GB used, {final_gpu_info['free']:.1f}GB free")
+        logger.info(f"GPU clustering batch size: {BATCH_SIZE}")
+        logger.info(f"GPU UMAP components: {N_COMPONENTS}")
     
-    return all_samples, comparison
+    logger.info(f"Corpus subset size: {CORPUS_SUBSET_SIZE if CORPUS_SUBSET_SIZE else 'full'}")
+    logger.info(f"Sample size: {SAMPLE_SIZE}")
+    logger.info(f"Processed queries: {len(QUERY_IDS)}")
+    logger.info(f"Total sampling methods: {sum(len(methods) for methods in all_results.values())}")
+    
+    # Print overall results summary
+    logger.info("\n===== OVERALL RESULTS SUMMARY =====")
+    for query_level, methods in all_results.items():
+        logger.info(f"{query_level.upper()}:")
+        for method, result in methods.items():
+            size = result["sampled_docs"]
+            rate = result["sampling_rate"]
+            logger.info(f"  {method}: {size} docs ({rate:.4f})")
+    
+    logger.info(f"\nRegistry saved to: {registry_path}")
+    logger.info("Sampling complete with query-centric caching and GPU acceleration!")
+    
+    return all_results, sampler
 
 
 # Execute main function if called directly
