@@ -70,16 +70,94 @@ class QueryExpander:
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
     
+    def _generate_baseline_cache_path(
+        self,
+        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
+        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+        top_k: int = 1000,
+        use_mmr: bool = False,
+        use_cross_encoder: bool = False,
+        mmr_lambda: float = 0.5,
+        hybrid_weight: float = 0.5
+    ) -> str:
+        """Generate structured cache path for baseline retrieval results"""
+        cache_dir = os.path.join("cache", "retrieval", "baseline")
+        
+        # Build filename with key parameters
+        method_str = retrieval_method.value if isinstance(retrieval_method, Enum) else str(retrieval_method)
+        strategy_str = hybrid_strategy.value if isinstance(hybrid_strategy, Enum) else str(hybrid_strategy)
+        strategy_str = strategy_str.replace("_", "-")  # Convert underscores to hyphens
+        
+        filename_parts = [method_str, strategy_str, f"k{top_k}"]
+        
+        # Add conditional parameters
+        if retrieval_method == RetrievalMethod.HYBRID and hybrid_strategy == HybridStrategy.WEIGHTED:
+            filename_parts.append(f"weight{hybrid_weight}")
+        
+        if use_mmr:
+            filename_parts.extend([f"mmr-true", f"lambda{mmr_lambda}"])
+        else:
+            filename_parts.append("mmr-false")
+        
+        if use_cross_encoder:
+            filename_parts.append("cross-true")
+        else:
+            filename_parts.append("cross-false")
+        
+        filename = "_".join(filename_parts) + ".pkl"
+        return os.path.join(cache_dir, filename)
+    
+    def _generate_expansion_cache_path(
+        self,
+        # Keyword extraction parameters
+        kw_method: str = "keybert",
+        num_keywords: int = 5,
+        diversity: float = 0.7,
+        # Expansion parameters  
+        expansion_method: QueryExpansionMethod = QueryExpansionMethod.KEYBERT,
+        combination_strategy: QueryCombinationStrategy = QueryCombinationStrategy.WEIGHTED_RRF,
+        original_query_weight: float = 0.7,
+        # Retrieval parameters
+        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
+        top_k: int = 1000,
+        use_cross_encoder: bool = False
+    ) -> str:
+        """Generate structured cache path for expanded retrieval results"""
+        cache_dir = os.path.join("cache", "retrieval", "expanded")
+        
+        # Build filename with keyword extraction params
+        kw_part = f"{kw_method}-k{num_keywords}-div{diversity}"
+        
+        # Add expansion strategy
+        exp_method = expansion_method.value if isinstance(expansion_method, Enum) else str(expansion_method)
+        comb_strategy = combination_strategy.value if isinstance(combination_strategy, Enum) else str(combination_strategy)
+        comb_strategy = comb_strategy.replace("_", "-")  # Convert underscores to hyphens
+        
+        exp_part = f"{comb_strategy}_exp{num_keywords}_weight{original_query_weight}"
+        
+        # Add retrieval params
+        retrieval_method_str = retrieval_method.value if isinstance(retrieval_method, Enum) else str(retrieval_method)
+        retrieval_part = f"{retrieval_method_str}_k{top_k}"
+        
+        if use_cross_encoder:
+            retrieval_part += "_cross-true"
+        else:
+            retrieval_part += "_cross-false"
+        
+        filename = f"{kw_part}_{exp_part}_{retrieval_part}.pkl"
+        return os.path.join(cache_dir, filename)
+    
     def _load_or_build_indices(
         self,
         corpus_dataset,
+        dataset_name: str = "trec-covid",
         force_reindex: bool = False
     ):
         """Load or build search indices"""
         logger.info("Loading or building BM25 index...")
         bm25, corpus_texts, corpus_ids = self.index_manager.build_bm25_index(
             corpus_dataset,
-            cache_path=os.path.join(self.cache_dir, "bm25_index.pkl"),
+            dataset_name=dataset_name,
             force_reindex=force_reindex
         )
         
@@ -87,8 +165,8 @@ class QueryExpander:
         sbert_model, doc_embeddings = self.index_manager.build_sbert_index(
             corpus_texts,
             model_name=self.sbert_model_name,
+            dataset_name=dataset_name,
             batch_size=64,
-            cache_path=os.path.join(self.cache_dir, "sbert_index.pt"),
             force_reindex=force_reindex
         )
         
@@ -159,6 +237,104 @@ class QueryExpander:
         result = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return result
     
+    def run_baseline_search(
+        self,
+        queries_dataset,
+        corpus_dataset,
+        search_engine: SearchEngine,
+        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
+        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+        top_k: int = 1000,
+        use_mmr: bool = False,
+        use_cross_encoder: bool = False,
+        mmr_lambda: float = 0.5,
+        hybrid_weight: float = 0.5,
+        force_regenerate: bool = False
+    ) -> Dict[int, List[Tuple[str, float]]]:
+        """
+        Run baseline search and cache results
+        
+        Args:
+            queries_dataset: Dataset containing queries
+            corpus_dataset: Dataset containing corpus documents  
+            search_engine: Initialized SearchEngine instance
+            retrieval_method: Method for document retrieval
+            hybrid_strategy: Strategy for hybrid retrieval
+            top_k: Number of documents to retrieve per query
+            use_mmr: Whether to use MMR for diversity
+            use_cross_encoder: Whether to use cross-encoder reranking
+            mmr_lambda: Lambda parameter for MMR
+            hybrid_weight: Weight for hybrid strategy
+            force_regenerate: Whether to force regenerating results
+            
+        Returns:
+            Dictionary mapping query IDs to search results
+        """
+        # Generate cache path
+        cache_path = self._generate_baseline_cache_path(
+            retrieval_method=retrieval_method,
+            hybrid_strategy=hybrid_strategy,
+            top_k=top_k,
+            use_mmr=use_mmr,
+            use_cross_encoder=use_cross_encoder,
+            mmr_lambda=mmr_lambda,
+            hybrid_weight=hybrid_weight
+        )
+        
+        # Check cache
+        if not force_regenerate and os.path.exists(cache_path):
+            logger.info(f"Loading baseline results from cache: {cache_path}")
+            with open(cache_path, "rb") as f:
+                baseline_data = pickle.load(f)
+                return baseline_data.get("baseline_results", {})
+        
+        logger.info("Running baseline search...")
+        
+        # Run search for all queries
+        baseline_results = run_search_for_multiple_queries(
+            search_engine=search_engine,
+            queries_dataset=queries_dataset,
+            top_k=top_k,
+            method=retrieval_method,
+            hybrid_strategy=hybrid_strategy,
+            hybrid_weight=hybrid_weight,
+            use_mmr=use_mmr,
+            mmr_lambda=mmr_lambda,
+            use_cross_encoder=use_cross_encoder
+        )
+        
+        # Format and cache results
+        query_id_to_text = {int(item["_id"]): item["text"] for item in queries_dataset}
+        baseline_formatted = []
+        for query_id, results in baseline_results.items():
+            baseline_formatted.append({
+                "query_id": query_id,
+                "query_text": query_id_to_text.get(query_id, ""),
+                "results": results
+            })
+        
+        baseline_data = {
+            "baseline_results": baseline_results,
+            "baseline_formatted": baseline_formatted,
+            "config": {
+                "retrieval_method": retrieval_method.value if isinstance(retrieval_method, Enum) else str(retrieval_method),
+                "hybrid_strategy": hybrid_strategy.value if isinstance(hybrid_strategy, Enum) else str(hybrid_strategy),
+                "top_k": top_k,
+                "use_mmr": use_mmr,
+                "use_cross_encoder": use_cross_encoder,
+                "mmr_lambda": mmr_lambda,
+                "hybrid_weight": hybrid_weight
+            }
+        }
+        
+        # Cache results
+        logger.info(f"Caching baseline results to: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(baseline_data, f)
+        
+        return baseline_results
+    
     def expand_queries(
         self,
         queries_dataset,
@@ -166,11 +342,19 @@ class QueryExpander:
         baseline_results: Dict[int, List[Tuple[str, float]]],
         search_engine: SearchEngine,
         query_keywords: Dict[str, List[str]],
+        # Keyword extraction parameters (for cache naming)
+        kw_method: str = "keybert",
+        kw_num_keywords: int = 5,
+        kw_diversity: float = 0.7,
+        # Expansion parameters
         expansion_method: QueryExpansionMethod = QueryExpansionMethod.KEYBERT,
         combination_strategy: QueryCombinationStrategy = QueryCombinationStrategy.WEIGHTED_RRF,
         num_keywords: int = 5,
         top_k_results: int = 1000,
         original_query_weight: float = 0.5,
+        # Retrieval parameters
+        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
+        use_cross_encoder: bool = False,
         force_regenerate_expansion: bool = False,
         cache_path: Optional[str] = None
     ):
@@ -183,22 +367,34 @@ class QueryExpander:
             baseline_results: Dictionary of baseline search results
             search_engine: Initialized SearchEngine instance
             query_keywords: Pre-extracted keywords for each query
+            kw_method: Keyword extraction method used (for cache naming)
+            kw_num_keywords: Number of keywords extracted (for cache naming)
+            kw_diversity: Diversity used in keyword extraction (for cache naming)
             expansion_method: Method for keyword extraction
             combination_strategy: How to combine expanded terms
             num_keywords: Number of keywords to extract per query
             top_k_results: Number of results to retrieve per query
             original_query_weight: Weight for original query in RRF combination
+            retrieval_method: Retrieval method to use
+            use_cross_encoder: Whether to use cross-encoder reranking
             force_regenerate_expansion: Whether to force regenerating expansion results
             cache_path: Optional specific cache path for this configuration
             
         Returns:
             Dictionary of results, including raw search results
         """
-        # Use specific cache path if provided, otherwise use default
+        # Use specific cache path if provided, otherwise generate one
         if cache_path is None:
-            cache_path = os.path.join(
-                self.cache_dir, 
-                f"expanded_{expansion_method.value}_{combination_strategy.value}.pkl"
+            cache_path = self._generate_expansion_cache_path(
+                kw_method=kw_method,
+                num_keywords=kw_num_keywords,
+                diversity=kw_diversity,
+                expansion_method=expansion_method,
+                combination_strategy=combination_strategy,
+                original_query_weight=original_query_weight,
+                retrieval_method=retrieval_method,
+                top_k=top_k_results,
+                use_cross_encoder=use_cross_encoder
             )
         
         # Try to load cached results first
@@ -234,10 +430,10 @@ class QueryExpander:
                     kw_results = search_engine.search(
                         query=keyword,
                         top_k=top_k_results,
-                        method=RetrievalMethod.HYBRID,
+                        method=retrieval_method,
                         hybrid_strategy=HybridStrategy.SIMPLE_SUM,
                         use_mmr=False,
-                        use_cross_encoder=False
+                        use_cross_encoder=use_cross_encoder
                     )
                     keyword_results.append(kw_results)
                 
@@ -276,10 +472,10 @@ class QueryExpander:
                 search_engine=search_engine,
                 queries_dataset=expanded_queries,
                 top_k=top_k_results,
-                method=RetrievalMethod.HYBRID,
+                method=retrieval_method,
                 hybrid_strategy=HybridStrategy.SIMPLE_SUM,
                 use_mmr=False,
-                use_cross_encoder=False
+                use_cross_encoder=use_cross_encoder
             )
             
         elif combination_strategy == QueryCombinationStrategy.CONCATENATED_RERANKED:
@@ -310,7 +506,7 @@ class QueryExpander:
                 search_engine=search_engine,
                 queries_dataset=expanded_queries,
                 top_k=top_k_results,
-                method=RetrievalMethod.HYBRID,
+                method=retrieval_method,
                 hybrid_strategy=HybridStrategy.SIMPLE_SUM,
                 use_mmr=False,
                 use_cross_encoder=True  # Enable reranking
@@ -334,11 +530,23 @@ class QueryExpander:
             "combination_strategy": combination_strategy.value,
             "num_keywords": num_keywords,
             "expanded_results": expanded_formatted,
+            "config": {
+                "kw_method": kw_method,
+                "kw_num_keywords": kw_num_keywords,
+                "kw_diversity": kw_diversity,
+                "expansion_method": expansion_method.value,
+                "combination_strategy": combination_strategy.value,
+                "original_query_weight": original_query_weight,
+                "retrieval_method": retrieval_method.value if isinstance(retrieval_method, Enum) else str(retrieval_method),
+                "top_k": top_k_results,
+                "use_cross_encoder": use_cross_encoder
+            }
         }
         
         # Cache results
         try:
             logger.info(f"Caching expansion results to {cache_path}")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "wb") as f:
                 pickle.dump(result_data, f)
         except Exception as e:
@@ -352,11 +560,24 @@ class QueryExpander:
         corpus_dataset,
         qrels_dataset,
         expansion_configs: List[Dict],
+        # Keyword extraction parameters
+        kw_method: str = "keybert",
         num_keywords: int = 5,
-        top_n_docs_for_extraction: int = 10,
+        kw_diversity: float = 0.7,
+        kw_top_k_docs: int = 1000,
+        kw_top_n_docs_for_extraction: int = 10,
+        # Retrieval parameters
         top_k_results: int = 1000,
+        retrieval_method: RetrievalMethod = RetrievalMethod.HYBRID,
+        hybrid_strategy: HybridStrategy = HybridStrategy.SIMPLE_SUM,
+        use_mmr: bool = False,
+        use_cross_encoder: bool = False,
+        # Dataset parameters
+        dataset_name: str = "trec-covid",
+        # Force flags
         force_reindex: bool = False,
         force_regenerate_keywords: bool = False,
+        force_regenerate_baseline: bool = False,
         force_regenerate_expansion: bool = False,
         output_dir: str = "results/query_expansion"
     ) -> Dict:
@@ -368,11 +589,20 @@ class QueryExpander:
             corpus_dataset: Dataset containing corpus documents
             qrels_dataset: Dataset containing relevance judgments
             expansion_configs: List of expansion configurations to evaluate
+            kw_method: Keyword extraction method
             num_keywords: Number of keywords to extract per query
-            top_n_docs_for_extraction: Number of docs to use for keyword extraction
+            kw_diversity: Diversity for keyword extraction
+            kw_top_k_docs: Number of documents to retrieve for keyword extraction
+            kw_top_n_docs_for_extraction: Number of docs to use for keyword extraction
             top_k_results: Number of results to retrieve per query
+            retrieval_method: Method for document retrieval
+            hybrid_strategy: Strategy for hybrid retrieval
+            use_mmr: Whether to use MMR
+            use_cross_encoder: Whether to use cross-encoder (for baseline)
+            dataset_name: Name of the dataset for caching
             force_reindex: Whether to force rebuilding indices
             force_regenerate_keywords: Whether to force regenerating keywords
+            force_regenerate_baseline: Whether to force regenerating baseline
             force_regenerate_expansion: Whether to force regenerating expansion results
             output_dir: Directory for output files
             
@@ -385,6 +615,7 @@ class QueryExpander:
         # Load or build indices
         bm25, corpus_texts, corpus_ids, sbert_model, doc_embeddings = self._load_or_build_indices(
             corpus_dataset,
+            dataset_name=dataset_name,
             force_reindex=force_reindex
         )
         
@@ -399,71 +630,39 @@ class QueryExpander:
             cross_encoder_model_name=self.cross_encoder_model_name
         )
         
-        # Run baseline search with original queries
+        # Run baseline search
         logger.info("Running baseline search...")
-        baseline_cache_path = os.path.join(self.cache_dir, "baseline_results.pkl")
+        baseline_results = self.run_baseline_search(
+            queries_dataset=queries_dataset,
+            corpus_dataset=corpus_dataset,
+            search_engine=search_engine,
+            retrieval_method=retrieval_method,
+            hybrid_strategy=hybrid_strategy,
+            top_k=top_k_results,
+            use_mmr=use_mmr,
+            use_cross_encoder=use_cross_encoder,
+            force_regenerate=force_regenerate_baseline
+        )
         
-        # Try to load cached baseline results
-        baseline_results = None
-        if not force_regenerate_expansion and os.path.exists(baseline_cache_path):
-            try:
-                logger.info(f"Loading cached baseline results from {baseline_cache_path}")
-                with open(baseline_cache_path, "rb") as f:
-                    baseline_data = pickle.load(f)
-                    baseline_formatted = baseline_data.get("baseline_results", [])
-                    baseline_results = {item["query_id"]: item["results"] for item in baseline_formatted}
-            except Exception as e:
-                logger.warning(f"Error loading cached baseline results: {e}")
-        
-        # Run baseline search if not loaded from cache
-        if baseline_results is None:
-            baseline_results = run_search_for_multiple_queries(
-                search_engine=search_engine,
-                queries_dataset=queries_dataset,
-                top_k=top_k_results,
-                method=RetrievalMethod.HYBRID,
-                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
-                use_mmr=False,
-                use_cross_encoder=False
-            )
-            
-            # Format baseline results and cache them
-            query_id_to_text = {int(item["_id"]): item["text"] for item in queries_dataset}
-            baseline_formatted = []
-            for query_id, results in baseline_results.items():
-                baseline_formatted.append({
-                    "query_id": query_id,
-                    "query_text": query_id_to_text.get(query_id, ""),
-                    "results": results
-                })
-                
-            baseline_data = {
-                "baseline_results": baseline_formatted
-            }
-            
-            try:
-                with open(baseline_cache_path, "wb") as f:
-                    pickle.dump(baseline_data, f)
-            except Exception as e:
-                logger.warning(f"Error caching baseline results: {e}")
-        
-        # Initialize keyword extractor with the appropriate parameters
+        # Initialize keyword extractor
         keyword_extractor = KeywordExtractor(
             keybert_model=self.sbert_model_name,
             cache_dir=self.cache_dir,
-            top_k_docs=top_k_results,
-            top_n_docs_for_extraction=top_n_docs_for_extraction
+            top_k_docs=kw_top_k_docs,
+            top_n_docs_for_extraction=kw_top_n_docs_for_extraction
         )
         
-        # Extract keywords for all queries once
+        # Extract keywords for all queries
         logger.info("Extracting keywords for all queries...")
         all_query_keywords = keyword_extractor.extract_keywords_for_queries(
             queries_dataset=queries_dataset,
             corpus_dataset=corpus_dataset,
             num_keywords=num_keywords,
-            diversity=0.7,  # Default diversity parameter
+            diversity=kw_diversity,
             force_regenerate=force_regenerate_keywords,
-            force_reindex=force_reindex
+            sbert_model_name=self.sbert_model_name,
+            force_reindex=force_reindex,
+            dataset_name=dataset_name
         )
         
         # Track all results for visualization
@@ -495,10 +694,10 @@ class QueryExpander:
             baseline_viz_result = {
                 "config": {
                     "name": "Baseline",
-                    "method": RetrievalMethod.HYBRID.value,
-                    "hybrid_strategy": HybridStrategy.SIMPLE_SUM.value,
-                    "use_mmr": False,
-                    "use_cross_encoder": False
+                    "method": retrieval_method.value,
+                    "hybrid_strategy": hybrid_strategy.value,
+                    "use_mmr": use_mmr,
+                    "use_cross_encoder": use_cross_encoder
                 },
                 "avg_precisions": baseline_metrics["precisions"],
                 "avg_recalls": baseline_metrics["recalls"],
@@ -513,11 +712,6 @@ class QueryExpander:
             expansion_method = QueryExpansionMethod(config["expansion_method"])
             combination_strategy = QueryCombinationStrategy(config["combination_strategy"])
             
-            cache_path = os.path.join(
-                self.cache_dir, 
-                f"expanded_{expansion_method.value}_{combination_strategy.value}.pkl"
-            )
-            
             # Run expansion and search with pre-extracted keywords
             result_data = self.expand_queries(
                 queries_dataset=queries_dataset,
@@ -525,12 +719,16 @@ class QueryExpander:
                 baseline_results=baseline_results,
                 search_engine=search_engine,
                 query_keywords=all_query_keywords,
+                kw_method=kw_method,
+                kw_num_keywords=num_keywords,
+                kw_diversity=kw_diversity,
                 expansion_method=expansion_method,
                 combination_strategy=combination_strategy,
                 num_keywords=num_keywords,
                 top_k_results=top_k_results,
-                force_regenerate_expansion=force_regenerate_expansion,
-                cache_path=cache_path
+                retrieval_method=retrieval_method,
+                use_cross_encoder=combination_strategy == QueryCombinationStrategy.CONCATENATED_RERANKED,
+                force_regenerate_expansion=force_regenerate_expansion
             )
             
             # Add baseline metrics if available
@@ -567,9 +765,9 @@ class QueryExpander:
                 viz_result = {
                     "config": {
                         "name": config["name"],
-                        "method": RetrievalMethod.HYBRID.value,
-                        "hybrid_strategy": HybridStrategy.SIMPLE_SUM.value,
-                        "use_mmr": False,
+                        "method": retrieval_method.value,
+                        "hybrid_strategy": hybrid_strategy.value,
+                        "use_mmr": use_mmr,
                         "use_cross_encoder": combination_strategy == QueryCombinationStrategy.CONCATENATED_RERANKED,
                         "expansion_method": expansion_method.value,
                         "combination_strategy": combination_strategy.value
@@ -605,7 +803,9 @@ class QueryExpander:
             "visualization_results": all_visualization_results,
             "detailed_results": results_by_config,
             "output_file": output_file,
-            "plot_paths": plot_paths
+            "plot_paths": plot_paths,
+            "baseline_results": baseline_results,
+            "query_keywords": all_query_keywords
         }
 
 
@@ -613,16 +813,39 @@ def main():
     """Main function for query expansion evaluation"""
     from datasets import load_dataset
     
-    # Define constants for configuration
-    FORCE_REINDEX = False
-    FORCE_REGENERATE_KEYWORDS = False
-    FORCE_REGENERATE_EXPANSION = False
+    # ===== CACHING CONTROL FLAGS =====
+    FORCE_REINDEX = False                      # For search indices
+    FORCE_REGENERATE_KEYWORDS = False          # For keyword extraction
+    FORCE_REGENERATE_BASELINE = False          # For baseline search results
+    FORCE_REGENERATE_EXPANSION = False         # For expansion results
+    
+    # ===== DATASET PARAMETERS =====
+    DATASET_NAME = "trec-covid"
+    
+    # ===== KEYWORD EXTRACTION PARAMETERS =====
+    KW_METHOD = "keybert"
     NUM_KEYWORDS = 10
-    TOP_N_DOCS = 10
+    KW_DIVERSITY = 0.7
+    KW_TOP_K_DOCS = 1000
+    KW_TOP_N_DOCS = 10
+    
+    # ===== RETRIEVAL PARAMETERS =====
     TOP_K_RESULTS = 1000
+    RETRIEVAL_METHOD = RetrievalMethod.HYBRID
+    HYBRID_STRATEGY = HybridStrategy.SIMPLE_SUM
+    USE_MMR = False
+    USE_CROSS_ENCODER_BASELINE = False
+    MMR_LAMBDA = 0.5
+    HYBRID_WEIGHT = 0.5
+    
+    # ===== MODEL PARAMETERS =====
+    SBERT_MODEL = "all-mpnet-base-v2"
+    CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    
+    # ===== OTHER PARAMETERS =====
     OUTPUT_DIR = "results/query_expansion"
-    LOG_LEVEL = "INFO"
     CACHE_DIR = "cache"
+    LOG_LEVEL = "INFO"
     
     # Configure logging
     logging.basicConfig(
@@ -646,8 +869,8 @@ def main():
         preprocessor=preprocessor,
         index_manager=index_manager,
         cache_dir=CACHE_DIR,
-        sbert_model_name="all-mpnet-base-v2",
-        cross_encoder_model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"
+        sbert_model_name=SBERT_MODEL,
+        cross_encoder_model_name=CROSS_ENCODER_MODEL
     )
     
     # Define expansion configurations to evaluate
@@ -675,11 +898,20 @@ def main():
         corpus_dataset=corpus_dataset,
         qrels_dataset=qrels_dataset,
         expansion_configs=expansion_configs,
+        kw_method=KW_METHOD,
         num_keywords=NUM_KEYWORDS,
-        top_n_docs_for_extraction=TOP_N_DOCS,
+        kw_diversity=KW_DIVERSITY,
+        kw_top_k_docs=KW_TOP_K_DOCS,
+        kw_top_n_docs_for_extraction=KW_TOP_N_DOCS,
         top_k_results=TOP_K_RESULTS,
+        retrieval_method=RETRIEVAL_METHOD,
+        hybrid_strategy=HYBRID_STRATEGY,
+        use_mmr=USE_MMR,
+        use_cross_encoder=USE_CROSS_ENCODER_BASELINE,
+        dataset_name=DATASET_NAME,
         force_reindex=FORCE_REINDEX,
         force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS,
+        force_regenerate_baseline=FORCE_REGENERATE_BASELINE,
         force_regenerate_expansion=FORCE_REGENERATE_EXPANSION,
         output_dir=OUTPUT_DIR
     )
@@ -704,6 +936,12 @@ def main():
     
     if results["plot_paths"]:
         logger.info(f"Visualization plots saved to {os.path.dirname(results['plot_paths'][0])}")
+    
+    # Print cache structure info
+    logger.info(f"\n===== CACHE STRUCTURE =====")
+    logger.info(f"Keyword cache: cache/keywords/")
+    logger.info(f"Baseline cache: cache/retrieval/baseline/")
+    logger.info(f"Expansion cache: cache/retrieval/expanded/")
     
     return results
 

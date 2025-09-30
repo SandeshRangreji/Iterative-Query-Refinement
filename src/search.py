@@ -70,10 +70,28 @@ class IndexManager:
     def __init__(self, preprocessor: TextPreprocessor):
         self.preprocessor = preprocessor
     
+    def _generate_bm25_cache_path(self, dataset_name: str, b_param: float = 0.75, k1_param: float = 1.5, epsilon: float = 0.25, stemmer: str = "porter") -> str:
+        """Generate structured cache path for BM25 index"""
+        cache_dir = os.path.join("cache", "indices", "bm25")
+        filename = f"{dataset_name}_b{b_param}_k1-{k1_param}_eps{epsilon}_stem-{stemmer}.pkl"
+        return os.path.join(cache_dir, filename)
+    
+    def _generate_sbert_cache_path(self, model_name: str, dataset_name: str, batch_size: int = 64) -> str:
+        """Generate structured cache path for SBERT embeddings"""
+        # Clean model name for filesystem
+        clean_model_name = model_name.replace("/", "_").replace("-", "_")
+        cache_dir = os.path.join("cache", "indices", "embeddings", clean_model_name)
+        filename = f"{dataset_name}_batch{batch_size}.pt"
+        return os.path.join(cache_dir, filename)
+    
     def build_bm25_index(
         self,
         corpus_dataset,
-        cache_path: str = "cache/bm25_index.pkl",
+        dataset_name: str,
+        b_param: float = 0.75,
+        k1_param: float = 1.5,
+        epsilon: float = 0.25,
+        stemmer: str = "porter",
         force_reindex: bool = False
     ) -> Tuple[BM25Okapi, List[str], List[str]]:
         """
@@ -81,12 +99,19 @@ class IndexManager:
         
         Args:
             corpus_dataset: Dataset containing corpus documents
-            cache_path: Path to cache the built index
+            dataset_name: Name of the dataset for caching
+            b_param: BM25 b parameter (document length normalization)
+            k1_param: BM25 k1 parameter (term frequency saturation)
+            epsilon: BM25 epsilon parameter (score normalization)
+            stemmer: Stemmer to use ("porter", "none")
             force_reindex: Whether to force rebuilding the index
             
         Returns:
             Tuple of (BM25 index, corpus texts, corpus ids)
         """
+        # Generate cache path
+        cache_path = self._generate_bm25_cache_path(dataset_name, b_param, k1_param, epsilon, stemmer)
+        
         if (not force_reindex) and os.path.exists(cache_path):
             logger.info(f"Loading BM25 index from cache: {cache_path}")
             with open(cache_path, "rb") as f:
@@ -102,8 +127,9 @@ class IndexManager:
             corpus_ids.append(doc["_id"])
 
         tokenized_corpus = [self.preprocessor.preprocess_text(text) for text in corpus_texts]
-        # Allow for parameter tuning - b=0.5 has been found to work well for longer texts
-        bm25 = BM25Okapi(tokenized_corpus, b=0.5)  
+        
+        # Use exposed parameters with correct defaults
+        bm25 = BM25Okapi(tokenized_corpus, b=b_param, k1=k1_param, epsilon=epsilon)
 
         logger.info(f"Saving BM25 index to cache: {cache_path}")
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -115,9 +141,11 @@ class IndexManager:
     def build_sbert_index(
         self,
         corpus_texts: List[str],
+        dataset_name: str,
         model_name: str = "sentence-transformers/msmarco-MiniLM-L6-cos-v5",
         batch_size: int = 64,
-        cache_path: str = "cache/sbert_index.pt",
+        max_seq_length: Optional[int] = None,
+        normalize_embeddings: bool = True,
         force_reindex: bool = False,
         device: str = None
     ) -> Tuple[SentenceTransformer, torch.Tensor]:
@@ -127,8 +155,10 @@ class IndexManager:
         Args:
             corpus_texts: List of document texts
             model_name: Name of the sentence transformer model
+            dataset_name: Name of the dataset for caching
             batch_size: Batch size for encoding
-            cache_path: Path to cache the embeddings
+            max_seq_length: Maximum sequence length (None for model default)
+            normalize_embeddings: Whether to normalize embeddings
             force_reindex: Whether to force recomputing embeddings
             device: Device to use for encoding (None for auto-selection)
             
@@ -139,8 +169,15 @@ class IndexManager:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
         
+        # Generate cache path
+        cache_path = self._generate_sbert_cache_path(model_name, dataset_name, batch_size)
+        
         logger.info(f"Initializing SBERT model on {device}...")
         model = SentenceTransformer(model_name, device=device)
+        
+        # Set max sequence length if provided
+        if max_seq_length is not None:
+            model.max_seq_length = max_seq_length
 
         if (not force_reindex) and os.path.exists(cache_path):
             logger.info(f"Loading SBERT embeddings from cache: {cache_path}")
@@ -153,6 +190,7 @@ class IndexManager:
             corpus_texts, 
             batch_size=batch_size, 
             convert_to_tensor=True,
+            normalize_to_unit_sphere=normalize_embeddings,
             show_progress_bar=True
         )
         
@@ -727,10 +765,38 @@ def search_single_query(
 
 def main():
     """Main function to demonstrate search functionality"""
-    # Define constants
-    FORCE_REINDEX = False
+    
+    # ===== CACHING CONTROL FLAGS =====
+    FORCE_REINDEX_BM25 = False
+    FORCE_REINDEX_SBERT = False
+    FORCE_REGENERATE_SEARCH_RESULTS = False
+    FORCE_REGENERATE_EVALUATION = False
+    
+    # ===== DATASET PARAMETERS =====
+    DATASET_NAME = 'trec-covid'
+    
+    # ===== BM25 PARAMETERS =====
+    BM25_B_PARAM = 0.75         # Document length normalization (default)
+    BM25_K1_PARAM = 1.5         # Term frequency saturation (default)
+    BM25_EPSILON = 0.25         # Score normalization (default)
+    BM25_STEMMER = "porter"     # Stemming method
+    
+    # ===== SBERT PARAMETERS =====
     SBERT_MODEL = 'all-mpnet-base-v2'
+    SBERT_BATCH_SIZE = 64
+    SBERT_MAX_SEQ_LENGTH = None  # Use model default
+    SBERT_NORMALIZE = True
+    
+    # ===== SEARCH PARAMETERS =====
     CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+    TOP_K = 1000
+    HYBRID_WEIGHT = 0.5
+    MMR_LAMBDA = 0.5
+    
+    # ===== EVALUATION PARAMETERS =====
+    EVALUATION_TOP_K_P = 20     # Precision@k
+    EVALUATION_TOP_K_R = 1000   # Recall@k
+    
     LOG_LEVEL = 'INFO'
     
     # Configure logging
@@ -752,21 +818,27 @@ def main():
     preprocessor = TextPreprocessor()
     index_manager = IndexManager(preprocessor)
     
-    # Build indices
+    # Build indices with exposed parameters
     logger.info("Building BM25 index...")
     bm25, corpus_texts, corpus_ids = index_manager.build_bm25_index(
         corpus_dataset,
-        cache_path="cache/bm25_index.pkl",
-        force_reindex=FORCE_REINDEX
+        dataset_name=DATASET_NAME,
+        b_param=BM25_B_PARAM,
+        k1_param=BM25_K1_PARAM,
+        epsilon=BM25_EPSILON,
+        stemmer=BM25_STEMMER,
+        force_reindex=FORCE_REINDEX_BM25
     )
     
     logger.info("Building SBERT index...")
     sbert_model, doc_embeddings = index_manager.build_sbert_index(
         corpus_texts,
         model_name=SBERT_MODEL,
-        batch_size=64,
-        cache_path="cache/sbert_index.pt",
-        force_reindex=FORCE_REINDEX
+        dataset_name=DATASET_NAME,
+        batch_size=SBERT_BATCH_SIZE,
+        max_seq_length=SBERT_MAX_SEQ_LENGTH,
+        normalize_embeddings=SBERT_NORMALIZE,
+        force_reindex=FORCE_REINDEX_SBERT
     )
     
     # Initialize search engine with all indices and models
@@ -832,10 +904,12 @@ def main():
         query_results = run_search_for_multiple_queries(
             search_engine=search_engine,
             queries_dataset=queries_dataset,
-            top_k=1000,
+            top_k=TOP_K,
             method=method,
             hybrid_strategy=hybrid_strategy,
+            hybrid_weight=HYBRID_WEIGHT,
             use_mmr=use_mmr,
+            mmr_lambda=MMR_LAMBDA,
             use_cross_encoder=use_cross_encoder
         )
         
@@ -855,8 +929,8 @@ def main():
         avg_precisions, avg_recalls, num_evaluated = SearchEvaluationUtils.evaluate_results(
             results_by_query_id=query_results,
             qrels_dataset=qrels_dataset,
-            top_k_p=20,
-            top_k_r=1000
+            top_k_p=EVALUATION_TOP_K_P,
+            top_k_r=EVALUATION_TOP_K_R
         )
         
         # Get the corresponding config
@@ -901,8 +975,8 @@ def main():
     plots_dir = os.path.join(output_dir, "plots")
     plot_paths = visualize_all_results(
         results=evaluation_results,
-        top_k_p=20,
-        top_k_r=1000,
+        top_k_p=EVALUATION_TOP_K_P,
+        top_k_r=EVALUATION_TOP_K_R,
         output_dir=plots_dir
     )
     
