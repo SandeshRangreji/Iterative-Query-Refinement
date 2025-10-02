@@ -241,8 +241,34 @@ class EndToEndEvaluator:
 
         return result
 
+    def sample_full_corpus(self) -> Dict[str, Any]:
+        """Method 0: Full corpus (REFERENCE - Ground Truth)"""
+        logger.info(f"Method 0: Full corpus topic modeling (ALL {len(self.corpus_dataset)} docs)")
+
+        # Query-independent cache path
+        cache_filename = f"full_corpus_{self.dataset_name}_{self.embedding_model_name.replace('/', '_')}.pkl"
+        cache_path = os.path.join(self.cache_dir, "topic_models", cache_filename)
+
+        def compute():
+            # Extract all documents from corpus
+            docs = []
+            doc_ids = []
+
+            for doc in tqdm(self.corpus_dataset, desc="Extracting full corpus"):
+                docs.append(doc["title"] + "\n\n" + doc["text"])
+                doc_ids.append(doc["_id"])
+
+            return {
+                "method": "full_corpus",
+                "doc_ids": doc_ids,
+                "doc_texts": docs,
+                "sample_size": len(docs)
+            }
+
+        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+
     def sample_random_uniform(self) -> Dict[str, Any]:
-        """Method 1: Random uniform sampling (REFERENCE)"""
+        """Method 1: Random uniform sampling"""
         logger.info(f"Method 1: Random uniform sampling ({self.sample_size} docs)")
 
         cache_path = os.path.join(self.samples_dir, "method1_random_uniform.pkl")
@@ -438,11 +464,31 @@ class EndToEndEvaluator:
 
             # Initialize SentenceTransformer with explicit device
             from sentence_transformers import SentenceTransformer
+            from hdbscan import HDBSCAN
+            from sklearn.feature_extraction.text import CountVectorizer
             embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
-            # Initialize BERTopic with pre-loaded embedding model
+            # Initialize HDBSCAN with fixed min_cluster_size for consistency
+            hdbscan_model = HDBSCAN(
+                min_cluster_size=5,
+                metric='euclidean',
+                cluster_selection_method='eom',
+                prediction_data=True
+            )
+
+            # Configure CountVectorizer to remove stopwords and filter short words
+            vectorizer_model = CountVectorizer(
+                stop_words='english',
+                min_df=2,  # Minimum document frequency
+                ngram_range=(1, 2),  # Unigrams and bigrams
+                max_features=10000  # Limit vocabulary size
+            )
+
+            # Initialize BERTopic with pre-loaded embedding model and fixed parameters
             topic_model = BERTopic(
                 embedding_model=embedding_model,
+                hdbscan_model=hdbscan_model,
+                vectorizer_model=vectorizer_model,
                 verbose=True,
                 calculate_probabilities=True
             )
@@ -500,6 +546,11 @@ class EndToEndEvaluator:
         # Topic-level metrics (Priority 1)
         metrics.update(self._compute_topic_level_metrics(reference_results, sample_results))
 
+        # Normalized metrics (account for sample size differences)
+        metrics.update(self._compute_normalized_metrics(
+            reference_results, sample_results, reference_sample, sample_sample
+        ))
+
         # Document distribution metrics (Priority 2)
         metrics.update(self._compute_document_distribution_metrics(sample_results))
 
@@ -554,6 +605,41 @@ class EndToEndEvaluator:
             metrics[f"topic_precision_@{threshold_str}"] = precision
             metrics[f"topic_recall_@{threshold_str}"] = recall
             metrics[f"topic_f1_@{threshold_str}"] = f1
+
+        return metrics
+
+    def _compute_normalized_metrics(
+        self,
+        reference_results: Dict[str, Any],
+        sample_results: Dict[str, Any],
+        reference_sample: Dict[str, Any],
+        sample_sample: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Compute normalized metrics that account for sample size differences"""
+
+        ref_n_docs = reference_sample["sample_size"]
+        sample_n_docs = sample_sample["sample_size"]
+
+        ref_n_topics = len(reference_results["topic_words"])
+        sample_n_topics = len(sample_results["topic_words"])
+
+        metrics = {}
+
+        # Topic density: topics per 100 documents
+        metrics["topic_density_reference"] = (ref_n_topics / ref_n_docs * 100) if ref_n_docs > 0 else 0.0
+        metrics["topic_density_sample"] = (sample_n_topics / sample_n_docs * 100) if sample_n_docs > 0 else 0.0
+
+        # Topic density ratio: how well sample preserves topic density
+        if metrics["topic_density_reference"] > 0:
+            metrics["topic_density_ratio"] = metrics["topic_density_sample"] / metrics["topic_density_reference"]
+        else:
+            metrics["topic_density_ratio"] = 0.0
+
+        # Coverage ratio: percentage of reference topics captured
+        if ref_n_topics > 0:
+            metrics["topic_coverage_ratio"] = sample_n_topics / ref_n_topics
+        else:
+            metrics["topic_coverage_ratio"] = 0.0
 
         return metrics
 
@@ -743,6 +829,10 @@ class EndToEndEvaluator:
             "topic_diversity_sample": "Topic Diversity",
             "topic_word_overlap_mean": "Word Overlap (mean)",
             "topic_semantic_similarity_mean": "Semantic Similarity (mean)",
+            # Normalized metrics
+            "topic_density_sample": "Topic Density (per 100 docs)",
+            "topic_density_ratio": "Topic Density Ratio",
+            "topic_coverage_ratio": "Topic Coverage Ratio",
             # Precision/Recall/F1 at multiple thresholds
             "topic_precision_@05": "Precision @0.5",
             "topic_recall_@05": "Recall @0.5",
@@ -915,6 +1005,7 @@ class EndToEndEvaluator:
         logger.info("="*80)
 
         samples = {}
+        samples["full_corpus"] = self.sample_full_corpus()
         samples["random_uniform"] = self.sample_random_uniform()
         samples["direct_retrieval"] = self.sample_direct_retrieval()
         samples["query_expansion"] = self.sample_query_expansion()
@@ -938,8 +1029,8 @@ class EndToEndEvaluator:
         logger.info("STEP 3: Computing Evaluation Metrics")
         logger.info("="*80)
 
-        # Use random_uniform as reference
-        reference_name = "random_uniform"
+        # Use full_corpus as reference (ground truth)
+        reference_name = "full_corpus"
         reference_results = topic_results[reference_name]
         reference_sample = samples[reference_name]
 
