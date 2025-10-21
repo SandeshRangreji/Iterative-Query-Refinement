@@ -1,14 +1,48 @@
 # end_to_end_evaluation.py
 """
-End-to-end evaluation of BERTopic using different sampling strategies.
+End-to-end evaluation of BERTopic using different sampling strategies with pairwise comparisons.
 
 Compares 4 methods:
-1. Random Uniform Sampling (REFERENCE)
-2. Direct Retrieval
+1. Random Uniform Sampling
+2. Direct Retrieval (Hybrid BM25+SBERT)
 3. Query Expansion + Retrieval
-4. QRELs Labeled Set
+4. Simple Keyword Search (BM25 only)
 
-Evaluates topic quality using topic-level and document-level metrics.
+METRICS IMPLEMENTED:
+
+Intrinsic Quality Metrics (Per-Method):
+- NPMI Coherence: Semantic coherence of topic words based on co-occurrence
+- Embedding Coherence: Average pairwise cosine similarity of word embeddings within topics
+- Semantic Diversity: Average pairwise distance between topics (embedding-based)
+- Lexical Diversity: Unique word fraction across all topics (vocabulary redundancy)
+- Document Coverage: Fraction of documents assigned to topics (1 - outlier_ratio)
+- Number of Topics: Total topics discovered
+- Average Topic Size: Mean documents per topic
+
+Query Alignment Metrics (Per-Method):
+- Topic-Query Similarity (Avg): Average similarity between all topics and the query
+- Max Query Similarity: Highest topic-query similarity score
+- Query-Relevant Ratio: Fraction of topics above similarity threshold (0.5)
+- Top-3 Avg Similarity: Average similarity of top-3 most query-relevant topics
+
+Pairwise Comparison Metrics:
+- Topic Word Overlap (Jaccard): Lexical overlap between matched topics
+- Topic Semantic Similarity: Embedding-based similarity between matched topics
+- Precision @ thresholds (0.5, 0.6, 0.7): What fraction of B's topics match A's topics
+- Recall @ thresholds (0.5, 0.6, 0.7): What fraction of A's topics match B's topics
+- F1 @ thresholds (0.5, 0.6, 0.7): Topic matching quality at different thresholds
+- NPMI Coherence Difference: Difference in coherence between methods
+- Embedding Coherence Difference: Difference in embedding coherence
+- Semantic Diversity Difference: Difference in semantic diversity
+- Lexical Diversity Difference: Difference in lexical diversity
+- ARI (Adjusted Rand Index): Agreement on document clustering (overlap only)
+- NMI (Normalized Mutual Information): Shared clustering information (overlap only)
+
+Visualizations Generated:
+1. intrinsic_quality_metrics.png: 3x2 grid of NPMI, Embedding Coherence, Semantic/Lexical Diversity, Coverage, Topic Count
+2. query_alignment_metrics.png: 1x3 grid of Avg/Max/Ratio query similarity metrics
+3. diversity_scatter.png: Semantic vs Lexical diversity scatter plot
+4. Pairwise heatmaps (14 plots): Similarity, Overlap, F1 @0.5/0.6/0.7, Precision @0.5/0.6/0.7, Recall @0.5/0.6/0.7, NPMI diff, Embedding diff, ARI
 """
 
 import os
@@ -27,6 +61,8 @@ from collections import defaultdict
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+from sklearn.metrics.pairwise import cosine_similarity
+from itertools import combinations
 
 # BERTopic imports
 from bertopic import BERTopic
@@ -39,10 +75,6 @@ from search import (
     SearchEngine,
     RetrievalMethod,
     HybridStrategy
-)
-from query_expansion import (
-    QueryExpander,
-    QueryCombinationStrategy
 )
 from evaluation import SearchEvaluationUtils
 
@@ -59,7 +91,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 
 class EndToEndEvaluator:
-    """End-to-end evaluator for topic modeling with different sampling strategies"""
+    """End-to-end evaluator for topic modeling with pairwise method comparisons"""
 
     def __init__(
         self,
@@ -71,7 +103,7 @@ class EndToEndEvaluator:
         embedding_model_name: str = "all-mpnet-base-v2",
         cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         dataset_name: str = "trec-covid",
-        output_dir: str = "results/end_to_end_evaluation",
+        output_dir: str = "results/topic_evaluation",
         cache_dir: str = "cache",
         random_seed: int = 42,
         device: str = "cpu",
@@ -128,14 +160,16 @@ class EndToEndEvaluator:
         else:
             self.sample_size = sample_size
 
-        # Create output directories
+        # Create output directories (new unified structure)
         self.output_dir = os.path.join(output_dir, f"query_{query_id}")
         self.samples_dir = os.path.join(self.output_dir, "samples")
         self.topic_models_dir = os.path.join(self.output_dir, "topic_models")
-        self.evaluation_dir = os.path.join(self.output_dir, "evaluation")
-        self.plots_dir = os.path.join(self.evaluation_dir, "plots")
+        self.results_dir = os.path.join(self.output_dir, "results")
+        self.plots_dir = os.path.join(self.results_dir, "plots")
+        self.topics_summary_dir = os.path.join(self.results_dir, "topics_summary")
 
-        for directory in [self.samples_dir, self.topic_models_dir, self.evaluation_dir, self.plots_dir]:
+        for directory in [self.samples_dir, self.topic_models_dir, self.results_dir,
+                          self.plots_dir, self.topics_summary_dir]:
             os.makedirs(directory, exist_ok=True)
 
         # Save configuration
@@ -241,37 +275,11 @@ class EndToEndEvaluator:
 
         return result
 
-    def sample_full_corpus(self) -> Dict[str, Any]:
-        """Method 0: Full corpus (REFERENCE - Ground Truth)"""
-        logger.info(f"Method 0: Full corpus topic modeling (ALL {len(self.corpus_dataset)} docs)")
-
-        # Query-independent cache path
-        cache_filename = f"full_corpus_{self.dataset_name}_{self.embedding_model_name.replace('/', '_')}.pkl"
-        cache_path = os.path.join(self.cache_dir, "topic_models", cache_filename)
-
-        def compute():
-            # Extract all documents from corpus
-            docs = []
-            doc_ids = []
-
-            for doc in tqdm(self.corpus_dataset, desc="Extracting full corpus"):
-                docs.append(doc["title"] + "\n\n" + doc["text"])
-                doc_ids.append(doc["_id"])
-
-            return {
-                "method": "full_corpus",
-                "doc_ids": doc_ids,
-                "doc_texts": docs,
-                "sample_size": len(docs)
-            }
-
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
-
     def sample_random_uniform(self) -> Dict[str, Any]:
         """Method 1: Random uniform sampling"""
         logger.info(f"Method 1: Random uniform sampling ({self.sample_size} docs)")
 
-        cache_path = os.path.join(self.samples_dir, "method1_random_uniform.pkl")
+        cache_path = os.path.join(self.samples_dir, "random_uniform.pkl")
 
         def compute():
             # Pure random sampling
@@ -295,10 +303,10 @@ class EndToEndEvaluator:
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
     def sample_direct_retrieval(self) -> Dict[str, Any]:
-        """Method 2: Direct retrieval"""
+        """Method 2: Direct retrieval (Hybrid BM25+SBERT)"""
         logger.info(f"Method 2: Direct retrieval ({self.sample_size} docs)")
 
-        cache_path = os.path.join(self.samples_dir, "method2_direct_retrieval.pkl")
+        cache_path = os.path.join(self.samples_dir, "direct_retrieval.pkl")
 
         def compute():
             # Perform hybrid search
@@ -331,7 +339,7 @@ class EndToEndEvaluator:
         """Method 3: Query expansion + retrieval"""
         logger.info(f"Method 3: Query expansion + retrieval ({self.sample_size} docs)")
 
-        cache_path = os.path.join(self.samples_dir, "method3_query_expansion.pkl")
+        cache_path = os.path.join(self.samples_dir, "query_expansion.pkl")
 
         def compute():
             # Load cached keywords
@@ -398,38 +406,34 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
-    def sample_qrels_labeled(self) -> Dict[str, Any]:
-        """Method 4: QRELs labeled set"""
-        logger.info(f"Method 4: QRELs labeled set")
+    def sample_keyword_search(self) -> Dict[str, Any]:
+        """Method 4: Simple keyword search (BM25 only)"""
+        logger.info(f"Method 4: Simple keyword search ({self.sample_size} docs)")
 
-        cache_path = os.path.join(self.samples_dir, "method4_qrels_labeled.pkl")
+        cache_path = os.path.join(self.samples_dir, "keyword_search.pkl")
 
         def compute():
-            # Get labeled doc IDs from qrels
-            _, _, overall_relevant = SearchEvaluationUtils.build_qrels_dicts(self.qrels_dataset)
-            query_id_int = int(self.query_id)
-            labeled_doc_ids = overall_relevant[query_id_int]
+            # Perform BM25-only search
+            results = self.search_engine.search(
+                query=self.query_text,
+                top_k=self.sample_size,
+                method=RetrievalMethod.BM25,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
 
-            # Extract documents from corpus
-            docs = []
-            doc_ids = []
+            doc_ids = [doc_id for doc_id, _ in results]
+            doc_texts = []
 
-            for doc in tqdm(self.corpus_dataset, desc="Extracting labeled docs"):
-                if doc["_id"] in labeled_doc_ids:
-                    docs.append(doc["title"] + "\n\n" + doc["text"])
-                    doc_ids.append(doc["_id"])
-
-            # Check for missing documents
-            missing = labeled_doc_ids - set(doc_ids)
-            if missing:
-                logger.warning(f"Query {self.query_id}: {len(missing)} labeled docs not found in corpus. Using {len(doc_ids)} docs.")
+            for doc_id in tqdm(doc_ids, desc="Extracting keyword search docs"):
+                doc_text = self.search_engine.get_document_by_id(doc_id)
+                doc_texts.append(doc_text)
 
             return {
-                "method": "qrels_labeled",
+                "method": "keyword_search",
                 "doc_ids": doc_ids,
-                "doc_texts": docs,
-                "sample_size": len(docs),
-                "missing_docs": len(missing)
+                "doc_texts": doc_texts,
+                "sample_size": len(doc_ids)
             }
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
@@ -500,12 +504,32 @@ class EndToEndEvaluator:
             # Get topic info
             topic_info = topic_model.get_topic_info()
 
-            # Get topic representations
+            # Get topic representations with scores
             topic_words = {}
+            topic_words_with_scores = {}
+            topic_labels = {}
+
             for topic_id in topic_info['Topic']:
                 if topic_id != -1:  # Skip outlier topic
                     words = topic_model.get_topic(topic_id)
                     topic_words[topic_id] = [word for word, _ in words]
+                    topic_words_with_scores[topic_id] = [(word, float(score)) for word, score in words]
+
+                    # Generate readable topic label from top words
+                    top_words = "_".join([word for word, _ in words[:3]])
+                    topic_labels[topic_id] = top_words
+
+            # Get topic names from BERTopic (auto-generated labels)
+            topic_names = {}
+            for topic_id in topic_info['Topic']:
+                if topic_id != -1:
+                    # BERTopic stores names in topic_info
+                    topic_row = topic_info[topic_info['Topic'] == topic_id]
+                    if not topic_row.empty and 'Name' in topic_row.columns:
+                        topic_names[topic_id] = topic_row['Name'].values[0]
+                    else:
+                        # Fallback to label we created
+                        topic_names[topic_id] = topic_labels.get(topic_id, f"Topic_{topic_id}")
 
             # Save model
             topic_model.save(model_cache_path, serialization="pickle")
@@ -522,6 +546,9 @@ class EndToEndEvaluator:
                 "probabilities": probs_list,
                 "topic_info": topic_info.to_dict(),
                 "topic_words": topic_words,
+                "topic_words_with_scores": topic_words_with_scores,
+                "topic_labels": topic_labels,
+                "topic_names": topic_names,
                 "n_topics": len(topic_words),
                 "n_docs": len(docs)
             }
@@ -530,469 +557,969 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(results_cache_path, compute, self.force_regenerate_topics)
 
-    def evaluate_all(
+    def compute_pairwise_metrics(
         self,
-        reference_results: Dict[str, Any],
-        sample_results: Dict[str, Any],
-        reference_sample: Dict[str, Any],
-        sample_sample: Dict[str, Any]
+        method_a: str,
+        method_b: str,
+        results_a: Dict[str, Any],
+        results_b: Dict[str, Any],
+        sample_a: Dict[str, Any],
+        sample_b: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Evaluate a sample against reference"""
+        """
+        Compute all metrics for a pair of methods
 
-        logger.info(f"Evaluating {sample_results['method']} against reference")
+        Args:
+            method_a: First method name
+            method_b: Second method name
+            results_a: Topic results for method A
+            results_b: Topic results for method B
+            sample_a: Sample for method A
+            sample_b: Sample for method B
 
-        metrics = {}
-
-        # Topic-level metrics (Priority 1)
-        metrics.update(self._compute_topic_level_metrics(reference_results, sample_results))
-
-        # Normalized metrics (account for sample size differences)
-        metrics.update(self._compute_normalized_metrics(
-            reference_results, sample_results, reference_sample, sample_sample
-        ))
-
-        # Document distribution metrics (Priority 2)
-        metrics.update(self._compute_document_distribution_metrics(sample_results))
-
-        # Document clustering metrics (Priority 3) - only if overlap exists
-        metrics.update(self._compute_document_clustering_metrics(
-            reference_results, sample_results, reference_sample, sample_sample
-        ))
-
-        return metrics
-
-    def _compute_topic_level_metrics(
-        self,
-        reference_results: Dict[str, Any],
-        sample_results: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Compute topic-level comparison metrics"""
-
-        ref_topic_words = reference_results["topic_words"]
-        sample_topic_words = sample_results["topic_words"]
-
+        Returns:
+            Dictionary of pairwise metrics
+        """
         metrics = {
-            "topic_coverage_reference": len(ref_topic_words),
-            "topic_coverage_sample": len(sample_topic_words),
+            "method_a": method_a,
+            "method_b": method_b,
         }
 
-        # Topic diversity (average pairwise distance)
-        metrics["topic_diversity_reference"] = self._compute_topic_diversity(ref_topic_words)
-        metrics["topic_diversity_sample"] = self._compute_topic_diversity(sample_topic_words)
+        # Extract topic information
+        topics_a = results_a["topic_words"]
+        topics_b = results_b["topic_words"]
 
-        # Topic matching using semantic similarity
-        word_overlap_scores, semantic_sim_scores = self._match_topics(
-            ref_topic_words, sample_topic_words, top_n=10
-        )
+        # Topic coverage comparison
+        metrics["n_topics_a"] = len(topics_a)
+        metrics["n_topics_b"] = len(topics_b)
+        metrics["topic_count_ratio"] = len(topics_a) / len(topics_b) if len(topics_b) > 0 else 0.0
 
-        metrics["topic_word_overlap_mean"] = float(np.mean(word_overlap_scores)) if word_overlap_scores else 0.0
-        metrics["topic_word_overlap_std"] = float(np.std(word_overlap_scores)) if word_overlap_scores else 0.0
-        metrics["topic_semantic_similarity_mean"] = float(np.mean(semantic_sim_scores)) if semantic_sim_scores else 0.0
-        metrics["topic_semantic_similarity_std"] = float(np.std(semantic_sim_scores)) if semantic_sim_scores else 0.0
+        # Topic diversity comparison (semantic and lexical)
+        diversity_semantic_a = self._compute_topic_diversity_semantic(topics_a)
+        diversity_semantic_b = self._compute_topic_diversity_semantic(topics_b)
+        metrics["diversity_semantic_a"] = diversity_semantic_a
+        metrics["diversity_semantic_b"] = diversity_semantic_b
+        metrics["diversity_semantic_diff"] = diversity_semantic_a - diversity_semantic_b
 
-        # Topic precision, recall, F1 at multiple thresholds
-        thresholds = [0.5, 0.6, 0.7]
+        diversity_lexical_a = self._compute_topic_diversity_lexical(topics_a)
+        diversity_lexical_b = self._compute_topic_diversity_lexical(topics_b)
+        metrics["diversity_lexical_a"] = diversity_lexical_a
+        metrics["diversity_lexical_b"] = diversity_lexical_b
+        metrics["diversity_lexical_diff"] = diversity_lexical_a - diversity_lexical_b
 
-        for threshold in thresholds:
-            matched_topics = sum(1 for score in semantic_sim_scores if score >= threshold)
+        # Intrinsic quality metrics
+        # NPMI Coherence
+        npmi_a = self._compute_npmi_coherence(topics_a, sample_a["doc_texts"])
+        npmi_b = self._compute_npmi_coherence(topics_b, sample_b["doc_texts"])
+        metrics["npmi_coherence_a"] = npmi_a
+        metrics["npmi_coherence_b"] = npmi_b
+        metrics["npmi_coherence_diff"] = npmi_a - npmi_b
 
-            precision = matched_topics / len(sample_topic_words) if len(sample_topic_words) > 0 else 0.0
-            recall = matched_topics / len(ref_topic_words) if len(ref_topic_words) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        # Embedding Coherence
+        emb_coh_a = self._compute_embedding_coherence(topics_a)
+        emb_coh_b = self._compute_embedding_coherence(topics_b)
+        metrics["embedding_coherence_a"] = emb_coh_a
+        metrics["embedding_coherence_b"] = emb_coh_b
+        metrics["embedding_coherence_diff"] = emb_coh_a - emb_coh_b
 
-            # Store with threshold suffix
-            threshold_str = str(threshold).replace('.', '')
-            metrics[f"topic_precision_@{threshold_str}"] = precision
-            metrics[f"topic_recall_@{threshold_str}"] = recall
-            metrics[f"topic_f1_@{threshold_str}"] = f1
+        # Per-topic query alignment metrics
+        alignment_a = self._compute_per_topic_query_alignment(results_a)
+        alignment_b = self._compute_per_topic_query_alignment(results_b)
+        metrics["max_query_similarity_a"] = alignment_a["max_query_similarity"]
+        metrics["max_query_similarity_b"] = alignment_b["max_query_similarity"]
+        metrics["query_relevant_ratio_a"] = alignment_a["query_relevant_ratio"]
+        metrics["query_relevant_ratio_b"] = alignment_b["query_relevant_ratio"]
+        metrics["top3_avg_similarity_a"] = alignment_a["top3_avg_similarity"]
+        metrics["top3_avg_similarity_b"] = alignment_b["top3_avg_similarity"]
+
+        # Topic matching using Hungarian algorithm
+        word_overlaps, semantic_sims = self._match_topics(topics_a, topics_b)
+
+        if word_overlaps and semantic_sims:
+            metrics["topic_word_overlap_mean"] = float(np.mean(word_overlaps))
+            metrics["topic_word_overlap_std"] = float(np.std(word_overlaps))
+            metrics["topic_semantic_similarity_mean"] = float(np.mean(semantic_sims))
+            metrics["topic_semantic_similarity_std"] = float(np.std(semantic_sims))
+
+            # Topic matching at different thresholds
+            for threshold in [0.5, 0.6, 0.7]:
+                matched = sum(1 for s in semantic_sims if s >= threshold)
+
+                # Precision: how many of B's topics match A's topics
+                precision_b = matched / len(topics_b) if len(topics_b) > 0 else 0.0
+                # Recall: how many of A's topics match B's topics
+                recall_a = matched / len(topics_a) if len(topics_a) > 0 else 0.0
+                # F1
+                f1 = 2 * precision_b * recall_a / (precision_b + recall_a) if (precision_b + recall_a) > 0 else 0.0
+
+                threshold_str = str(threshold).replace('.', '')
+                metrics[f"precision_b_@{threshold_str}"] = precision_b
+                metrics[f"recall_a_@{threshold_str}"] = recall_a
+                metrics[f"f1_@{threshold_str}"] = f1
+        else:
+            # No topics to compare
+            metrics["topic_word_overlap_mean"] = 0.0
+            metrics["topic_word_overlap_std"] = 0.0
+            metrics["topic_semantic_similarity_mean"] = 0.0
+            metrics["topic_semantic_similarity_std"] = 0.0
+            for threshold in [0.5, 0.6, 0.7]:
+                threshold_str = str(threshold).replace('.', '')
+                metrics[f"precision_b_@{threshold_str}"] = 0.0
+                metrics[f"recall_a_@{threshold_str}"] = 0.0
+                metrics[f"f1_@{threshold_str}"] = 0.0
+
+        # Topic-Query similarity for both methods
+        metrics["topic_query_similarity_a"] = self._compute_topic_query_similarity(results_a)
+        metrics["topic_query_similarity_b"] = self._compute_topic_query_similarity(results_b)
+        metrics["topic_query_similarity_diff"] = metrics["topic_query_similarity_a"] - metrics["topic_query_similarity_b"]
+
+        # Document distribution comparison
+        outlier_a = np.sum(np.array(results_a["topics"]) == -1) / len(results_a["topics"])
+        outlier_b = np.sum(np.array(results_b["topics"]) == -1) / len(results_b["topics"])
+        metrics["outlier_ratio_a"] = float(outlier_a)
+        metrics["outlier_ratio_b"] = float(outlier_b)
+        metrics["outlier_ratio_diff"] = float(outlier_a - outlier_b)
+
+        # Average topic size comparison
+        topics_arr_a = np.array(results_a["topics"])
+        topics_arr_b = np.array(results_b["topics"])
+
+        unique_a, counts_a = np.unique(topics_arr_a[topics_arr_a != -1], return_counts=True)
+        unique_b, counts_b = np.unique(topics_arr_b[topics_arr_b != -1], return_counts=True)
+
+        avg_size_a = float(np.mean(counts_a)) if len(counts_a) > 0 else 0.0
+        avg_size_b = float(np.mean(counts_b)) if len(counts_b) > 0 else 0.0
+
+        metrics["avg_topic_size_a"] = avg_size_a
+        metrics["avg_topic_size_b"] = avg_size_b
+        metrics["avg_topic_size_diff"] = avg_size_a - avg_size_b
+
+        # Document-level clustering metrics (if overlap exists)
+        doc_ids_a = set(sample_a["doc_ids"])
+        doc_ids_b = set(sample_b["doc_ids"])
+        overlap = doc_ids_a & doc_ids_b
+
+        metrics["overlap_count"] = len(overlap)
+        metrics["overlap_percent_a"] = len(overlap) / len(doc_ids_a) * 100 if len(doc_ids_a) > 0 else 0.0
+        metrics["overlap_percent_b"] = len(overlap) / len(doc_ids_b) * 100 if len(doc_ids_b) > 0 else 0.0
+
+        if len(overlap) >= 2:
+            doc_to_idx_a = {doc_id: i for i, doc_id in enumerate(sample_a["doc_ids"])}
+            doc_to_idx_b = {doc_id: i for i, doc_id in enumerate(sample_b["doc_ids"])}
+
+            topics_overlap_a = [results_a["topics"][doc_to_idx_a[doc_id]] for doc_id in overlap]
+            topics_overlap_b = [results_b["topics"][doc_to_idx_b[doc_id]] for doc_id in overlap]
+
+            try:
+                ari = adjusted_rand_score(topics_overlap_a, topics_overlap_b)
+                nmi = normalized_mutual_info_score(topics_overlap_a, topics_overlap_b)
+                metrics["ari"] = float(ari)
+                metrics["nmi"] = float(nmi)
+            except:
+                metrics["ari"] = None
+                metrics["nmi"] = None
+        else:
+            metrics["ari"] = None
+            metrics["nmi"] = None
 
         return metrics
 
-    def _compute_normalized_metrics(
-        self,
-        reference_results: Dict[str, Any],
-        sample_results: Dict[str, Any],
-        reference_sample: Dict[str, Any],
-        sample_sample: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Compute normalized metrics that account for sample size differences"""
+    def _compute_topic_diversity_semantic(self, topic_words: Dict[int, List[str]]) -> float:
+        """
+        Compute semantic diversity: average pairwise distance between topics in embedding space
 
-        ref_n_docs = reference_sample["sample_size"]
-        sample_n_docs = sample_sample["sample_size"]
+        Higher values indicate topics are more semantically distinct from each other.
 
-        ref_n_topics = len(reference_results["topic_words"])
-        sample_n_topics = len(sample_results["topic_words"])
+        Args:
+            topic_words: Dictionary mapping topic IDs to lists of words
 
-        metrics = {}
-
-        # Topic density: topics per 100 documents
-        metrics["topic_density_reference"] = (ref_n_topics / ref_n_docs * 100) if ref_n_docs > 0 else 0.0
-        metrics["topic_density_sample"] = (sample_n_topics / sample_n_docs * 100) if sample_n_docs > 0 else 0.0
-
-        # Topic density ratio: how well sample preserves topic density
-        if metrics["topic_density_reference"] > 0:
-            metrics["topic_density_ratio"] = metrics["topic_density_sample"] / metrics["topic_density_reference"]
-        else:
-            metrics["topic_density_ratio"] = 0.0
-
-        # Coverage ratio: percentage of reference topics captured
-        if ref_n_topics > 0:
-            metrics["topic_coverage_ratio"] = sample_n_topics / ref_n_topics
-        else:
-            metrics["topic_coverage_ratio"] = 0.0
-
-        return metrics
-
-    def _compute_topic_diversity(self, topic_words: Dict[int, List[str]]) -> float:
-        """Compute average pairwise distance between topics"""
+        Returns:
+            Average pairwise semantic distance (0-1, higher = more diverse)
+        """
         if len(topic_words) < 2:
             return 0.0
 
-        # Get embeddings for topic words
-        embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Load embedding model
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
+        # Get embeddings for topics
         topic_embeddings = []
         for topic_id, words in topic_words.items():
-            # Use top 5 words for topic representation
             top_words = " ".join(words[:5])
-            embedding = embedding_model.encode(top_words, convert_to_tensor=False)
+            embedding = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
             topic_embeddings.append(embedding)
 
         topic_embeddings = np.array(topic_embeddings)
 
-        # Compute pairwise cosine distances
-        from sklearn.metrics.pairwise import cosine_similarity
+        # Compute pairwise distances
         similarities = cosine_similarity(topic_embeddings)
-
-        # Get upper triangle (excluding diagonal)
         n = len(topic_embeddings)
         distances = 1 - similarities
         upper_triangle = distances[np.triu_indices(n, k=1)]
 
         return float(np.mean(upper_triangle))
 
+    def _compute_topic_diversity_lexical(self, topic_words: Dict[int, List[str]], top_k: int = 10) -> float:
+        """
+        Compute lexical diversity: unique word fraction across all topics
+
+        Measures vocabulary redundancy. Higher values indicate less word overlap across topics.
+
+        Args:
+            topic_words: Dictionary mapping topic IDs to lists of words
+            top_k: Number of top words to consider per topic
+
+        Returns:
+            Ratio of unique words to total words (0-1, higher = less redundancy)
+        """
+        if not topic_words:
+            return 0.0
+
+        unique_words = set()
+        total_words = 0
+
+        for topic_id, words in topic_words.items():
+            unique_words.update(words[:top_k])
+            total_words += min(len(words), top_k)
+
+        return len(unique_words) / total_words if total_words > 0 else 0.0
+
     def _match_topics(
         self,
-        ref_topic_words: Dict[int, List[str]],
-        sample_topic_words: Dict[int, List[str]],
+        topics_a: Dict[int, List[str]],
+        topics_b: Dict[int, List[str]],
         top_n: int = 10
     ) -> Tuple[List[float], List[float]]:
-        """Match topics using Hungarian algorithm and compute similarities"""
-
-        if not ref_topic_words or not sample_topic_words:
+        """Match topics using Hungarian algorithm"""
+        if not topics_a or not topics_b:
             return [], []
 
-        # Get embeddings for all topics
-        embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Load embedding model
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
-        ref_topics = list(ref_topic_words.keys())
-        sample_topics = list(sample_topic_words.keys())
+        # Get topic IDs
+        topic_ids_a = list(topics_a.keys())
+        topic_ids_b = list(topics_b.keys())
 
-        # Compute semantic similarity matrix
-        ref_embeddings = []
-        for topic_id in ref_topics:
-            words = " ".join(ref_topic_words[topic_id][:top_n])
-            emb = embedding_model.encode(words, convert_to_tensor=False)
-            ref_embeddings.append(emb)
+        # Compute embeddings
+        embeddings_a = []
+        for topic_id in topic_ids_a:
+            words = " ".join(topics_a[topic_id][:top_n])
+            emb = model.encode(words, convert_to_tensor=False, show_progress_bar=False)
+            embeddings_a.append(emb)
 
-        sample_embeddings = []
-        for topic_id in sample_topics:
-            words = " ".join(sample_topic_words[topic_id][:top_n])
-            emb = embedding_model.encode(words, convert_to_tensor=False)
-            sample_embeddings.append(emb)
+        embeddings_b = []
+        for topic_id in topic_ids_b:
+            words = " ".join(topics_b[topic_id][:top_n])
+            emb = model.encode(words, convert_to_tensor=False, show_progress_bar=False)
+            embeddings_b.append(emb)
 
-        ref_embeddings = np.array(ref_embeddings)
-        sample_embeddings = np.array(sample_embeddings)
+        embeddings_a = np.array(embeddings_a)
+        embeddings_b = np.array(embeddings_b)
 
         # Compute similarity matrix
-        from sklearn.metrics.pairwise import cosine_similarity
-        similarity_matrix = cosine_similarity(ref_embeddings, sample_embeddings)
+        similarity_matrix = cosine_similarity(embeddings_a, embeddings_b)
 
-        # Hungarian algorithm for optimal matching (maximize similarity = minimize -similarity)
+        # Hungarian algorithm
         row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
 
-        # Compute matched similarities
-        semantic_similarities = []
+        # Get matched similarities and word overlaps
+        semantic_sims = []
         word_overlaps = []
 
         for i, j in zip(row_ind, col_ind):
-            ref_topic_id = ref_topics[i]
-            sample_topic_id = sample_topics[j]
+            topic_id_a = topic_ids_a[i]
+            topic_id_b = topic_ids_b[j]
 
             # Semantic similarity
-            semantic_similarities.append(similarity_matrix[i, j])
+            semantic_sims.append(similarity_matrix[i, j])
 
             # Word overlap (Jaccard)
-            ref_words_set = set(ref_topic_words[ref_topic_id][:top_n])
-            sample_words_set = set(sample_topic_words[sample_topic_id][:top_n])
+            words_a = set(topics_a[topic_id_a][:top_n])
+            words_b = set(topics_b[topic_id_b][:top_n])
 
-            intersection = len(ref_words_set & sample_words_set)
-            union = len(ref_words_set | sample_words_set)
+            intersection = len(words_a & words_b)
+            union = len(words_a | words_b)
             jaccard = intersection / union if union > 0 else 0.0
 
             word_overlaps.append(jaccard)
 
-        return word_overlaps, semantic_similarities
+        return word_overlaps, semantic_sims
 
-    def _compute_document_distribution_metrics(self, results: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute metrics about document distribution across topics"""
+    def _compute_topic_query_similarity(self, results: Dict[str, Any]) -> float:
+        """
+        Compute average similarity between topics and the query
 
-        topics = np.array(results["topics"])
+        Args:
+            results: Topic modeling results
 
-        # Count docs per topic (excluding -1)
-        unique_topics, counts = np.unique(topics[topics != -1], return_counts=True)
+        Returns:
+            Average cosine similarity between all topics and the query
+        """
+        topic_words = results["topic_words"]
 
-        metrics = {}
+        if not topic_words:
+            return 0.0
 
-        # Outlier ratio
-        n_outliers = np.sum(topics == -1)
-        metrics["outlier_ratio"] = float(n_outliers / len(topics)) if len(topics) > 0 else 0.0
+        # Load embedding model
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
 
-        # Average topic size
-        if len(counts) > 0:
-            metrics["avg_topic_size"] = float(np.mean(counts))
-            metrics["std_topic_size"] = float(np.std(counts))
-        else:
-            metrics["avg_topic_size"] = 0.0
-            metrics["std_topic_size"] = 0.0
+        # Encode query
+        query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
 
-        # Singleton topic ratio
-        n_singletons = np.sum(counts == 1)
-        metrics["singleton_topic_ratio"] = float(n_singletons / len(counts)) if len(counts) > 0 else 0.0
+        # Encode all topics (top 10 words each)
+        topic_embeddings = []
+        for topic_id, words in topic_words.items():
+            top_words = " ".join(words[:10])
+            emb = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
+            topic_embeddings.append(emb)
 
-        # Document-topic entropy
-        if len(counts) > 0:
-            probs = counts / np.sum(counts)
-            entropy = -np.sum(probs * np.log(probs + 1e-10))
-            metrics["document_topic_entropy"] = float(entropy)
-        else:
-            metrics["document_topic_entropy"] = 0.0
+        if not topic_embeddings:
+            return 0.0
 
-        return metrics
+        topic_embeddings = np.array(topic_embeddings)
+        query_embedding = query_embedding.reshape(1, -1)
 
-    def _compute_document_clustering_metrics(
-        self,
-        reference_results: Dict[str, Any],
-        sample_results: Dict[str, Any],
-        reference_sample: Dict[str, Any],
-        sample_sample: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Compute document-level clustering metrics on overlapping documents"""
+        # Compute cosine similarities
+        similarities = cosine_similarity(query_embedding, topic_embeddings)[0]
 
-        metrics = {}
+        # Return average similarity
+        return float(np.mean(similarities))
 
-        # Find overlapping documents
-        ref_doc_ids = set(reference_sample["doc_ids"])
-        sample_doc_ids = set(sample_sample["doc_ids"])
-        overlap = ref_doc_ids & sample_doc_ids
+    def _compute_per_topic_query_alignment(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute per-topic query alignment metrics
 
-        metrics["overlap_count"] = len(overlap)
+        Returns detailed metrics about how individual topics align with the query.
 
-        if len(overlap) < 2:
-            logger.info(f"Insufficient overlap ({len(overlap)} docs) for clustering metrics")
-            metrics["ari"] = None
-            metrics["nmi"] = None
-            return metrics
+        Args:
+            results: Topic modeling results
 
-        # Get topic assignments for overlapping docs
-        ref_doc_to_idx = {doc_id: i for i, doc_id in enumerate(reference_sample["doc_ids"])}
-        sample_doc_to_idx = {doc_id: i for i, doc_id in enumerate(sample_sample["doc_ids"])}
+        Returns:
+            Dictionary with:
+            - max_query_similarity: Highest topic-query similarity
+            - query_relevant_ratio: Fraction of topics above similarity threshold (0.5)
+            - top3_avg_similarity: Average similarity of top-3 most query-relevant topics
+            - per_topic_similarities: List of (topic_id, similarity) tuples
+        """
+        topic_words = results["topic_words"]
 
-        ref_topics_overlap = []
-        sample_topics_overlap = []
+        if not topic_words:
+            return {
+                "max_query_similarity": 0.0,
+                "query_relevant_ratio": 0.0,
+                "top3_avg_similarity": 0.0,
+                "per_topic_similarities": []
+            }
 
-        for doc_id in overlap:
-            ref_topics_overlap.append(reference_results["topics"][ref_doc_to_idx[doc_id]])
-            sample_topics_overlap.append(sample_results["topics"][sample_doc_to_idx[doc_id]])
+        # Load embedding model
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+
+        # Encode query
+        query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
+
+        # Encode all topics and compute similarities
+        similarities = []
+        for topic_id, words in topic_words.items():
+            top_words = " ".join(words[:10])
+            topic_emb = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
+            sim = float(cosine_similarity([query_embedding], [topic_emb])[0][0])
+            similarities.append((topic_id, sim))
+
+        # Sort by similarity (descending)
+        similarities_sorted = sorted(similarities, key=lambda x: x[1], reverse=True)
 
         # Compute metrics
-        try:
-            ari = adjusted_rand_score(ref_topics_overlap, sample_topics_overlap)
-            nmi = normalized_mutual_info_score(ref_topics_overlap, sample_topics_overlap)
+        max_sim = similarities_sorted[0][1] if similarities_sorted else 0.0
 
-            metrics["ari"] = float(ari)
-            metrics["nmi"] = float(nmi)
-        except Exception as e:
-            logger.warning(f"Error computing clustering metrics: {e}")
-            metrics["ari"] = None
-            metrics["nmi"] = None
+        # Count topics above threshold
+        threshold = 0.5
+        relevant_count = sum(1 for _, sim in similarities if sim >= threshold)
+        relevant_ratio = relevant_count / len(similarities) if similarities else 0.0
 
-        return metrics
+        # Top-3 average
+        top3_sims = [sim for _, sim in similarities_sorted[:3]]
+        top3_avg = float(np.mean(top3_sims)) if top3_sims else 0.0
 
-    def create_summary_table(self, all_metrics: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-        """Create summary table of all metrics"""
-
-        # Define metric order and nice names
-        metric_names = {
-            # Topic-level (Priority 1)
-            "topic_coverage_sample": "Topic Coverage",
-            "topic_diversity_sample": "Topic Diversity",
-            "topic_word_overlap_mean": "Word Overlap (mean)",
-            "topic_semantic_similarity_mean": "Semantic Similarity (mean)",
-            # Normalized metrics
-            "topic_density_sample": "Topic Density (per 100 docs)",
-            "topic_density_ratio": "Topic Density Ratio",
-            "topic_coverage_ratio": "Topic Coverage Ratio",
-            # Precision/Recall/F1 at multiple thresholds
-            "topic_precision_@05": "Precision @0.5",
-            "topic_recall_@05": "Recall @0.5",
-            "topic_f1_@05": "F1 @0.5",
-            "topic_precision_@06": "Precision @0.6",
-            "topic_recall_@06": "Recall @0.6",
-            "topic_f1_@06": "F1 @0.6",
-            "topic_precision_@07": "Precision @0.7",
-            "topic_recall_@07": "Recall @0.7",
-            "topic_f1_@07": "F1 @0.7",
-            # Document distribution (Priority 2)
-            "outlier_ratio": "Outlier Ratio",
-            "avg_topic_size": "Avg Topic Size",
-            "singleton_topic_ratio": "Singleton Ratio",
-            "document_topic_entropy": "Doc-Topic Entropy",
-            # Clustering (Priority 3)
-            "overlap_count": "Overlap Count",
-            "ari": "ARI",
-            "nmi": "NMI",
+        return {
+            "max_query_similarity": max_sim,
+            "query_relevant_ratio": relevant_ratio,
+            "top3_avg_similarity": top3_avg,
+            "per_topic_similarities": similarities_sorted
         }
 
-        rows = []
-        for method, metrics in all_metrics.items():
-            row = {"Method": method}
-            for metric_key, metric_name in metric_names.items():
-                value = metrics.get(metric_key, None)
-                if value is not None:
-                    if isinstance(value, float):
-                        row[metric_name] = f"{value:.4f}"
-                    else:
-                        row[metric_name] = str(value)
-                else:
-                    row[metric_name] = "N/A"
-            rows.append(row)
+    def _compute_npmi_coherence(self, topic_words: Dict[int, List[str]], doc_texts: List[str], top_k: int = 10) -> float:
+        """
+        Compute average NPMI (Normalized Pointwise Mutual Information) coherence across topics
 
-        df = pd.DataFrame(rows)
+        NPMI measures semantic coherence of topic words based on co-occurrence in documents.
+        Higher values indicate more interpretable/coherent topics.
+
+        Args:
+            topic_words: Dictionary mapping topic IDs to lists of words
+            doc_texts: List of document texts for computing co-occurrences
+            top_k: Number of top words to consider per topic
+
+        Returns:
+            Average NPMI coherence across all topics (range: -1 to 1, higher = more coherent)
+        """
+        if not topic_words or not doc_texts:
+            return 0.0
+
+        from collections import Counter
+        import math
+
+        # Tokenize documents (simple whitespace + lowercase)
+        tokenized_docs = []
+        for doc in doc_texts:
+            tokens = set(doc.lower().split())
+            tokenized_docs.append(tokens)
+
+        n_docs = len(tokenized_docs)
+
+        # Compute document frequencies for all words
+        word_doc_freq = Counter()
+        for tokens in tokenized_docs:
+            for word in tokens:
+                word_doc_freq[word] += 1
+
+        # Compute NPMI for each topic
+        topic_npmis = []
+
+        for topic_id, words in topic_words.items():
+            top_words = words[:top_k]
+
+            # Compute NPMI for all word pairs
+            pair_npmis = []
+            for i in range(len(top_words)):
+                for j in range(i + 1, len(top_words)):
+                    word_i = top_words[i].lower()
+                    word_j = top_words[j].lower()
+
+                    # Count co-occurrences
+                    co_occur = sum(1 for tokens in tokenized_docs if word_i in tokens and word_j in tokens)
+
+                    # Compute PMI
+                    if co_occur > 0:
+                        p_i = word_doc_freq.get(word_i, 0) / n_docs
+                        p_j = word_doc_freq.get(word_j, 0) / n_docs
+                        p_ij = co_occur / n_docs
+
+                        if p_i > 0 and p_j > 0 and p_ij > 0:
+                            pmi = math.log(p_ij / (p_i * p_j))
+                            npmi = pmi / (-math.log(p_ij))  # Normalize by -log(p(i,j))
+                            pair_npmis.append(npmi)
+
+            # Average NPMI for this topic
+            if pair_npmis:
+                topic_npmi = float(np.mean(pair_npmis))
+                topic_npmis.append(topic_npmi)
+
+        # Average across all topics
+        return float(np.mean(topic_npmis)) if topic_npmis else 0.0
+
+    def _compute_embedding_coherence(self, topic_words: Dict[int, List[str]], top_k: int = 10) -> float:
+        """
+        Compute average embedding coherence across topics
+
+        Measures how semantically tight topic words are by computing average pairwise
+        cosine similarity of word embeddings within each topic.
+
+        Args:
+            topic_words: Dictionary mapping topic IDs to lists of words
+            top_k: Number of top words to consider per topic
+
+        Returns:
+            Average embedding coherence across all topics (0-1, higher = tighter topics)
+        """
+        if not topic_words:
+            return 0.0
+
+        # Load embedding model
+        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+
+        topic_coherences = []
+
+        for topic_id, words in topic_words.items():
+            top_words = words[:top_k]
+
+            if len(top_words) < 2:
+                continue
+
+            # Get embeddings for words
+            word_embeddings = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
+
+            # Compute pairwise cosine similarities
+            similarities = cosine_similarity(word_embeddings)
+
+            # Get upper triangle (exclude diagonal)
+            n = len(word_embeddings)
+            upper_triangle = similarities[np.triu_indices(n, k=1)]
+
+            # Average similarity for this topic
+            topic_coherence = float(np.mean(upper_triangle))
+            topic_coherences.append(topic_coherence)
+
+        # Average across all topics
+        return float(np.mean(topic_coherences)) if topic_coherences else 0.0
+
+    def _save_topic_summaries(self, topic_results: Dict[str, Dict[str, Any]], samples: Dict[str, Dict[str, Any]]):
+        """Save human-readable topic summaries for qualitative analysis"""
+        logger.info("Saving human-readable topic summaries...")
+
+        for method_name, results in topic_results.items():
+            if results is None:
+                continue
+
+            # Create text summary
+            summary_path = os.path.join(self.topics_summary_dir, f"{method_name}_topics.txt")
+            json_path = os.path.join(self.topics_summary_dir, f"{method_name}_topics.json")
+
+            # Text summary
+            with open(summary_path, 'w') as f:
+                f.write("="*80 + "\n")
+                f.write(f"TOPIC SUMMARY: {method_name.upper()}\n")
+                f.write(f"Query ID: {self.query_id}\n")
+                f.write(f"Query: {self.query_text}\n")
+                f.write(f"Number of Topics: {results['n_topics']}\n")
+                f.write(f"Number of Documents: {results['n_docs']}\n")
+                f.write("="*80 + "\n\n")
+
+                # Get topic info
+                topic_labels = results.get('topic_labels', {})
+                topic_names = results.get('topic_names', {})
+                topic_words_with_scores = results.get('topic_words_with_scores', {})
+
+                # Count documents per topic
+                topics_array = np.array(results['topics'])
+                unique_topics, counts = np.unique(topics_array[topics_array != -1], return_counts=True)
+                topic_counts = dict(zip(unique_topics, counts))
+
+                # Sort topics by size (largest first)
+                sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
+
+                for topic_id, count in sorted_topics:
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"TOPIC {topic_id}: {topic_labels.get(topic_id, 'N/A')}\n")
+                    f.write(f"Name: {topic_names.get(topic_id, 'N/A')}\n")
+                    f.write(f"Document Count: {count}\n")
+                    f.write(f"-"*80 + "\n")
+
+                    # Top words with scores
+                    if topic_id in topic_words_with_scores:
+                        f.write("Top Words (with c-TF-IDF scores):\n")
+                        for i, (word, score) in enumerate(topic_words_with_scores[topic_id][:10], 1):
+                            f.write(f"  {i:2d}. {word:20s} {score:.4f}\n")
+                    f.write("\n")
+
+                # Outliers
+                n_outliers = np.sum(topics_array == -1)
+                if n_outliers > 0:
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"OUTLIERS (Topic -1)\n")
+                    f.write(f"Document Count: {n_outliers}\n")
+                    f.write(f"Percentage: {100 * n_outliers / len(topics_array):.2f}%\n")
+
+            # JSON summary for programmatic access
+            json_summary = {
+                "method": method_name,
+                "query_id": self.query_id,
+                "query_text": self.query_text,
+                "n_topics": results['n_topics'],
+                "n_docs": results['n_docs'],
+                "topics": []
+            }
+
+            # Get topic info
+            topic_labels = results.get('topic_labels', {})
+            topic_names = results.get('topic_names', {})
+            topic_words_with_scores = results.get('topic_words_with_scores', {})
+
+            # Count documents per topic
+            topics_array = np.array(results['topics'])
+            unique_topics, counts = np.unique(topics_array[topics_array != -1], return_counts=True)
+            topic_counts = dict(zip(unique_topics, counts))
+            sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
+
+            for topic_id, count in sorted_topics:
+                topic_data = {
+                    "topic_id": int(topic_id),
+                    "label": topic_labels.get(topic_id, f"Topic_{topic_id}"),
+                    "name": topic_names.get(topic_id, f"Topic_{topic_id}"),
+                    "doc_count": int(count),
+                    "top_words": topic_words_with_scores.get(topic_id, [])[:10]
+                }
+                json_summary["topics"].append(topic_data)
+
+            # Add outlier info
+            n_outliers = np.sum(topics_array == -1)
+            if n_outliers > 0:
+                json_summary["outliers"] = {
+                    "count": int(n_outliers),
+                    "percentage": float(100 * n_outliers / len(topics_array))
+                }
+
+            with open(json_path, 'w') as f:
+                json.dump(json_summary, f, indent=2)
+
+            logger.info(f"Saved topic summary for {method_name}: {summary_path}")
+
+        logger.info(f"All topic summaries saved to {self.topics_summary_dir}")
+
+    def run_all_pairwise_comparisons(
+        self,
+        topic_results: Dict[str, Dict[str, Any]],
+        samples: Dict[str, Dict[str, Any]]
+    ) -> pd.DataFrame:
+        """
+        Run pairwise comparisons for all method pairs
+
+        Returns:
+            DataFrame with all pairwise metrics
+        """
+        logger.info("\n" + "="*80)
+        logger.info("Running pairwise comparisons...")
+        logger.info("="*80)
+
+        methods = list(topic_results.keys())
+
+        if len(methods) < 2:
+            logger.error(f"Need at least 2 methods, found {len(methods)}")
+            return pd.DataFrame()
+
+        all_metrics = []
+
+        # Compare each pair
+        pairs = list(combinations(methods, 2))
+        logger.info(f"Computing {len(pairs)} pairwise comparisons...\n")
+
+        for method_a, method_b in tqdm(pairs, desc="Pairwise comparisons"):
+            try:
+                metrics = self.compute_pairwise_metrics(
+                    method_a=method_a,
+                    method_b=method_b,
+                    results_a=topic_results[method_a],
+                    results_b=topic_results[method_b],
+                    sample_a=samples[method_a],
+                    sample_b=samples[method_b]
+                )
+                all_metrics.append(metrics)
+
+                logger.debug(f"Compared {method_a} vs {method_b}")
+            except Exception as e:
+                logger.error(f"Error comparing {method_a} vs {method_b}: {e}")
+                continue
+
+        # Convert to DataFrame
+        df = pd.DataFrame(all_metrics)
+
+        # Save results
+        csv_path = os.path.join(self.results_dir, "pairwise_metrics.csv")
+        json_path = os.path.join(self.results_dir, "pairwise_metrics.json")
+
+        df.to_csv(csv_path, index=False)
+        logger.info(f"\n✓ Saved pairwise metrics to {csv_path}")
+
+        with open(json_path, 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+        logger.info(f"✓ Saved pairwise metrics to {json_path}")
+
         return df
 
-    def create_plots(self, all_metrics: Dict[str, Dict[str, Any]]):
-        """Create visualization plots"""
+    def create_per_method_summary(
+        self,
+        pairwise_df: pd.DataFrame,
+        topic_results: Dict[str, Dict[str, Any]]
+    ) -> pd.DataFrame:
+        """
+        Create per-method summary statistics
 
-        logger.info("Creating visualization plots...")
+        Args:
+            pairwise_df: DataFrame with pairwise metrics
+            topic_results: Dict of topic modeling results
+
+        Returns:
+            DataFrame with per-method statistics
+        """
+        logger.info("Creating per-method summary...")
+
+        methods = list(topic_results.keys())
+        summary_data = []
+
+        for method in methods:
+            # Get all comparisons involving this method
+            method_comparisons = pairwise_df[
+                (pairwise_df['method_a'] == method) | (pairwise_df['method_b'] == method)
+            ]
+
+            # Extract metrics when this method is method_a or method_b
+            topic_counts = []
+            diversity_semantic = []
+            diversity_lexical = []
+            npmi_coherence = []
+            embedding_coherence = []
+            outlier_ratios = []
+            avg_topic_sizes = []
+            topic_query_sims = []
+            max_query_sims = []
+            query_relevant_ratios = []
+            top3_avg_sims = []
+
+            for _, row in method_comparisons.iterrows():
+                if row['method_a'] == method:
+                    topic_counts.append(row['n_topics_a'])
+                    diversity_semantic.append(row['diversity_semantic_a'])
+                    diversity_lexical.append(row['diversity_lexical_a'])
+                    npmi_coherence.append(row['npmi_coherence_a'])
+                    embedding_coherence.append(row['embedding_coherence_a'])
+                    outlier_ratios.append(row['outlier_ratio_a'])
+                    avg_topic_sizes.append(row['avg_topic_size_a'])
+                    topic_query_sims.append(row['topic_query_similarity_a'])
+                    max_query_sims.append(row['max_query_similarity_a'])
+                    query_relevant_ratios.append(row['query_relevant_ratio_a'])
+                    top3_avg_sims.append(row['top3_avg_similarity_a'])
+                else:  # method_b == method
+                    topic_counts.append(row['n_topics_b'])
+                    diversity_semantic.append(row['diversity_semantic_b'])
+                    diversity_lexical.append(row['diversity_lexical_b'])
+                    npmi_coherence.append(row['npmi_coherence_b'])
+                    embedding_coherence.append(row['embedding_coherence_b'])
+                    outlier_ratios.append(row['outlier_ratio_b'])
+                    avg_topic_sizes.append(row['avg_topic_size_b'])
+                    topic_query_sims.append(row['topic_query_similarity_b'])
+                    max_query_sims.append(row['max_query_similarity_b'])
+                    query_relevant_ratios.append(row['query_relevant_ratio_b'])
+                    top3_avg_sims.append(row['top3_avg_similarity_b'])
+
+            summary_data.append({
+                "method": method,
+                "n_topics": topic_counts[0] if topic_counts else 0,
+                "diversity_semantic": diversity_semantic[0] if diversity_semantic else 0,
+                "diversity_lexical": diversity_lexical[0] if diversity_lexical else 0,
+                "npmi_coherence": npmi_coherence[0] if npmi_coherence else 0,
+                "embedding_coherence": embedding_coherence[0] if embedding_coherence else 0,
+                "outlier_ratio": outlier_ratios[0] if outlier_ratios else 0,
+                "document_coverage": (1 - outlier_ratios[0]) if outlier_ratios else 1.0,
+                "avg_topic_size": avg_topic_sizes[0] if avg_topic_sizes else 0,
+                "topic_query_similarity": topic_query_sims[0] if topic_query_sims else 0,
+                "max_query_similarity": max_query_sims[0] if max_query_sims else 0,
+                "query_relevant_ratio": query_relevant_ratios[0] if query_relevant_ratios else 0,
+                "top3_avg_similarity": top3_avg_sims[0] if top3_avg_sims else 0,
+                "n_docs": topic_results[method]['n_docs']
+            })
+
+        summary_df = pd.DataFrame(summary_data)
+
+        # Save summary
+        summary_path = os.path.join(self.results_dir, "per_method_summary.csv")
+        summary_df.to_csv(summary_path, index=False)
+        logger.info(f"✓ Saved per-method summary to {summary_path}")
+
+        return summary_df
+
+    def create_comprehensive_plots(
+        self,
+        pairwise_df: pd.DataFrame,
+        per_method_df: pd.DataFrame
+    ):
+        """
+        Create comprehensive visualization plots for all metrics
+
+        Args:
+            pairwise_df: DataFrame with pairwise metrics
+            per_method_df: DataFrame with per-method summary
+        """
+        logger.info("\n" + "="*80)
+        logger.info("Creating comprehensive visualizations...")
+        logger.info("="*80)
 
         # Set style
         sns.set_style("whitegrid")
-        plt.rcParams['figure.figsize'] = (12, 8)
+        methods = per_method_df['method'].tolist()
+        n_methods = len(methods)
 
-        # Plot 1: Topic Coverage
-        self._plot_bar_metric(
-            all_metrics,
-            "topic_coverage_sample",
-            "Topic Coverage Comparison",
-            "Number of Topics",
-            "topic_coverage.png"
-        )
+        # Plot 1: Intrinsic Quality Metrics (3x2 grid)
+        fig, axes = plt.subplots(3, 2, figsize=(14, 16))
+        fig.suptitle(f'Intrinsic Topic Quality Metrics - Query {self.query_id}', fontsize=16, fontweight='bold')
 
-        # Plot 2: Topic Precision, Recall, F1 at threshold 0.5
-        self._plot_grouped_bars(
-            all_metrics,
-            ["topic_precision_@05", "topic_recall_@05", "topic_f1_@05"],
-            "Topic Matching Metrics @0.5 Threshold",
-            "topic_precision_recall_f1_threshold05.png"
-        )
+        quality_metrics = [
+            ('npmi_coherence', 'NPMI Coherence', 'Blues_d'),
+            ('embedding_coherence', 'Embedding Coherence', 'Greens_d'),
+            ('diversity_semantic', 'Semantic Diversity', 'Purples_d'),
+            ('diversity_lexical', 'Lexical Diversity', 'Oranges_d'),
+            ('document_coverage', 'Document Coverage', 'YlGn'),
+            ('n_topics', 'Number of Topics', 'Greys_d')
+        ]
 
-        # Plot 3: Topic Precision, Recall, F1 at threshold 0.6
-        self._plot_grouped_bars(
-            all_metrics,
-            ["topic_precision_@06", "topic_recall_@06", "topic_f1_@06"],
-            "Topic Matching Metrics @0.6 Threshold",
-            "topic_precision_recall_f1_threshold06.png"
-        )
+        for idx, (metric, title, color) in enumerate(quality_metrics):
+            ax = axes[idx // 2, idx % 2]
+            values = per_method_df[metric].values
+            colors_list = sns.color_palette(color, n_methods)
 
-        # Plot 4: Topic Precision, Recall, F1 at threshold 0.7
-        self._plot_grouped_bars(
-            all_metrics,
-            ["topic_precision_@07", "topic_recall_@07", "topic_f1_@07"],
-            "Topic Matching Metrics @0.7 Threshold",
-            "topic_precision_recall_f1_threshold07.png"
-        )
-
-        # Plot 5: Topic Quality Metrics
-        self._plot_grouped_bars(
-            all_metrics,
-            ["topic_diversity_sample", "topic_word_overlap_mean", "topic_semantic_similarity_mean"],
-            "Topic Quality Metrics",
-            "topic_quality.png"
-        )
-
-        # Plot 6: Document Distribution
-        self._plot_grouped_bars(
-            all_metrics,
-            ["outlier_ratio", "singleton_topic_ratio", "document_topic_entropy"],
-            "Document Distribution Metrics",
-            "document_distribution.png"
-        )
-
-        logger.info(f"Plots saved to {self.plots_dir}")
-
-    def _plot_bar_metric(self, all_metrics, metric_key, title, ylabel, filename):
-        """Create a simple bar plot for a single metric"""
-        methods = list(all_metrics.keys())
-        values = [all_metrics[m].get(metric_key, 0) for m in methods]
-
-        plt.figure(figsize=(10, 6))
-        bars = plt.bar(methods, values, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
-        plt.title(title, fontsize=14, fontweight='bold')
-        plt.ylabel(ylabel, fontsize=12)
-        plt.xlabel("Method", fontsize=12)
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-
-        # Add value labels on bars
-        for bar, value in zip(bars, values):
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{value:.2f}' if isinstance(value, float) else str(value),
-                    ha='center', va='bottom', fontsize=10)
-
-        plt.savefig(os.path.join(self.plots_dir, filename), dpi=300, bbox_inches='tight')
-        plt.close()
-
-    def _plot_grouped_bars(self, all_metrics, metric_keys, title, filename):
-        """Create grouped bar plot for multiple metrics"""
-        methods = list(all_metrics.keys())
-
-        x = np.arange(len(methods))
-        width = 0.25
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-
-        for i, metric_key in enumerate(metric_keys):
-            values = [all_metrics[m].get(metric_key, 0) for m in methods]
-            offset = width * (i - len(metric_keys)/2 + 0.5)
-            bars = ax.bar(x + offset, values, width, label=metric_key.replace('_', ' ').title(),
-                         color=colors[i % len(colors)])
+            bars = ax.bar(methods, values, color=colors_list, edgecolor='black', linewidth=1.5)
+            ax.set_title(title, fontsize=12, fontweight='bold')
+            ax.set_ylabel('Value', fontsize=10)
+            ax.set_xlabel('Method', fontsize=10)
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(axis='y', alpha=0.3)
 
             # Add value labels
             for bar, value in zip(bars, values):
                 height = bar.get_height()
-                if value is not None and value > 0:
-                    ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{value:.3f}',
-                           ha='center', va='bottom', fontsize=8)
-
-        ax.set_title(title, fontsize=14, fontweight='bold')
-        ax.set_ylabel('Score', fontsize=12)
-        ax.set_xlabel('Method', fontsize=12)
-        ax.set_xticks(x)
-        ax.set_xticklabels(methods, rotation=45, ha='right')
-        ax.legend(fontsize=10)
-        ax.grid(axis='y', alpha=0.3)
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{value:.3f}' if isinstance(value, float) and value < 10 else f'{value:.0f}',
+                       ha='center', va='bottom', fontsize=9)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(self.plots_dir, filename), dpi=300, bbox_inches='tight')
+        plot_path = os.path.join(self.plots_dir, "intrinsic_quality_metrics.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
+        logger.info(f"✓ Saved intrinsic quality metrics plot")
+
+        # Plot 2: Query Alignment Metrics (1x3 grid)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(f'Query Alignment Metrics - Query {self.query_id}', fontsize=16, fontweight='bold')
+
+        query_metrics = [
+            ('topic_query_similarity', 'Avg Topic-Query Similarity', 'viridis'),
+            ('max_query_similarity', 'Max Topic-Query Similarity', 'plasma'),
+            ('query_relevant_ratio', 'Query-Relevant Topic Ratio', 'cividis')
+        ]
+
+        for idx, (metric, title, cmap) in enumerate(query_metrics):
+            ax = axes[idx]
+            values = per_method_df[metric].values
+            colors_list = sns.color_palette(cmap, n_methods)
+
+            bars = ax.bar(methods, values, color=colors_list, edgecolor='black', linewidth=1.5)
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            ax.set_ylabel('Value', fontsize=10)
+            ax.set_xlabel('Method', fontsize=10)
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(axis='y', alpha=0.3)
+            ax.set_ylim(0, 1.0)
+
+            for bar, value in zip(bars, values):
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{value:.3f}', ha='center', va='bottom', fontsize=9)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self.plots_dir, "query_alignment_metrics.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved query alignment metrics plot")
+
+        # Plot 3: Diversity Scatter (Semantic vs Lexical)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        colors_list = sns.color_palette("husl", n_methods)
+
+        for idx, method in enumerate(methods):
+            semantic = per_method_df[per_method_df['method'] == method]['diversity_semantic'].values[0]
+            lexical = per_method_df[per_method_df['method'] == method]['diversity_lexical'].values[0]
+            ax.scatter(semantic, lexical, s=200, color=colors_list[idx],
+                      edgecolor='black', linewidth=2, label=method, alpha=0.7)
+            ax.annotate(method, (semantic, lexical),
+                       xytext=(5, 5), textcoords='offset points', fontsize=10)
+
+        ax.set_xlabel('Semantic Diversity (higher = more distinct concepts)', fontsize=12)
+        ax.set_ylabel('Lexical Diversity (higher = less word overlap)', fontsize=12)
+        ax.set_title(f'Topic Diversity: Semantic vs Lexical - Query {self.query_id}',
+                    fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best', fontsize=10)
+
+        # Add quadrant lines (optional interpretation guides)
+        ax.axhline(0.8, color='gray', linestyle='--', alpha=0.3, linewidth=1)
+        ax.axvline(0.6, color='gray', linestyle='--', alpha=0.3, linewidth=1)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self.plots_dir, "diversity_scatter.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved diversity scatter plot")
+
+        # Plot 4: Pairwise Similarity Heatmaps
+        pairwise_metrics_to_plot = [
+            ("topic_semantic_similarity_mean", "Topic Semantic Similarity", "Blues", (0, 1)),
+            ("topic_word_overlap_mean", "Topic Word Overlap (Jaccard)", "Greens", (0, 1)),
+            ("f1_@05", "Topic Matching F1 @0.5", "RdPu", (0, 1)),
+            ("f1_@06", "Topic Matching F1 @0.6", "RdPu", (0, 1)),
+            ("f1_@07", "Topic Matching F1 @0.7", "RdPu", (0, 1)),
+            ("precision_b_@05", "Topic Precision (B) @0.5", "Purples", (0, 1)),
+            ("precision_b_@06", "Topic Precision (B) @0.6", "Purples", (0, 1)),
+            ("precision_b_@07", "Topic Precision (B) @0.7", "Purples", (0, 1)),
+            ("recall_a_@05", "Topic Recall (A) @0.5", "Oranges", (0, 1)),
+            ("recall_a_@06", "Topic Recall (A) @0.6", "Oranges", (0, 1)),
+            ("recall_a_@07", "Topic Recall (A) @0.7", "Oranges", (0, 1)),
+            ("npmi_coherence_diff", "NPMI Coherence Difference (A-B)", "RdBu_r", (-0.5, 0.5)),
+            ("embedding_coherence_diff", "Embedding Coherence Difference (A-B)", "RdBu_r", (-0.2, 0.2)),
+            ("ari", "Adjusted Rand Index (ARI)", "YlGn", (-0.5, 1)),
+        ]
+
+        for metric_key, title, cmap, vrange in pairwise_metrics_to_plot:
+            # Create matrix
+            matrix = np.zeros((n_methods, n_methods))
+
+            for i, method_a in enumerate(methods):
+                for j, method_b in enumerate(methods):
+                    if i == j:
+                        # Diagonal: self-comparison (perfect score for similarity metrics)
+                        if "ari" in metric_key.lower():
+                            matrix[i, j] = 1.0
+                        elif "diff" in metric_key.lower():
+                            matrix[i, j] = 0.0
+                        else:
+                            matrix[i, j] = 1.0
+                    else:
+                        # Find the metric value
+                        row = pairwise_df[(pairwise_df['method_a'] == method_a) & (pairwise_df['method_b'] == method_b)]
+                        if row.empty:
+                            # Try reverse order
+                            row = pairwise_df[(pairwise_df['method_a'] == method_b) & (pairwise_df['method_b'] == method_a)]
+                            if not row.empty and metric_key in row.columns:
+                                value = row[metric_key].values[0]
+                                matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
+                        elif metric_key in row.columns:
+                            value = row[metric_key].values[0]
+                            matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
+
+            # Create heatmap
+            plt.figure(figsize=(10, 8))
+
+            sns.heatmap(
+                matrix,
+                annot=True,
+                fmt='.3f',
+                cmap=cmap,
+                xticklabels=methods,
+                yticklabels=methods,
+                vmin=vrange[0],
+                vmax=vrange[1],
+                cbar_kws={'label': title},
+                square=True,
+                linewidths=0.5
+            )
+
+            plt.title(f"{title}\n(Method A vs Method B) - Query {self.query_id}", fontsize=14, fontweight='bold')
+            plt.xlabel("Method B", fontsize=12)
+            plt.ylabel("Method A", fontsize=12)
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks(rotation=0)
+            plt.tight_layout()
+
+            # Save plot
+            filename = metric_key.replace('@', '_at_').replace('_', '-') + "_heatmap.png"
+            plot_path = os.path.join(self.plots_dir, filename)
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            logger.info(f"✓ Saved {title} heatmap")
+
+        logger.info(f"\n✓ All plots saved to {self.plots_dir}")
 
     def run_full_evaluation(self):
-        """Run full end-to-end evaluation pipeline"""
+        """Run full end-to-end evaluation pipeline with pairwise comparisons"""
 
         logger.info("="*80)
         logger.info(f"Starting End-to-End Evaluation for Query {self.query_id}")
@@ -1005,11 +1532,10 @@ class EndToEndEvaluator:
         logger.info("="*80)
 
         samples = {}
-        samples["full_corpus"] = self.sample_full_corpus()
         samples["random_uniform"] = self.sample_random_uniform()
         samples["direct_retrieval"] = self.sample_direct_retrieval()
         samples["query_expansion"] = self.sample_query_expansion()
-        samples["qrels_labeled"] = self.sample_qrels_labeled()
+        samples["keyword_search"] = self.sample_keyword_search()
 
         # Step 2: Run topic modeling
         logger.info("\n" + "="*80)
@@ -1024,85 +1550,57 @@ class EndToEndEvaluator:
                 logger.error(f"Error in topic modeling for {method_name}: {e}")
                 topic_results[method_name] = None
 
-        # Step 3: Evaluate
+        # Remove failed methods
+        topic_results = {k: v for k, v in topic_results.items() if v is not None}
+        samples = {k: v for k, v in samples.items() if k in topic_results}
+
+        if len(topic_results) < 2:
+            logger.error("Need at least 2 successful topic models for pairwise comparison")
+            return None
+
+        # Step 3: Save topic summaries
         logger.info("\n" + "="*80)
-        logger.info("STEP 3: Computing Evaluation Metrics")
+        logger.info("STEP 3: Saving Topic Summaries")
         logger.info("="*80)
 
-        # Use full_corpus as reference (ground truth)
-        reference_name = "full_corpus"
-        reference_results = topic_results[reference_name]
-        reference_sample = samples[reference_name]
+        try:
+            self._save_topic_summaries(topic_results, samples)
+        except Exception as e:
+            logger.error(f"Error saving topic summaries: {e}")
+            logger.warning("Continuing with evaluation despite topic summary error")
 
-        all_metrics = {}
-
-        # Check if reference model succeeded
-        if reference_results is None:
-            logger.error(f"Reference method '{reference_name}' failed. Cannot proceed with evaluation.")
-            logger.error("All topic modeling failed. Please check CUDA/device compatibility.")
-            return {
-                "samples": samples,
-                "topic_results": topic_results,
-                "metrics": {},
-                "summary_df": None,
-                "error": "Reference topic model failed"
-            }
-
-        # Evaluate all methods against reference (including reference against itself)
-        for method_name, results in topic_results.items():
-            if results is None:
-                continue
-
-            try:
-                metrics = self.evaluate_all(
-                    reference_results,
-                    results,
-                    reference_sample,
-                    samples[method_name]
-                )
-                metrics["method"] = method_name
-                all_metrics[method_name] = metrics
-            except Exception as e:
-                logger.error(f"Error evaluating {method_name}: {e}")
-                continue
-
-        # Step 4: Create summary and plots
+        # Step 4: Run pairwise comparisons
         logger.info("\n" + "="*80)
-        logger.info("STEP 4: Creating Summary and Visualizations")
+        logger.info("STEP 4: Running Pairwise Comparisons")
         logger.info("="*80)
 
-        # Create summary table
-        summary_df = self.create_summary_table(all_metrics)
+        pairwise_df = self.run_all_pairwise_comparisons(topic_results, samples)
 
-        # Save results
-        summary_csv_path = os.path.join(self.evaluation_dir, "metrics_summary.csv")
-        summary_json_path = os.path.join(self.evaluation_dir, "metrics_summary.json")
-        metrics_raw_path = os.path.join(self.evaluation_dir, "metrics_raw.pkl")
+        if pairwise_df.empty:
+            logger.error("No pairwise comparisons completed. Exiting.")
+            return None
 
-        summary_df.to_csv(summary_csv_path, index=False)
+        # Step 5: Create per-method summary
+        logger.info("\n" + "="*80)
+        logger.info("STEP 5: Creating Per-Method Summary")
+        logger.info("="*80)
 
-        with open(summary_json_path, 'w') as f:
-            json.dump(all_metrics, f, indent=2)
+        per_method_df = self.create_per_method_summary(pairwise_df, topic_results)
 
-        with open(metrics_raw_path, 'wb') as f:
-            pickle.dump({
-                "samples": samples,
-                "topic_results": topic_results,
-                "metrics": all_metrics
-            }, f)
+        # Step 6: Create comprehensive visualizations
+        logger.info("\n" + "="*80)
+        logger.info("STEP 6: Creating Comprehensive Visualizations")
+        logger.info("="*80)
 
-        logger.info(f"Summary saved to {summary_csv_path}")
-        logger.info(f"Metrics saved to {summary_json_path}")
-        logger.info(f"Raw data saved to {metrics_raw_path}")
+        self.create_comprehensive_plots(pairwise_df, per_method_df)
 
-        # Create plots
-        self.create_plots(all_metrics)
-
-        # Print summary
+        # Step 7: Print summary
         logger.info("\n" + "="*80)
         logger.info("EVALUATION SUMMARY")
         logger.info("="*80)
-        print("\n" + summary_df.to_string(index=False))
+
+        print("\nPer-Method Summary:")
+        print(per_method_df.to_string(index=False))
 
         logger.info("\n" + "="*80)
         logger.info("Evaluation Complete!")
@@ -1112,15 +1610,9 @@ class EndToEndEvaluator:
         return {
             "samples": samples,
             "topic_results": topic_results,
-            "metrics": all_metrics,
-            "summary_df": summary_df
+            "pairwise_metrics": pairwise_df,
+            "per_method_summary": per_method_df
         }
-
-    def _compute_topic_diversity_metrics(self, results: Dict[str, Any]) -> Dict[str, Any]:
-        """Helper to compute diversity for reference"""
-        topic_words = results["topic_words"]
-        diversity = self._compute_topic_diversity(topic_words)
-        return {"topic_diversity_sample": diversity}
 
 
 def main():
@@ -1128,8 +1620,8 @@ def main():
 
     # ===== CONFIGURATION PARAMETERS =====
 
-    # Query configuration
-    QUERY_ID = "43"
+    # Query configuration - can be a single query ID or a list of query IDs
+    QUERY_IDS = ["2", "9", "27", "43"]  # Change to a single string like "9" to run only one query
 
     # Sample size (None = auto-determine from qrels)
     SAMPLE_SIZE = None
@@ -1142,7 +1634,7 @@ def main():
     DATASET_NAME = "trec-covid"
 
     # Directory configuration
-    OUTPUT_DIR = "results/end_to_end_evaluation"
+    OUTPUT_DIR = "results/topic_evaluation"
     CACHE_DIR = "cache"
 
     # Device configuration
@@ -1167,31 +1659,54 @@ def main():
 
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} qrels")
 
-    # ===== INITIALIZE EVALUATOR =====
+    # ===== HANDLE SINGLE QUERY VS MULTIPLE QUERIES =====
 
-    evaluator = EndToEndEvaluator(
-        corpus_dataset=corpus_dataset,
-        queries_dataset=queries_dataset,
-        qrels_dataset=qrels_dataset,
-        query_id=QUERY_ID,
-        sample_size=SAMPLE_SIZE,
-        embedding_model_name=EMBEDDING_MODEL,
-        cross_encoder_model_name=CROSS_ENCODER_MODEL,
-        dataset_name=DATASET_NAME,
-        output_dir=OUTPUT_DIR,
-        cache_dir=CACHE_DIR,
-        random_seed=RANDOM_SEED,
-        device=DEVICE,
-        force_regenerate_samples=FORCE_REGENERATE_SAMPLES,
-        force_regenerate_topics=FORCE_REGENERATE_TOPICS,
-        force_regenerate_evaluation=FORCE_REGENERATE_EVALUATION
-    )
+    # Convert single query ID to list for uniform processing
+    if isinstance(QUERY_IDS, str):
+        query_ids_to_run = [QUERY_IDS]
+    else:
+        query_ids_to_run = QUERY_IDS
 
-    # ===== RUN EVALUATION =====
+    # ===== RUN EVALUATION FOR EACH QUERY =====
 
-    results = evaluator.run_full_evaluation()
+    all_results = {}
 
-    return results
+    for query_id in query_ids_to_run:
+        logger.info("\n" + "="*80)
+        logger.info(f"PROCESSING QUERY {query_id} ({query_ids_to_run.index(query_id) + 1}/{len(query_ids_to_run)})")
+        logger.info("="*80 + "\n")
+
+        evaluator = EndToEndEvaluator(
+            corpus_dataset=corpus_dataset,
+            queries_dataset=queries_dataset,
+            qrels_dataset=qrels_dataset,
+            query_id=query_id,
+            sample_size=SAMPLE_SIZE,
+            embedding_model_name=EMBEDDING_MODEL,
+            cross_encoder_model_name=CROSS_ENCODER_MODEL,
+            dataset_name=DATASET_NAME,
+            output_dir=OUTPUT_DIR,
+            cache_dir=CACHE_DIR,
+            random_seed=RANDOM_SEED,
+            device=DEVICE,
+            force_regenerate_samples=FORCE_REGENERATE_SAMPLES,
+            force_regenerate_topics=FORCE_REGENERATE_TOPICS,
+            force_regenerate_evaluation=FORCE_REGENERATE_EVALUATION
+        )
+
+        results = evaluator.run_full_evaluation()
+        all_results[query_id] = results
+
+    # ===== FINAL SUMMARY =====
+
+    logger.info("\n" + "="*80)
+    logger.info("ALL QUERIES COMPLETED!")
+    logger.info("="*80)
+    logger.info(f"Processed {len(query_ids_to_run)} queries: {', '.join(query_ids_to_run)}")
+    logger.info(f"Results saved to: {OUTPUT_DIR}")
+    logger.info("="*80 + "\n")
+
+    return all_results
 
 
 if __name__ == "__main__":
