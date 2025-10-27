@@ -2,11 +2,12 @@
 """
 End-to-end evaluation of BERTopic using different sampling strategies with pairwise comparisons.
 
-Compares 4 methods:
+Compares 5 methods:
 1. Random Uniform Sampling
 2. Direct Retrieval (Hybrid BM25+SBERT)
 3. Query Expansion + Retrieval
 4. Simple Keyword Search (BM25 only)
+5. QRELs Labeled Documents (Ground truth relevance)
 
 METRICS IMPLEMENTED:
 
@@ -107,6 +108,7 @@ class EndToEndEvaluator:
         cache_dir: str = "cache",
         random_seed: int = 42,
         device: str = "cpu",
+        save_topic_models: bool = False,
         force_regenerate_samples: bool = False,
         force_regenerate_topics: bool = False,
         force_regenerate_evaluation: bool = False
@@ -127,6 +129,7 @@ class EndToEndEvaluator:
             cache_dir: Cache directory
             random_seed: Random seed for reproducibility
             device: Device to use ('cpu', 'cuda', 'mps')
+            save_topic_models: Whether to save full BERTopic models (420 MB each, only needed for interactive exploration)
             force_regenerate_samples: Force regenerate samples
             force_regenerate_topics: Force regenerate topic models
             force_regenerate_evaluation: Force regenerate evaluation
@@ -141,6 +144,7 @@ class EndToEndEvaluator:
         self.cache_dir = cache_dir
         self.random_seed = random_seed
         self.device = device
+        self.save_topic_models = save_topic_models
         self.force_regenerate_samples = force_regenerate_samples
         self.force_regenerate_topics = force_regenerate_topics
         self.force_regenerate_evaluation = force_regenerate_evaluation
@@ -438,6 +442,45 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
+    def sample_qrels_labeled(self) -> Dict[str, Any]:
+        """Method 5: QRELs labeled documents (ground truth relevance)"""
+        logger.info(f"Method 5: QRELs labeled documents ({self.sample_size} docs)")
+
+        cache_path = os.path.join(self.samples_dir, "qrels_labeled.pkl")
+
+        def compute():
+            # Get all relevant documents (score > 0) from qrels
+            _, _, overall_relevant = SearchEvaluationUtils.build_qrels_dicts(
+                self.qrels_dataset
+            )
+
+            query_id_int = int(self.query_id)
+
+            if query_id_int not in overall_relevant:
+                raise ValueError(f"Query ID {query_id_int} has no labeled documents in qrels")
+
+            relevant_doc_ids = list(overall_relevant[query_id_int])
+
+            logger.info(f"Found {len(relevant_doc_ids)} labeled documents in qrels")
+
+            # Extract document texts using SearchEngine
+            doc_texts = []
+            extracted_doc_ids = []
+
+            for doc_id in tqdm(relevant_doc_ids, desc="Extracting qrels docs"):
+                doc_text = self.search_engine.get_document_by_id(doc_id)
+                doc_texts.append(doc_text)
+                extracted_doc_ids.append(doc_id)
+
+            return {
+                "method": "qrels_labeled",
+                "doc_ids": extracted_doc_ids,
+                "doc_texts": doc_texts,
+                "sample_size": len(extracted_doc_ids)
+            }
+
+        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+
     def _reciprocal_rank_fusion(
         self,
         rankings: List[List[Tuple[str, float]]],
@@ -531,9 +574,13 @@ class EndToEndEvaluator:
                         # Fallback to label we created
                         topic_names[topic_id] = topic_labels.get(topic_id, f"Topic_{topic_id}")
 
-            # Save model
-            topic_model.save(model_cache_path, serialization="pickle")
-            logger.info(f"Saved topic model to {model_cache_path}")
+            # Save model (optional - only if save_topic_models=True)
+            # Models are 420 MB each and only needed for interactive exploration
+            if self.save_topic_models:
+                topic_model.save(model_cache_path, serialization="pickle")
+                logger.info(f"Saved topic model to {model_cache_path}")
+            else:
+                logger.info(f"Skipping model save (save_topic_models=False) - saving ~420 MB")
 
             # Convert to list if needed (topics might be list or numpy array)
             topics_list = topics.tolist() if hasattr(topics, 'tolist') else topics
@@ -1536,6 +1583,7 @@ class EndToEndEvaluator:
         samples["direct_retrieval"] = self.sample_direct_retrieval()
         samples["query_expansion"] = self.sample_query_expansion()
         samples["keyword_search"] = self.sample_keyword_search()
+        samples["qrels_labeled"] = self.sample_qrels_labeled()
 
         # Step 2: Run topic modeling
         logger.info("\n" + "="*80)
@@ -1615,13 +1663,363 @@ class EndToEndEvaluator:
         }
 
 
+def aggregate_cross_query_results(
+    results_base_dir: str,
+    query_ids: List[str],
+    output_dir: str = None
+) -> Dict[str, Any]:
+    """
+    Aggregate results across all queries to understand overall method performance.
+
+    Args:
+        results_base_dir: Base directory containing query result folders
+        query_ids: List of query IDs to aggregate
+        output_dir: Directory to save aggregated results (default: results_base_dir/aggregate_results)
+
+    Returns:
+        Dictionary containing aggregated metrics
+    """
+    logger.info("="*80)
+    logger.info("Aggregating Results Across Queries")
+    logger.info("="*80)
+
+    if output_dir is None:
+        output_dir = os.path.join(results_base_dir, "aggregate_results")
+
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
+
+    # Collect all per-method summaries
+    per_method_data = []
+    pairwise_data = []
+
+    logger.info(f"Loading results from {len(query_ids)} queries...")
+
+    for query_id in query_ids:
+        query_dir = os.path.join(results_base_dir, f"query_{query_id}", "results")
+
+        # Load per-method summary
+        per_method_csv = os.path.join(query_dir, "per_method_summary.csv")
+        if os.path.exists(per_method_csv):
+            df = pd.read_csv(per_method_csv)
+            df['query_id'] = query_id
+            per_method_data.append(df)
+        else:
+            logger.warning(f"Missing per_method_summary.csv for query {query_id}")
+
+        # Load pairwise metrics
+        pairwise_json = os.path.join(query_dir, "pairwise_metrics.json")
+        if os.path.exists(pairwise_json):
+            with open(pairwise_json, 'r') as f:
+                pairwise = json.load(f)
+                for item in pairwise:
+                    item['query_id'] = query_id
+                pairwise_data.extend(pairwise)
+        else:
+            logger.warning(f"Missing pairwise_metrics.json for query {query_id}")
+
+    if not per_method_data:
+        logger.error("No per-method data found!")
+        return None
+
+    # Combine all data
+    all_per_method = pd.concat(per_method_data, ignore_index=True)
+    all_pairwise = pd.DataFrame(pairwise_data)
+
+    logger.info(f"Loaded data from {len(per_method_data)} queries")
+    logger.info(f"Total per-method records: {len(all_per_method)}")
+    logger.info(f"Total pairwise records: {len(all_pairwise)}")
+
+    # ===== PER-METHOD AGGREGATION =====
+    logger.info("\nAggregating per-method metrics...")
+
+    # Metrics to aggregate with mean/std/median/min/max
+    aggregatable_metrics = [
+        'diversity_semantic',
+        'diversity_lexical',
+        'npmi_coherence',
+        'embedding_coherence',
+        'outlier_ratio',
+        'document_coverage',
+        'topic_query_similarity',
+        'max_query_similarity',
+        'query_relevant_ratio',
+        'top3_avg_similarity'
+    ]
+
+    # Metrics to report but not aggregate (query-dependent)
+    descriptive_metrics = ['n_topics', 'avg_topic_size']
+
+    per_method_aggregates = []
+
+    for method in all_per_method['method'].unique():
+        method_data = all_per_method[all_per_method['method'] == method]
+
+        agg_record = {'method': method, 'n_queries': len(method_data)}
+
+        # Aggregate main metrics
+        for metric in aggregatable_metrics:
+            if metric in method_data.columns:
+                values = method_data[metric].dropna()
+                if len(values) > 0:
+                    agg_record[f'{metric}_mean'] = values.mean()
+                    agg_record[f'{metric}_std'] = values.std()
+                    agg_record[f'{metric}_median'] = values.median()
+                    agg_record[f'{metric}_min'] = values.min()
+                    agg_record[f'{metric}_max'] = values.max()
+
+        # Report descriptive metrics
+        for metric in descriptive_metrics:
+            if metric in method_data.columns:
+                values = method_data[metric].dropna()
+                if len(values) > 0:
+                    agg_record[f'{metric}_mean'] = values.mean()
+                    agg_record[f'{metric}_std'] = values.std()
+
+        per_method_aggregates.append(agg_record)
+
+    per_method_agg_df = pd.DataFrame(per_method_aggregates)
+
+    # Save per-method aggregates
+    per_method_csv_path = os.path.join(output_dir, "per_method_aggregates.csv")
+    per_method_json_path = os.path.join(output_dir, "per_method_aggregates.json")
+
+    per_method_agg_df.to_csv(per_method_csv_path, index=False)
+    per_method_agg_df.to_json(per_method_json_path, orient='records', indent=2)
+
+    logger.info(f"Saved per-method aggregates to {per_method_csv_path}")
+
+    # ===== PAIRWISE AGGREGATION =====
+    logger.info("\nAggregating pairwise metrics...")
+
+    # Metrics to aggregate
+    pairwise_aggregatable = [
+        'diversity_semantic_diff',
+        'diversity_lexical_diff',
+        'npmi_coherence_diff',
+        'embedding_coherence_diff',
+        'topic_query_similarity_diff',
+        'outlier_ratio_diff',
+        'topic_word_overlap_mean',
+        'topic_semantic_similarity_mean',
+        'precision_b_@05',
+        'recall_a_@05',
+        'f1_@05',
+        'precision_b_@06',
+        'recall_a_@06',
+        'f1_@06',
+        'precision_b_@07',
+        'recall_a_@07',
+        'f1_@07',
+        'ari',
+        'nmi'
+    ]
+
+    pairwise_aggregates = []
+
+    # Group by method pair
+    if 'method_a' in all_pairwise.columns and 'method_b' in all_pairwise.columns:
+        for (method_a, method_b), group in all_pairwise.groupby(['method_a', 'method_b']):
+            agg_record = {
+                'method_a': method_a,
+                'method_b': method_b,
+                'n_queries': len(group)
+            }
+
+            for metric in pairwise_aggregatable:
+                if metric in group.columns:
+                    values = group[metric].dropna()
+                    if len(values) > 0:
+                        agg_record[f'{metric}_mean'] = values.mean()
+                        agg_record[f'{metric}_std'] = values.std()
+                        agg_record[f'{metric}_median'] = values.median()
+                        agg_record[f'{metric}_min'] = values.min()
+                        agg_record[f'{metric}_max'] = values.max()
+
+            pairwise_aggregates.append(agg_record)
+
+    pairwise_agg_df = pd.DataFrame(pairwise_aggregates)
+
+    # Save pairwise aggregates
+    pairwise_csv_path = os.path.join(output_dir, "pairwise_aggregates.csv")
+    pairwise_json_path = os.path.join(output_dir, "pairwise_aggregates.json")
+
+    pairwise_agg_df.to_csv(pairwise_csv_path, index=False)
+    pairwise_agg_df.to_json(pairwise_json_path, orient='records', indent=2)
+
+    logger.info(f"Saved pairwise aggregates to {pairwise_csv_path}")
+
+    # ===== VISUALIZATIONS =====
+    logger.info("\nGenerating aggregate visualizations...")
+
+    _generate_aggregate_visualizations(
+        all_per_method,
+        all_pairwise,
+        per_method_agg_df,
+        pairwise_agg_df,
+        output_dir
+    )
+
+    logger.info("="*80)
+    logger.info("Cross-Query Aggregation Complete!")
+    logger.info(f"Results saved to: {output_dir}")
+    logger.info("="*80)
+
+    return {
+        'per_method_aggregates': per_method_agg_df,
+        'pairwise_aggregates': pairwise_agg_df,
+        'raw_per_method': all_per_method,
+        'raw_pairwise': all_pairwise
+    }
+
+
+def _generate_aggregate_visualizations(
+    all_per_method: pd.DataFrame,
+    all_pairwise: pd.DataFrame,
+    per_method_agg: pd.DataFrame,
+    pairwise_agg: pd.DataFrame,
+    output_dir: str
+):
+    """Generate visualizations for aggregated results"""
+
+    plots_dir = os.path.join(output_dir, "plots")
+
+    # Set style
+    sns.set_style("whitegrid")
+    plt.rcParams['figure.facecolor'] = 'white'
+
+    # 1. Method Quality Comparison (Boxplots)
+    logger.info("Creating method quality comparison plots...")
+
+    quality_metrics = [
+        ('npmi_coherence', 'NPMI Coherence'),
+        ('embedding_coherence', 'Embedding Coherence'),
+        ('diversity_semantic', 'Semantic Diversity'),
+        ('diversity_lexical', 'Lexical Diversity'),
+        ('document_coverage', 'Document Coverage'),
+        ('outlier_ratio', 'Outlier Ratio')
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+
+    for idx, (metric, title) in enumerate(quality_metrics):
+        if metric in all_per_method.columns:
+            sns.boxplot(data=all_per_method, x='method', y=metric, ax=axes[idx])
+            axes[idx].set_title(f'{title} Across Queries', fontsize=12, fontweight='bold')
+            axes[idx].set_xlabel('Method', fontsize=10)
+            axes[idx].set_ylabel(title, fontsize=10)
+            axes[idx].tick_params(axis='x', rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "method_quality_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 2. Method Alignment Comparison (Boxplots)
+    logger.info("Creating method alignment comparison plots...")
+
+    alignment_metrics = [
+        ('topic_query_similarity', 'Avg Topic-Query Similarity'),
+        ('max_query_similarity', 'Max Topic-Query Similarity'),
+        ('query_relevant_ratio', 'Query-Relevant Ratio'),
+        ('top3_avg_similarity', 'Top-3 Avg Similarity')
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.flatten()
+
+    for idx, (metric, title) in enumerate(alignment_metrics):
+        if metric in all_per_method.columns:
+            sns.boxplot(data=all_per_method, x='method', y=metric, ax=axes[idx])
+            axes[idx].set_title(f'{title} Across Queries', fontsize=12, fontweight='bold')
+            axes[idx].set_xlabel('Method', fontsize=10)
+            axes[idx].set_ylabel(title, fontsize=10)
+            axes[idx].tick_params(axis='x', rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, "method_alignment_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 3. Pairwise Coherence Difference Heatmap
+    logger.info("Creating pairwise difference heatmaps...")
+
+    pairwise_heatmap_metrics = [
+        ('npmi_coherence_diff_mean', 'Avg NPMI Coherence Difference', 'RdYlGn'),
+        ('embedding_coherence_diff_mean', 'Avg Embedding Coherence Difference', 'RdYlGn'),
+        ('diversity_semantic_diff_mean', 'Avg Semantic Diversity Difference', 'RdYlGn'),
+        ('topic_query_similarity_diff_mean', 'Avg Topic-Query Similarity Difference', 'RdYlGn'),
+        ('f1_@05_mean', 'Avg F1 Score @ 0.5 Threshold', 'YlGnBu'),
+        ('topic_word_overlap_mean_mean', 'Avg Topic Word Overlap', 'YlOrRd'),
+        ('topic_semantic_similarity_mean_mean', 'Avg Topic Semantic Similarity', 'YlOrRd')
+    ]
+
+    for metric, title, cmap in pairwise_heatmap_metrics:
+        if metric in pairwise_agg.columns:
+            # Create pivot table
+            methods = sorted(set(pairwise_agg['method_a'].tolist() + pairwise_agg['method_b'].tolist()))
+            pivot_data = np.zeros((len(methods), len(methods)))
+            pivot_data[:] = np.nan
+
+            method_to_idx = {m: i for i, m in enumerate(methods)}
+
+            for _, row in pairwise_agg.iterrows():
+                i = method_to_idx[row['method_a']]
+                j = method_to_idx[row['method_b']]
+                value = row[metric]
+                if pd.notna(value):
+                    pivot_data[i, j] = value
+                    # For symmetric metrics, mirror the value
+                    if 'diff' not in metric:
+                        pivot_data[j, i] = value
+                    else:
+                        pivot_data[j, i] = -value
+
+            # Create heatmap
+            fig, ax = plt.subplots(figsize=(10, 8))
+
+            # Determine color scale center
+            if 'diff' in metric:
+                vmax = np.nanmax(np.abs(pivot_data))
+                vmin = -vmax
+                center = 0
+            else:
+                vmin = np.nanmin(pivot_data)
+                vmax = np.nanmax(pivot_data)
+                center = None
+
+            sns.heatmap(
+                pivot_data,
+                annot=True,
+                fmt='.3f',
+                cmap=cmap,
+                center=center,
+                vmin=vmin,
+                vmax=vmax,
+                xticklabels=methods,
+                yticklabels=methods,
+                ax=ax,
+                cbar_kws={'label': title}
+            )
+
+            ax.set_title(f'{title}\n(Averaged Across Queries)', fontsize=14, fontweight='bold')
+
+            plt.tight_layout()
+
+            # Create safe filename
+            safe_metric = metric.replace('_mean', '').replace('@', '-at-').replace('_', '-')
+            plt.savefig(os.path.join(plots_dir, f"pairwise_{safe_metric}_heatmap.png"), dpi=300, bbox_inches='tight')
+            plt.close()
+
+    logger.info(f"Saved all aggregate visualizations to {plots_dir}")
+
+
 def main():
     """Main function"""
 
     # ===== CONFIGURATION PARAMETERS =====
 
     # Query configuration - can be a single query ID or a list of query IDs
-    QUERY_IDS = ["2", "9", "27", "43"]  # Change to a single string like "9" to run only one query
+    QUERY_IDS = ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]  # 15 open-ended queries
 
     # Sample size (None = auto-determine from qrels)
     SAMPLE_SIZE = None
@@ -1639,6 +2037,12 @@ def main():
 
     # Device configuration
     DEVICE = "cpu"  # Use "cpu" to avoid CUDA errors, "cuda" if GPU is compatible
+
+    # Topic model saving configuration
+    # Set to True to save full BERTopic models (420 MB each, only needed for interactive exploration)
+    # Set to False to save only results (30-500 KB each, sufficient for evaluation)
+    # Default: False (saves ~31.5 GB for 15 queries × 5 methods)
+    SAVE_TOPIC_MODELS = False
 
     # Force flags
     FORCE_REGENERATE_SAMPLES = False
@@ -1689,6 +2093,7 @@ def main():
             cache_dir=CACHE_DIR,
             random_seed=RANDOM_SEED,
             device=DEVICE,
+            save_topic_models=SAVE_TOPIC_MODELS,
             force_regenerate_samples=FORCE_REGENERATE_SAMPLES,
             force_regenerate_topics=FORCE_REGENERATE_TOPICS,
             force_regenerate_evaluation=FORCE_REGENERATE_EVALUATION
@@ -1705,6 +2110,28 @@ def main():
     logger.info(f"Processed {len(query_ids_to_run)} queries: {', '.join(query_ids_to_run)}")
     logger.info(f"Results saved to: {OUTPUT_DIR}")
     logger.info("="*80 + "\n")
+
+    # ===== AGGREGATE CROSS-QUERY RESULTS =====
+
+    # Only run aggregation if we processed multiple queries
+    if len(query_ids_to_run) > 1:
+        logger.info("\n" + "="*80)
+        logger.info("AGGREGATING RESULTS ACROSS ALL QUERIES")
+        logger.info("="*80 + "\n")
+
+        aggregate_results = aggregate_cross_query_results(
+            results_base_dir=OUTPUT_DIR,
+            query_ids=query_ids_to_run
+        )
+
+        if aggregate_results:
+            logger.info("\n" + "="*80)
+            logger.info("AGGREGATION COMPLETE!")
+            logger.info("="*80)
+            logger.info(f"Aggregate results saved to: {OUTPUT_DIR}/aggregate_results")
+            logger.info("="*80 + "\n")
+    else:
+        logger.info("\nSkipping cross-query aggregation (only 1 query processed)")
 
     return all_results
 
