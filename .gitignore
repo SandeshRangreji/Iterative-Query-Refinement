@@ -189,6 +189,9 @@ results/*
 .DS_Store
 
 # HPC related files
-*.sh 
+*.sh
 *.err
 *.out
+
+# CLSP Grid experiment results
+clsp_grid_files/
