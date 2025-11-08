@@ -244,24 +244,25 @@ class Sampler:
         """
         logger.info(f"Initializing indices and models for corpus size: {len(self.corpus_dataset)}...")
         
-        # Generate corpus-specific cache paths
-        corpus_cache_dir = self._generate_corpus_cache_dir()
+        # Create a corpus-specific dataset name for automatic cache separation
+        if self.corpus_subset_size is None:
+            effective_dataset_name = self.dataset_name
+        else:
+            effective_dataset_name = f"{self.dataset_name}-subset{self.corpus_cache_size}"
         
         # Build BM25 index
-        bm25_cache_path = os.path.join(corpus_cache_dir, "indices", "bm25_index.pkl")
         self.bm25, self.corpus_texts, self.corpus_ids = self.index_manager.build_bm25_index(
             self.corpus_dataset,
-            cache_path=bm25_cache_path,
+            dataset_name=effective_dataset_name,
             force_reindex=force_reindex
         )
         
         # Build SBERT index
-        sbert_cache_path = os.path.join(corpus_cache_dir, "indices", "sbert_index.pt")
         self.sbert_model, self.doc_embeddings = self.index_manager.build_sbert_index(
             self.corpus_texts,
             model_name=self.embedding_model_name,
+            dataset_name=effective_dataset_name,
             batch_size=64,
-            cache_path=sbert_cache_path,
             force_reindex=force_reindex
         )
         

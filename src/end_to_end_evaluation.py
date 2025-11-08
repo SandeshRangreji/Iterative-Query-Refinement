@@ -2,12 +2,11 @@
 """
 End-to-end evaluation of BERTopic using different sampling strategies with pairwise comparisons.
 
-Compares 5 methods:
+Compares 4 methods:
 1. Random Uniform Sampling
 2. Direct Retrieval (Hybrid BM25+SBERT)
 3. Query Expansion + Retrieval
 4. Simple Keyword Search (BM25 only)
-5. QRELs Labeled Documents (Ground truth relevance)
 
 METRICS IMPLEMENTED:
 
@@ -157,12 +156,9 @@ class EndToEndEvaluator:
         self.query_text = self._get_query_text()
         logger.info(f"Query {query_id}: {self.query_text}")
 
-        # Determine sample size from qrels if not provided
-        if sample_size is None:
-            self.sample_size = self._get_qrels_sample_size()
-            logger.info(f"Sample size determined from qrels: {self.sample_size}")
-        else:
-            self.sample_size = sample_size
+        # Set sample size
+        self.sample_size = sample_size
+        logger.info(f"Sample size: {self.sample_size}")
 
         # Create output directories (new unified structure)
         self.output_dir = os.path.join(output_dir, f"query_{query_id}")
@@ -193,17 +189,6 @@ class EndToEndEvaluator:
                 return query["text"]
         raise ValueError(f"Query ID {self.query_id} not found in queries dataset")
 
-    def _get_qrels_sample_size(self) -> int:
-        """Determine sample size from qrels labeled documents"""
-        _, _, overall_relevant = SearchEvaluationUtils.build_qrels_dicts(self.qrels_dataset)
-
-        # Convert query_id to int for qrels lookup
-        query_id_int = int(self.query_id)
-
-        if query_id_int not in overall_relevant:
-            raise ValueError(f"Query ID {query_id_int} has no labeled documents in qrels")
-
-        return len(overall_relevant[query_id_int])
 
     def _save_config(self):
         """Save configuration to JSON"""
@@ -442,44 +427,6 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
-    def sample_qrels_labeled(self) -> Dict[str, Any]:
-        """Method 5: QRELs labeled documents (ground truth relevance)"""
-        logger.info(f"Method 5: QRELs labeled documents ({self.sample_size} docs)")
-
-        cache_path = os.path.join(self.samples_dir, "qrels_labeled.pkl")
-
-        def compute():
-            # Get all relevant documents (score > 0) from qrels
-            _, _, overall_relevant = SearchEvaluationUtils.build_qrels_dicts(
-                self.qrels_dataset
-            )
-
-            query_id_int = int(self.query_id)
-
-            if query_id_int not in overall_relevant:
-                raise ValueError(f"Query ID {query_id_int} has no labeled documents in qrels")
-
-            relevant_doc_ids = list(overall_relevant[query_id_int])
-
-            logger.info(f"Found {len(relevant_doc_ids)} labeled documents in qrels")
-
-            # Extract document texts using SearchEngine
-            doc_texts = []
-            extracted_doc_ids = []
-
-            for doc_id in tqdm(relevant_doc_ids, desc="Extracting qrels docs"):
-                doc_text = self.search_engine.get_document_by_id(doc_id)
-                doc_texts.append(doc_text)
-                extracted_doc_ids.append(doc_id)
-
-            return {
-                "method": "qrels_labeled",
-                "doc_ids": extracted_doc_ids,
-                "doc_texts": doc_texts,
-                "sample_size": len(extracted_doc_ids)
-            }
-
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
     def _reciprocal_rank_fusion(
         self,
@@ -1583,7 +1530,6 @@ class EndToEndEvaluator:
         samples["direct_retrieval"] = self.sample_direct_retrieval()
         samples["query_expansion"] = self.sample_query_expansion()
         samples["keyword_search"] = self.sample_keyword_search()
-        samples["qrels_labeled"] = self.sample_qrels_labeled()
 
         # Step 2: Run topic modeling
         logger.info("\n" + "="*80)
@@ -2021,8 +1967,8 @@ def main():
     # Query configuration - can be a single query ID or a list of query IDs
     QUERY_IDS = ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]  # 15 open-ended queries
 
-    # Sample size (None = auto-determine from qrels)
-    SAMPLE_SIZE = None
+    # Sample size (fixed at 1000 documents for all methods)
+    SAMPLE_SIZE = 1000
 
     # Model configuration
     EMBEDDING_MODEL = "all-mpnet-base-v2"
@@ -2041,13 +1987,13 @@ def main():
     # Topic model saving configuration
     # Set to True to save full BERTopic models (420 MB each, only needed for interactive exploration)
     # Set to False to save only results (30-500 KB each, sufficient for evaluation)
-    # Default: False (saves ~31.5 GB for 15 queries × 5 methods)
+    # Default: False (saves ~25.2 GB for 15 queries × 4 methods)
     SAVE_TOPIC_MODELS = False
 
-    # Force flags
-    FORCE_REGENERATE_SAMPLES = False
-    FORCE_REGENERATE_TOPICS = False
-    FORCE_REGENERATE_EVALUATION = False
+    # Force flags - SET TO TRUE FOR NEW SAMPLE SIZE (1000 docs)
+    FORCE_REGENERATE_SAMPLES = True
+    FORCE_REGENERATE_TOPICS = True
+    FORCE_REGENERATE_EVALUATION = True
 
     # Random seed
     RANDOM_SEED = 42
