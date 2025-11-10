@@ -1,13 +1,17 @@
+# Minimal requirements.txt - dependencies auto-resolved
+
+# Core packages directly used
 datasets==3.4.1
-rank-bm25==0.2.2
 sentence-transformers==3.4.1
-ir-datasets==0.5.10
-nltk==3.9.1
-rake-nltk==1.0.6
-yake==0.4.8
-keybert==0.9.0
 bertopic==0.17.0
 matplotlib==3.10.1
 seaborn==0.13.2
 plotly==6.0.1
-kaleido==0.2.1
+
+# NLP packages directly used
+nltk==3.9.1
+rank-bm25==0.2.2
+keybert==0.9.0
+
+# GPU acceleration
+cupy-cuda11x>=11.0.0

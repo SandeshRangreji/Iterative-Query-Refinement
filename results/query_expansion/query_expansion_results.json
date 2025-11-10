@@ -14,8 +14,8 @@
     },
     "avg_recalls": {
       "relevant": 0.43656335137230096,
-      "highly_relevant": 0.6071586238133138,
-      "overall": 0.5366263545095924
+      "highly_relevant": 0.6070735174303351,
+      "overall": 0.5366032864588427
     },
     "num_evaluated": 50
   },
@@ -54,8 +54,8 @@
     },
     "avg_recalls": {
       "relevant": 0.36449481367824865,
-      "highly_relevant": 0.5429544637133898,
-      "overall": 0.46832896323238415
+      "highly_relevant": 0.5429979419742594,
+      "overall": 0.46835221904633767
     },
     "num_evaluated": 50
   },
@@ -74,8 +74,8 @@
     },
     "avg_recalls": {
       "relevant": 0.36449481367824865,
-      "highly_relevant": 0.5429544637133898,
-      "overall": 0.46832896323238415
+      "highly_relevant": 0.5429979419742594,
+      "overall": 0.46835221904633767
     },
     "num_evaluated": 50
   }
