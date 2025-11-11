@@ -77,6 +77,7 @@ from search import (
     HybridStrategy
 )
 from evaluation import SearchEvaluationUtils
+from topic_models import TopicModelWrapper
 
 # Configure logging
 logging.basicConfig(
@@ -103,7 +104,9 @@ class EndToEndEvaluator:
         embedding_model_name: str = "all-mpnet-base-v2",
         cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         dataset_name: str = "trec-covid",
-        output_dir: str = "results/topic_evaluation",
+        topic_model_type: str = "bertopic",
+        topic_model_params: Optional[Dict] = None,
+        output_dir: str = "results",
         cache_dir: str = "cache",
         random_seed: int = 42,
         device: str = "cpu",
@@ -124,6 +127,8 @@ class EndToEndEvaluator:
             embedding_model_name: Name of embedding model
             cross_encoder_model_name: Name of cross-encoder model
             dataset_name: Dataset name for caching
+            topic_model_type: Type of topic model ('bertopic', 'lda', 'topicgpt')
+            topic_model_params: Model-specific parameters dict
             output_dir: Output directory for results
             cache_dir: Cache directory
             random_seed: Random seed for reproducibility
@@ -140,6 +145,8 @@ class EndToEndEvaluator:
         self.embedding_model_name = embedding_model_name
         self.cross_encoder_model_name = cross_encoder_model_name
         self.dataset_name = dataset_name
+        self.topic_model_type = topic_model_type
+        self.topic_model_params = topic_model_params or {}
         self.cache_dir = cache_dir
         self.random_seed = random_seed
         self.device = device
@@ -161,7 +168,12 @@ class EndToEndEvaluator:
         logger.info(f"Sample size: {self.sample_size}")
 
         # Create output directories (new unified structure)
-        self.output_dir = os.path.join(output_dir, f"query_{query_id}")
+        self.output_dir = os.path.join(
+            output_dir,
+            self.dataset_name,
+            self.topic_model_type,
+            f"query_{query_id}"
+        )
         self.samples_dir = os.path.join(self.output_dir, "samples")
         self.topic_models_dir = os.path.join(self.output_dir, "topic_models")
         self.results_dir = os.path.join(self.output_dir, "results")
@@ -199,6 +211,8 @@ class EndToEndEvaluator:
             "embedding_model": self.embedding_model_name,
             "cross_encoder_model": self.cross_encoder_model_name,
             "dataset_name": self.dataset_name,
+            "topic_model_type": self.topic_model_type,
+            "topic_model_params": self.topic_model_params,
             "random_seed": self.random_seed,
             "force_flags": {
                 "samples": self.force_regenerate_samples,
@@ -445,9 +459,9 @@ class EndToEndEvaluator:
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     def run_topic_modeling(self, sample: Dict[str, Any]) -> Dict[str, Any]:
-        """Run BERTopic on a document sample"""
+        """Run topic modeling on a document sample"""
         method = sample["method"]
-        logger.info(f"Running BERTopic on {method} ({sample['sample_size']} docs)")
+        logger.info(f"Running {self.topic_model_type} on {method} ({sample['sample_size']} docs)")
 
         model_cache_path = os.path.join(self.topic_models_dir, f"{method}_model.pkl")
         results_cache_path = os.path.join(self.topic_models_dir, f"{method}_results.pkl")
@@ -456,96 +470,22 @@ class EndToEndEvaluator:
             docs = sample["doc_texts"]
             doc_ids = sample["doc_ids"]
 
-            # Initialize SentenceTransformer with explicit device
-            from sentence_transformers import SentenceTransformer
-            from hdbscan import HDBSCAN
-            from sklearn.feature_extraction.text import CountVectorizer
-            embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
-
-            # Initialize HDBSCAN with fixed min_cluster_size for consistency
-            hdbscan_model = HDBSCAN(
-                min_cluster_size=5,
-                metric='euclidean',
-                cluster_selection_method='eom',
-                prediction_data=True
+            # Use wrapper to dispatch to appropriate topic model
+            topic_model = TopicModelWrapper(
+                model_type=self.topic_model_type,
+                **self.topic_model_params
             )
 
-            # Configure CountVectorizer to remove stopwords and filter short words
-            vectorizer_model = CountVectorizer(
-                stop_words='english',
-                min_df=2,  # Minimum document frequency
-                ngram_range=(1, 2),  # Unigrams and bigrams
-                max_features=10000  # Limit vocabulary size
+            # Call wrapper - returns EXACT same dict structure as before
+            results = topic_model.fit_and_get_results(
+                docs=docs,
+                doc_ids=doc_ids,
+                method_name=method,
+                embedding_model_name=self.embedding_model_name,
+                device=self.device,
+                save_model=self.save_topic_models,
+                model_path=model_cache_path if self.save_topic_models else None
             )
-
-            # Initialize BERTopic with pre-loaded embedding model and fixed parameters
-            topic_model = BERTopic(
-                embedding_model=embedding_model,
-                hdbscan_model=hdbscan_model,
-                vectorizer_model=vectorizer_model,
-                verbose=True,
-                calculate_probabilities=True
-            )
-
-            # Fit model
-            logger.info(f"Fitting BERTopic on {len(docs)} documents...")
-            topics, probs = topic_model.fit_transform(docs)
-
-            # Get topic info
-            topic_info = topic_model.get_topic_info()
-
-            # Get topic representations with scores
-            topic_words = {}
-            topic_words_with_scores = {}
-            topic_labels = {}
-
-            for topic_id in topic_info['Topic']:
-                if topic_id != -1:  # Skip outlier topic
-                    words = topic_model.get_topic(topic_id)
-                    topic_words[topic_id] = [word for word, _ in words]
-                    topic_words_with_scores[topic_id] = [(word, float(score)) for word, score in words]
-
-                    # Generate readable topic label from top words
-                    top_words = "_".join([word for word, _ in words[:3]])
-                    topic_labels[topic_id] = top_words
-
-            # Get topic names from BERTopic (auto-generated labels)
-            topic_names = {}
-            for topic_id in topic_info['Topic']:
-                if topic_id != -1:
-                    # BERTopic stores names in topic_info
-                    topic_row = topic_info[topic_info['Topic'] == topic_id]
-                    if not topic_row.empty and 'Name' in topic_row.columns:
-                        topic_names[topic_id] = topic_row['Name'].values[0]
-                    else:
-                        # Fallback to label we created
-                        topic_names[topic_id] = topic_labels.get(topic_id, f"Topic_{topic_id}")
-
-            # Save model (optional - only if save_topic_models=True)
-            # Models are 420 MB each and only needed for interactive exploration
-            if self.save_topic_models:
-                topic_model.save(model_cache_path, serialization="pickle")
-                logger.info(f"Saved topic model to {model_cache_path}")
-            else:
-                logger.info(f"Skipping model save (save_topic_models=False) - saving ~420 MB")
-
-            # Convert to list if needed (topics might be list or numpy array)
-            topics_list = topics.tolist() if hasattr(topics, 'tolist') else topics
-            probs_list = probs.tolist() if probs is not None and hasattr(probs, 'tolist') else probs
-
-            results = {
-                "method": method,
-                "doc_ids": doc_ids,
-                "topics": topics_list,
-                "probabilities": probs_list,
-                "topic_info": topic_info.to_dict(),
-                "topic_words": topic_words,
-                "topic_words_with_scores": topic_words_with_scores,
-                "topic_labels": topic_labels,
-                "topic_names": topic_names,
-                "n_topics": len(topic_words),
-                "n_docs": len(docs)
-            }
 
             return results
 
@@ -1609,6 +1549,249 @@ class EndToEndEvaluator:
         }
 
 
+def create_cross_query_intrinsic_plots(
+    all_per_method: pd.DataFrame,
+    output_dir: str
+):
+    """
+    Create cross-query intrinsic metric visualizations.
+    Consolidates functionality from visualize_intrinsic_metrics.py
+
+    Args:
+        all_per_method: DataFrame with per-method metrics across all queries
+        output_dir: Directory to save plots
+    """
+    logger.info("Creating cross-query intrinsic metric visualizations...")
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Define method colors for consistency
+    method_colors = {
+        "random_uniform": "#e74c3c",      # Red
+        "direct_retrieval": "#3498db",    # Blue
+        "query_expansion": "#2ecc71",     # Green
+        "keyword_search": "#f39c12"       # Orange
+    }
+
+    # Get available methods
+    methods = sorted(all_per_method['method'].unique())
+    queries = sorted(all_per_method['query_id'].unique())
+
+    # 1. DIVERSITY ANALYSIS
+    if 'diversity_semantic' in all_per_method.columns:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Topic Diversity Across Methods and Queries', fontsize=16, fontweight='bold')
+
+        # Plot 1: Bar chart by query
+        ax = axes[0, 0]
+        pivot = all_per_method.pivot(index='query_id', columns='method', values='diversity_semantic')
+        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
+        ax.set_title('Semantic Diversity by Query', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Query', fontsize=12)
+        ax.set_ylabel('Diversity (higher = more diverse)', fontsize=12)
+        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Plot 2: Method comparison (averaged across queries)
+        ax = axes[0, 1]
+        method_avg = all_per_method.groupby('method')['diversity_semantic'].agg(['mean', 'std']).reset_index()
+        method_avg = method_avg.sort_values('mean', ascending=False)
+        x_pos = np.arange(len(method_avg))
+        bars = ax.bar(x_pos, method_avg['mean'], yerr=method_avg['std'],
+                      color=[method_colors.get(m, '#95a5a6') for m in method_avg['method']],
+                      capsize=5, alpha=0.8, edgecolor='black', linewidth=1.5)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(method_avg['method'], fontsize=11)
+        ax.set_title('Average Diversity by Method', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Diversity (mean ± std)', fontsize=12)
+        ax.grid(axis='y', alpha=0.3)
+
+        for i, (bar, mean_val) in enumerate(zip(bars, method_avg['mean'])):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                    f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        # Plot 3: Heatmap
+        ax = axes[1, 0]
+        heatmap_data = all_per_method.pivot(index='query_id', columns='method', values='diversity_semantic')
+        sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax,
+                    cbar_kws={'label': 'Diversity'})
+        ax.set_title('Diversity Heatmap', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Query', fontsize=12)
+
+        # Plot 4: Line plot (trend across queries)
+        ax = axes[1, 1]
+        for method in methods:
+            method_data = all_per_method[all_per_method['method'] == method].sort_values('query_id')
+            ax.plot(method_data['query_id'], method_data['diversity_semantic'],
+                    marker='o', linewidth=2, markersize=8, label=method,
+                    color=method_colors.get(method, '#95a5a6'))
+        ax.set_title('Diversity Trend Across Queries', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Query', fontsize=12)
+        ax.set_ylabel('Diversity', fontsize=12)
+        ax.legend(title='Method', loc='best')
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cross_query_diversity_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ Saved diversity analysis")
+
+    # 2. DOCUMENT COVERAGE (1 - outlier_ratio)
+    if 'document_coverage' in all_per_method.columns:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle('Document Coverage Across Methods and Queries', fontsize=16, fontweight='bold')
+
+        # Plot 1: Bar chart by query
+        ax = axes[0, 0]
+        pivot = all_per_method.pivot(index='query_id', columns='method', values='document_coverage')
+        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
+        ax.set_title('Document Coverage by Query', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Query', fontsize=12)
+        ax.set_ylabel('Coverage (higher = better)', fontsize=12)
+        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Plot 2: Method comparison
+        ax = axes[0, 1]
+        method_avg = all_per_method.groupby('method')['document_coverage'].agg(['mean', 'std']).reset_index()
+        method_avg = method_avg.sort_values('mean', ascending=False)
+        x_pos = np.arange(len(method_avg))
+        bars = ax.bar(x_pos, method_avg['mean'], yerr=method_avg['std'],
+                      color=[method_colors.get(m, '#95a5a6') for m in method_avg['method']],
+                      capsize=5, alpha=0.8, edgecolor='black', linewidth=1.5)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(method_avg['method'], fontsize=11)
+        ax.set_title('Average Coverage by Method', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Coverage (mean ± std)', fontsize=12)
+        ax.grid(axis='y', alpha=0.3)
+
+        for i, (bar, mean_val) in enumerate(zip(bars, method_avg['mean'])):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+
+        # Plot 3: Heatmap
+        ax = axes[1, 0]
+        heatmap_data = all_per_method.pivot(index='query_id', columns='method', values='document_coverage')
+        sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='YlGn', ax=ax,
+                    cbar_kws={'label': 'Coverage'})
+        ax.set_title('Coverage Heatmap', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Query', fontsize=12)
+
+        # Plot 4: Line plot
+        ax = axes[1, 1]
+        for method in methods:
+            method_data = all_per_method[all_per_method['method'] == method].sort_values('query_id')
+            ax.plot(method_data['query_id'], method_data['document_coverage'],
+                    marker='o', linewidth=2, markersize=8, label=method,
+                    color=method_colors.get(method, '#95a5a6'))
+        ax.set_title('Coverage Trend Across Queries', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Query', fontsize=12)
+        ax.set_ylabel('Coverage', fontsize=12)
+        ax.legend(title='Method', loc='best')
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cross_query_coverage_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ Saved coverage analysis")
+
+    # 3. TOPIC COUNT ANALYSIS
+    if 'n_topics' in all_per_method.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle('Number of Topics Discovered', fontsize=16, fontweight='bold')
+
+        # Plot 1: Bar chart by query
+        ax = axes[0]
+        pivot = all_per_method.pivot(index='query_id', columns='method', values='n_topics')
+        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
+        ax.set_title('Topic Count by Query', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Query', fontsize=12)
+        ax.set_ylabel('Number of Topics', fontsize=12)
+        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        # Plot 2: Heatmap
+        ax = axes[1]
+        heatmap_data = all_per_method.pivot(index='query_id', columns='method', values='n_topics')
+        sns.heatmap(heatmap_data, annot=True, fmt='.0f', cmap='Blues', ax=ax,
+                    cbar_kws={'label': 'Number of Topics'})
+        ax.set_title('Topic Count Heatmap', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Query', fontsize=12)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'cross_query_topic_count.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info("✓ Saved topic count analysis")
+
+    # 4. COMBINED SUMMARY
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Intrinsic Metrics Summary: All Methods & Queries', fontsize=18, fontweight='bold')
+
+    # Plot 1: Diversity comparison
+    if 'diversity_semantic' in all_per_method.columns:
+        ax = axes[0, 0]
+        pivot = all_per_method.pivot(index='method', columns='query_id', values='diversity_semantic')
+        pivot.plot(kind='bar', ax=ax, width=0.8)
+        ax.set_title('Semantic Diversity by Method', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Diversity', fontsize=12)
+        ax.legend(title='Query', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Plot 2: Coverage comparison
+    if 'document_coverage' in all_per_method.columns:
+        ax = axes[0, 1]
+        pivot = all_per_method.pivot(index='method', columns='query_id', values='document_coverage')
+        pivot.plot(kind='bar', ax=ax, width=0.8)
+        ax.set_title('Document Coverage by Method', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Coverage', fontsize=12)
+        ax.legend(title='Query', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Plot 3: Topic count comparison
+    if 'n_topics' in all_per_method.columns:
+        ax = axes[1, 0]
+        pivot = all_per_method.pivot(index='method', columns='query_id', values='n_topics')
+        pivot.plot(kind='bar', ax=ax, width=0.8)
+        ax.set_title('Number of Topics by Method', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('Number of Topics', fontsize=12)
+        ax.legend(title='Query', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    # Plot 4: Coherence comparison
+    if 'npmi_coherence' in all_per_method.columns:
+        ax = axes[1, 1]
+        pivot = all_per_method.pivot(index='method', columns='query_id', values='npmi_coherence')
+        pivot.plot(kind='bar', ax=ax, width=0.8)
+        ax.set_title('NPMI Coherence by Method', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Method', fontsize=12)
+        ax.set_ylabel('NPMI Coherence', fontsize=12)
+        ax.legend(title='Query', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=9)
+        ax.grid(axis='y', alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cross_query_intrinsic_summary.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info("✓ Saved intrinsic metrics summary")
+
+    logger.info(f"✓ All cross-query intrinsic plots saved to {output_dir}")
+
+
 def aggregate_cross_query_results(
     results_base_dir: str,
     query_ids: List[str],
@@ -1958,6 +2141,16 @@ def _generate_aggregate_visualizations(
 
     logger.info(f"Saved all aggregate visualizations to {plots_dir}")
 
+    # Create cross-query intrinsic metric visualizations (consolidates visualize_intrinsic_metrics.py)
+    logger.info("\nCreating cross-query intrinsic metric visualizations...")
+    create_cross_query_intrinsic_plots(all_per_method, plots_dir)
+
+    # Return aggregated data
+    return {
+        "per_method": all_per_method,
+        "pairwise": pairwise_agg
+    }
+
 
 def main():
     """Main function"""
@@ -1977,8 +2170,15 @@ def main():
     # Dataset configuration
     DATASET_NAME = "trec-covid"
 
+    # Topic modeling configuration
+    TOPIC_MODEL_TYPE = "bertopic"  # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_PARAMS = {
+        # Using defaults that match current behavior
+        # Can override: "min_cluster_size": 5, "metric": "euclidean", etc.
+    }
+
     # Directory configuration
-    OUTPUT_DIR = "results/topic_evaluation"
+    OUTPUT_DIR = "results"
     CACHE_DIR = "cache"
 
     # Device configuration
@@ -2035,6 +2235,8 @@ def main():
             embedding_model_name=EMBEDDING_MODEL,
             cross_encoder_model_name=CROSS_ENCODER_MODEL,
             dataset_name=DATASET_NAME,
+            topic_model_type=TOPIC_MODEL_TYPE,
+            topic_model_params=TOPIC_MODEL_PARAMS,
             output_dir=OUTPUT_DIR,
             cache_dir=CACHE_DIR,
             random_seed=RANDOM_SEED,
@@ -2054,7 +2256,7 @@ def main():
     logger.info("ALL QUERIES COMPLETED!")
     logger.info("="*80)
     logger.info(f"Processed {len(query_ids_to_run)} queries: {', '.join(query_ids_to_run)}")
-    logger.info(f"Results saved to: {OUTPUT_DIR}")
+    logger.info(f"Results saved to: {os.path.join(OUTPUT_DIR, DATASET_NAME, TOPIC_MODEL_TYPE)}")
     logger.info("="*80 + "\n")
 
     # ===== AGGREGATE CROSS-QUERY RESULTS =====
@@ -2065,8 +2267,9 @@ def main():
         logger.info("AGGREGATING RESULTS ACROSS ALL QUERIES")
         logger.info("="*80 + "\n")
 
+        results_base_dir = os.path.join(OUTPUT_DIR, DATASET_NAME, TOPIC_MODEL_TYPE)
         aggregate_results = aggregate_cross_query_results(
-            results_base_dir=OUTPUT_DIR,
+            results_base_dir=results_base_dir,
             query_ids=query_ids_to_run
         )
 
@@ -2074,7 +2277,7 @@ def main():
             logger.info("\n" + "="*80)
             logger.info("AGGREGATION COMPLETE!")
             logger.info("="*80)
-            logger.info(f"Aggregate results saved to: {OUTPUT_DIR}/aggregate_results")
+            logger.info(f"Aggregate results saved to: {results_base_dir}/aggregate_results")
             logger.info("="*80 + "\n")
     else:
         logger.info("\nSkipping cross-query aggregation (only 1 query processed)")
