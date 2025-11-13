@@ -194,6 +194,15 @@ class EndToEndEvaluator:
         # Build or load indices
         self._initialize_indices()
 
+        # Initialize IDF scores cache (corpus-level, shared across all queries)
+        self.idf_cache_dir = os.path.join(self.cache_dir, f"corpus_{len(self.corpus_dataset)}")
+        os.makedirs(self.idf_cache_dir, exist_ok=True)
+        self.idf_scores = self._load_or_compute_idf()
+
+        # Build qrels dictionary for fast relevance lookup
+        self.qrels_dict = self._build_qrels_dict()
+        logger.info(f"QRELs loaded for {len(self.qrels_dict)} queries")
+
     def _get_query_text(self) -> str:
         """Get query text for given query ID"""
         for query in self.queries_dataset:
@@ -277,6 +286,66 @@ class EndToEndEvaluator:
         logger.info(f"Saved to cache: {cache_path}")
 
         return result
+
+    def _build_qrels_dict(self) -> Dict[int, Dict[str, int]]:
+        """Build qrels dictionary for fast relevance lookup
+
+        Returns:
+            Dict mapping query_id -> {doc_id: relevance_score}
+        """
+        qrels_dict = defaultdict(dict)
+        for item in self.qrels_dataset:
+            query_id = int(item['query-id'])
+            corpus_id = str(item['corpus-id'])
+            score = int(item['score'])
+            qrels_dict[query_id][corpus_id] = score
+        return dict(qrels_dict)
+
+    def _compute_idf_scores(self) -> Dict[str, float]:
+        """Compute IDF scores from full corpus using TfidfVectorizer
+
+        Returns:
+            Dict mapping words to IDF scores
+        """
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        logger.info("Computing IDF scores on full corpus (this may take 2-5 minutes)...")
+
+        # Extract corpus texts
+        corpus_texts = []
+        for doc in tqdm(self.corpus_dataset, desc="Loading corpus for IDF"):
+            text = doc.get('text', '') or doc.get('title', '')
+            corpus_texts.append(text)
+
+        # Fit vectorizer on full corpus
+        vectorizer = TfidfVectorizer(
+            max_features=50000,  # Top 50K vocabulary
+            stop_words='english',
+            ngram_range=(1, 2),   # Unigrams + bigrams
+            min_df=2,             # Must appear in at least 2 docs
+            lowercase=True
+        )
+
+        vectorizer.fit(corpus_texts)
+
+        # Extract IDF scores
+        feature_names = vectorizer.get_feature_names_out()
+        idf_values = vectorizer.idf_
+
+        idf_dict = dict(zip(feature_names, idf_values))
+
+        logger.info(f"✓ Computed IDF for {len(idf_dict)} terms from {len(corpus_texts)} documents")
+        return idf_dict
+
+    def _load_or_compute_idf(self) -> Dict[str, float]:
+        """Load cached IDF scores or compute if not exists"""
+        cache_path = os.path.join(self.idf_cache_dir, "idf_scores.pkl")
+
+        return self._load_or_compute(
+            cache_path=cache_path,
+            compute_fn=self._compute_idf_scores,
+            force=False  # Never force - IDF computation is expensive
+        )
 
     def sample_random_uniform(self) -> Dict[str, Any]:
         """Method 1: Random uniform sampling"""
@@ -441,6 +510,78 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
+    def sample_direct_retrieval_mmr(self) -> Dict[str, Any]:
+        """Method 5: Direct Retrieval + MMR (High Diversity)
+
+        Retrieves 5000 candidates, applies MMR reranking with lambda=0.3 (70% diversity),
+        then selects top 1000 documents.
+        """
+        logger.info(f"Method 5: Direct Retrieval + MMR (High Diversity, lambda=0.3)")
+
+        cache_path = os.path.join(self.samples_dir, "direct_retrieval_mmr.pkl")
+
+        def compute():
+            # STEP 1: Retrieve large candidate pool (5000 docs) WITHOUT MMR
+            logger.info("Retrieving 5000 candidate documents...")
+            candidate_results = self.search_engine.search(
+                query=self.query_text,
+                top_k=5000,  # Large candidate pool for MMR to select from
+                method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                use_mmr=False,  # Don't apply MMR yet
+                use_cross_encoder=False
+            )
+
+            # STEP 2: Apply MMR reranking with high diversity (lambda=0.3)
+            logger.info("Applying MMR reranking with lambda=0.3 (30% relevance, 70% diversity)...")
+
+            # Get embeddings for MMR
+            candidate_ids = [r[0] for r in candidate_results]
+            candidate_scores = [r[1] for r in candidate_results]
+
+            # Get document indices
+            candidate_indices = [self.search_engine.corpus_ids.index(doc_id)
+                                for doc_id in candidate_ids]
+            candidate_embeddings = self.search_engine.doc_embeddings[candidate_indices]
+
+            # Compute query embedding
+            query_embedding = self.search_engine.sbert_model.encode(
+                self.query_text,
+                convert_to_tensor=True,
+                show_progress_bar=False
+            )
+
+            # STEP 3: Apply MMR to select top 1000 from 5000 candidates
+            mmr_results = self.search_engine._mmr_rerank(
+                query_embedding=query_embedding,
+                doc_embeddings=candidate_embeddings,
+                doc_ids=candidate_ids,
+                scores=candidate_scores,
+                top_k=self.sample_size,  # 1000
+                lambda_param=0.3  # 30% relevance, 70% diversity
+            )
+
+            # Extract final sample
+            doc_ids = [r[0] for r in mmr_results]
+            doc_texts = []
+
+            for doc_id in tqdm(doc_ids, desc="Extracting MMR docs"):
+                doc_text = self.search_engine.get_document_by_id(doc_id)
+                doc_texts.append(doc_text)
+
+            logger.info(f"✓ Selected {len(doc_ids)} documents after MMR (from 5000 candidates)")
+
+            return {
+                'method': 'direct_retrieval_mmr',
+                'doc_ids': doc_ids,
+                'doc_texts': doc_texts,
+                'sample_size': len(doc_ids),
+                'mmr_lambda': 0.3,
+                'candidate_pool_size': 5000
+            }
+
+        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+
 
     def _reciprocal_rank_fusion(
         self,
@@ -556,6 +697,20 @@ class EndToEndEvaluator:
         metrics["embedding_coherence_b"] = emb_coh_b
         metrics["embedding_coherence_diff"] = emb_coh_a - emb_coh_b
 
+        # Relevant Document Concentration (NEW)
+        relevant_conc_a = self._compute_relevant_concentration(sample_a)
+        relevant_conc_b = self._compute_relevant_concentration(sample_b)
+        metrics["relevant_concentration_a"] = relevant_conc_a
+        metrics["relevant_concentration_b"] = relevant_conc_b
+        metrics["relevant_concentration_diff"] = relevant_conc_a - relevant_conc_b
+
+        # Topic Specificity (IDF-based) (NEW)
+        topic_spec_a = self._compute_topic_specificity(topics_a)
+        topic_spec_b = self._compute_topic_specificity(topics_b)
+        metrics["topic_specificity_a"] = topic_spec_a
+        metrics["topic_specificity_b"] = topic_spec_b
+        metrics["topic_specificity_diff"] = topic_spec_a - topic_spec_b
+
         # Per-topic query alignment metrics
         alignment_a = self._compute_per_topic_query_alignment(results_a)
         alignment_b = self._compute_per_topic_query_alignment(results_b)
@@ -636,6 +791,10 @@ class EndToEndEvaluator:
         metrics["overlap_count"] = len(overlap)
         metrics["overlap_percent_a"] = len(overlap) / len(doc_ids_a) * 100 if len(doc_ids_a) > 0 else 0.0
         metrics["overlap_percent_b"] = len(overlap) / len(doc_ids_b) * 100 if len(doc_ids_b) > 0 else 0.0
+
+        # Document Overlap (Jaccard similarity)
+        union_count = len(doc_ids_a | doc_ids_b)
+        metrics["document_overlap_jaccard"] = len(overlap) / union_count if union_count > 0 else 0.0
 
         if len(overlap) >= 2:
             doc_to_idx_a = {doc_id: i for i, doc_id in enumerate(sample_a["doc_ids"])}
@@ -997,6 +1156,69 @@ class EndToEndEvaluator:
         # Average across all topics
         return float(np.mean(topic_coherences)) if topic_coherences else 0.0
 
+    def _compute_relevant_concentration(self, sample: Dict[str, Any]) -> float:
+        """
+        Compute fraction of sample that is relevant according to QRELs
+
+        Validates that retrieval actually increases sample relevance using ground-truth.
+
+        Args:
+            sample: Sample dictionary with doc_ids
+
+        Returns:
+            Fraction of documents in sample that are relevant (0-1)
+        """
+        query_id_int = int(self.query_id)
+
+        if query_id_int not in self.qrels_dict:
+            logger.warning(f"No QRELs found for query {query_id_int}")
+            return 0.0
+
+        relevant_doc_ids = set(self.qrels_dict[query_id_int].keys())
+        sample_doc_ids = set(sample['doc_ids'])
+
+        relevant_in_sample = sample_doc_ids & relevant_doc_ids
+        concentration = len(relevant_in_sample) / len(sample_doc_ids) if sample_doc_ids else 0.0
+
+        logger.debug(f"Relevant concentration: {concentration:.3f} ({len(relevant_in_sample)}/{len(sample_doc_ids)})")
+        return concentration
+
+    def _compute_topic_specificity(self, topic_words: Dict[int, List[str]]) -> float:
+        """
+        Compute average IDF (specificity) of topic words
+
+        Operationalizes "less generic" observation - higher IDF means more specific/technical terms.
+
+        Args:
+            topic_words: Dictionary mapping topic IDs to lists of words
+
+        Returns:
+            Average IDF across all topic words (higher = more specific)
+        """
+        if not topic_words or not self.idf_scores:
+            return 0.0
+
+        topic_specificities = []
+
+        for topic_id, words in topic_words.items():
+            if topic_id == -1:  # Skip outlier topic
+                continue
+
+            # Get IDF scores for topic words (top 10)
+            topic_idf_scores = []
+            for word in words[:10]:
+                # Normalize word (lowercase, remove special chars)
+                normalized_word = word.lower().strip()
+                if normalized_word in self.idf_scores:
+                    topic_idf_scores.append(self.idf_scores[normalized_word])
+
+            if topic_idf_scores:
+                topic_specificities.append(np.mean(topic_idf_scores))
+
+        avg_specificity = np.mean(topic_specificities) if topic_specificities else 0.0
+        logger.debug(f"Topic specificity (avg IDF): {avg_specificity:.3f}")
+        return float(avg_specificity)
+
     def _save_topic_summaries(self, topic_results: Dict[str, Dict[str, Any]], samples: Dict[str, Dict[str, Any]]):
         """Save human-readable topic summaries for qualitative analysis"""
         logger.info("Saving human-readable topic summaries...")
@@ -1192,6 +1414,8 @@ class EndToEndEvaluator:
             diversity_lexical = []
             npmi_coherence = []
             embedding_coherence = []
+            relevant_concentrations = []
+            topic_specificities = []
             outlier_ratios = []
             avg_topic_sizes = []
             topic_query_sims = []
@@ -1206,6 +1430,8 @@ class EndToEndEvaluator:
                     diversity_lexical.append(row['diversity_lexical_a'])
                     npmi_coherence.append(row['npmi_coherence_a'])
                     embedding_coherence.append(row['embedding_coherence_a'])
+                    relevant_concentrations.append(row['relevant_concentration_a'])
+                    topic_specificities.append(row['topic_specificity_a'])
                     outlier_ratios.append(row['outlier_ratio_a'])
                     avg_topic_sizes.append(row['avg_topic_size_a'])
                     topic_query_sims.append(row['topic_query_similarity_a'])
@@ -1218,6 +1444,8 @@ class EndToEndEvaluator:
                     diversity_lexical.append(row['diversity_lexical_b'])
                     npmi_coherence.append(row['npmi_coherence_b'])
                     embedding_coherence.append(row['embedding_coherence_b'])
+                    relevant_concentrations.append(row['relevant_concentration_b'])
+                    topic_specificities.append(row['topic_specificity_b'])
                     outlier_ratios.append(row['outlier_ratio_b'])
                     avg_topic_sizes.append(row['avg_topic_size_b'])
                     topic_query_sims.append(row['topic_query_similarity_b'])
@@ -1232,6 +1460,8 @@ class EndToEndEvaluator:
                 "diversity_lexical": diversity_lexical[0] if diversity_lexical else 0,
                 "npmi_coherence": npmi_coherence[0] if npmi_coherence else 0,
                 "embedding_coherence": embedding_coherence[0] if embedding_coherence else 0,
+                "relevant_concentration": relevant_concentrations[0] if relevant_concentrations else 0,
+                "topic_specificity": topic_specificities[0] if topic_specificities else 0,
                 "outlier_ratio": outlier_ratios[0] if outlier_ratios else 0,
                 "document_coverage": (1 - outlier_ratios[0]) if outlier_ratios else 1.0,
                 "avg_topic_size": avg_topic_sizes[0] if avg_topic_sizes else 0,
@@ -1373,6 +1603,53 @@ class EndToEndEvaluator:
         plt.close()
         logger.info(f"✓ Saved diversity scatter plot")
 
+        # Plot 3b: Relevancy vs Diversity Trade-off
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        relevancy = per_method_df['topic_query_similarity'].values
+        diversity = per_method_df['diversity_semantic'].values
+
+        # Color map for methods
+        colors_list = sns.color_palette("tab10", n_methods)
+
+        for i, method in enumerate(methods):
+            ax.scatter(relevancy[i], diversity[i], s=300, color=colors_list[i],
+                      label=method, alpha=0.7, edgecolors='black', linewidths=2)
+            ax.annotate(method, (relevancy[i], diversity[i]),
+                       xytext=(8, 8), textcoords='offset points',
+                       fontsize=10, fontweight='bold')
+
+        # Add median lines for quadrants
+        if len(relevancy) > 0 and len(diversity) > 0:
+            relevancy_median = np.median(relevancy)
+            diversity_median = np.median(diversity)
+
+            ax.axvline(x=relevancy_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+            ax.axhline(y=diversity_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+
+            # Quadrant labels
+            ax.text(relevancy_median + 0.01, diversity_median + 0.01,
+                   "High Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+            ax.text(relevancy_median - 0.15, diversity_median + 0.01,
+                   "Low Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+            ax.text(relevancy_median + 0.01, diversity_median - 0.05,
+                   "High Rel.\nLow Div.", fontsize=9, alpha=0.6)
+            ax.text(relevancy_median - 0.15, diversity_median - 0.05,
+                   "Low Rel.\nLow Div.", fontsize=9, alpha=0.6)
+
+        ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
+        ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+        ax.set_title(f'Relevancy vs. Diversity Trade-off - Query {self.query_id}',
+                    fontsize=15, fontweight='bold')
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self.plots_dir, 'relevancy_vs_diversity_tradeoff.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved relevancy vs diversity trade-off plot")
+
         # Plot 4: Pairwise Similarity Heatmaps
         pairwise_metrics_to_plot = [
             ("topic_semantic_similarity_mean", "Topic Semantic Similarity", "Blues", (0, 1)),
@@ -1468,6 +1745,7 @@ class EndToEndEvaluator:
         samples = {}
         samples["random_uniform"] = self.sample_random_uniform()
         samples["direct_retrieval"] = self.sample_direct_retrieval()
+        samples["direct_retrieval_mmr"] = self.sample_direct_retrieval_mmr()
         samples["query_expansion"] = self.sample_query_expansion()
         samples["keyword_search"] = self.sample_keyword_search()
 
