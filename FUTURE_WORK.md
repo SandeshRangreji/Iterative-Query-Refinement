@@ -30,6 +30,8 @@ IDF(word) = log(total_docs / docs_containing_word)
 
 **Implementation:** Use sklearn's TfidfVectorizer with fit on full corpus, then compute IDF for topic words
 
+**Status:** ✅ IMPLEMENTED - Added as per-method metric with corpus-level IDF caching
+
 ---
 
 #### 2. Relevant Document Concentration
@@ -51,6 +53,8 @@ concentration = len(relevant_docs) / len(doc_ids)
 
 **Implementation:** Load QRELs, intersect with sample doc_ids, compute ratio
 
+**Status:** ✅ IMPLEMENTED - Added as per-method metric in pairwise comparisons
+
 ---
 
 #### 3. Document Overlap (Jaccard) Between Samples
@@ -70,7 +74,7 @@ overlap_jaccard = len(set(doc_ids_A) & set(doc_ids_B)) / len(set(doc_ids_A) | se
 
 **Implementation:** Already computed in code (metrics["overlap_count"]), need to compute Jaccard explicitly
 
-**Status:** ⚠️ PARTIALLY IMPLEMENTED - overlap count exists, need Jaccard similarity
+**Status:** ✅ IMPLEMENTED - Added as pairwise metric
 
 ---
 
@@ -92,7 +96,7 @@ overlap_jaccard = len(set(doc_ids_A) & set(doc_ids_B)) / len(set(doc_ids_A) | se
 
 **Implementation:** Add to visualization pipeline in `end_to_end_evaluation.py`
 
-**Status:** 📝 NOT IMPLEMENTED
+**Status:** ✅ IMPLEMENTED - Added as `relevancy_vs_diversity_tradeoff.png`
 
 ---
 
@@ -234,16 +238,17 @@ avg_purity = mean(purity for all topics)
 
 **Configuration:**
 - Base: Direct Retrieval (Hybrid BM25+SBERT, Simple Sum)
-- Enhancement: MMR with λ=0.7 (70% relevance, 30% diversity)
+- Enhancement: MMR with λ=0.3 (30% relevance, 70% diversity)
+- Candidate pool: 5000 documents, reranked to top 1000
 
 **Expected effect:**
 - Higher semantic diversity than Direct Retrieval
 - Similar query alignment to Direct Retrieval
 - Tests: "Can diversity enforcement counteract narrowing from retrieval?"
 
-**Implementation:** Add `use_mmr=True, mmr_lambda=0.7` to search call
+**Implementation:** Retrieve 5000 candidates, apply MMR reranking, select top 1000
 
-**Status:** 📝 PLANNED - easy to implement
+**Status:** ✅ IMPLEMENTED - Added as 5th sampling method `direct_retrieval_mmr`
 
 ---
 

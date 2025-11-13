@@ -29,10 +29,11 @@ We compare sampling methods across a **spectrum of relevance bias**:
 | **Random Uniform** | None (unbiased control) | Pure random sampling from corpus |
 | **Keyword Search** | Low (lexical only) | BM25 lexical matching |
 | **Direct Retrieval** | Medium (lexical + semantic) | Hybrid BM25+SBERT (Simple Sum fusion) |
+| **Direct Retrieval + MMR** | Medium + High Diversity | Hybrid retrieval (5000 candidates) → MMR reranking (λ=0.3) → Top 1000 |
 | **Query Expansion** | High (expanded semantic) | KeyBERT keywords + Weighted RRF fusion |
 
-**Independent Variable:** Retrieval method (controls degree of relevance bias)
-**Dependent Variables:** 40+ topic modeling metrics
+**Independent Variable:** Retrieval method (controls degree of relevance bias and diversity)
+**Dependent Variables:** 50+ topic modeling metrics (includes IDF-based specificity, relevance concentration, document overlap)
 **Sample Size:** 1,000 documents per method (fixed)
 **Dataset:** TREC-COVID corpus (171K documents)
 **Queries:** 15 queries for cross-query generalization
@@ -40,9 +41,8 @@ We compare sampling methods across a **spectrum of relevance bias**:
 ### Future Ablations
 
 Planned extensions include:
-- **Direct Retrieval + MMR**: Diversity enforcement alongside relevance
 - **Cross-encoder reranking**: Enhanced relevance precision
-- **Additional retrieval variants**: Different fusion strategies, embedding models
+- **Additional retrieval variants**: Different fusion strategies, embedding models, MMR lambda values
 - **Additional datasets**: Generalization beyond TREC-COVID
 
 ---

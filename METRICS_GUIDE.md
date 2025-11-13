@@ -177,11 +177,53 @@ These measure topic characteristics independent of other methods.
 
 ---
 
+### 8. Relevant Document Concentration
+
+**Range:** 0 to 1
+**Computation:** Fraction of sampled documents that are relevant according to TREC-COVID QRELs
+**Measures:** Sample relevance validated against ground-truth relevance judgments
+
+**Interpretation:**
+- Higher values indicate more relevant documents in sample
+- 0.0 means no relevant documents (pure random or failed retrieval)
+- 1.0 means all documents are relevant (perfect retrieval)
+- Validates that retrieval actually increases sample relevance
+
+**Relevance effects:**
+- Expected: Retrieval > Random
+- Expected: Query Expansion ≥ Direct Retrieval ≥ Keyword Search > Random
+- Directly validates the relevance control mechanism
+
+**Related metrics:** Topic-Query Similarity (measures topic alignment, not sample relevance)
+
+---
+
+### 9. Topic Specificity (IDF-based)
+
+**Range:** 0 to max(IDF) (typically 2-10 for biomedical corpus)
+**Computation:** Average IDF score of topic words (top-10 per topic), averaged across all topics
+**Measures:** How specific/technical vs. generic/common the topic words are
+
+**Interpretation:**
+- Higher values indicate more specific, technical, domain-specific terms (rare in corpus)
+- Lower values indicate more generic, common terms (frequent in corpus)
+- Operationalizes "less generic, more nuanced" qualitative observation
+- IDF computed over full corpus (171K documents)
+
+**Relevance effects:**
+- Expected: Retrieval-based topics use more specific terminology
+- Expected: Random topics use more generic terms
+- Hypothesis: Query-focused samples bias toward query-specific terminology
+
+**Related metrics:** NPMI Coherence (both measure topic quality, but different aspects)
+
+---
+
 ## Query Alignment Metrics (Per-Method)
 
 These measure how well discovered topics align with the query.
 
-### 8. Topic-Query Similarity (Average)
+### 10. Topic-Query Similarity (Average)
 
 **Range:** 0 to 1
 **Computation:** Average cosine similarity between query embedding and each topic embedding (topic = concatenated top-10 words)
@@ -201,7 +243,7 @@ These measure how well discovered topics align with the query.
 
 ---
 
-### 9. Max Query Similarity
+### 11. Max Query Similarity
 
 **Range:** 0 to 1
 **Computation:** Highest cosine similarity between query and any single topic
@@ -220,7 +262,7 @@ These measure how well discovered topics align with the query.
 
 ---
 
-### 10. Query-Relevant Ratio
+### 12. Query-Relevant Ratio
 
 **Range:** 0 to 1
 **Computation:** Fraction of topics with similarity ≥ 0.5 threshold
@@ -240,7 +282,7 @@ These measure how well discovered topics align with the query.
 
 ---
 
-### 11. Top-3 Average Similarity
+### 13. Top-3 Average Similarity
 
 **Range:** 0 to 1
 **Computation:** Average cosine similarity of the 3 most query-relevant topics
@@ -264,7 +306,7 @@ These measure how well discovered topics align with the query.
 
 These compare two methods to quantify differences and similarities.
 
-### 12. Topic Word Overlap (Jaccard)
+### 14. Topic Word Overlap (Jaccard)
 
 **Range:** 0 to 1
 **Computation:** Jaccard similarity of top-10 words for Hungarian-matched topic pairs
@@ -284,7 +326,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 13. Topic Semantic Similarity
+### 15. Topic Semantic Similarity
 
 **Range:** 0 to 1
 **Computation:** Cosine similarity of topic embeddings for Hungarian-matched pairs
@@ -304,7 +346,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 14-16. F1 @ Thresholds (0.5, 0.6, 0.7)
+### 16-18. F1 @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
 **Computation:** Harmonic mean of precision and recall at different semantic similarity thresholds
@@ -327,7 +369,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 17-19. Precision @ Thresholds (0.5, 0.6, 0.7)
+### 19-21. Precision @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
 **Computation:** Fraction of method B's topics that match method A's topics
@@ -346,7 +388,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 20-22. Recall @ Thresholds (0.5, 0.6, 0.7)
+### 22-24. Recall @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
 **Computation:** Fraction of method A's topics that match method B's topics
@@ -365,7 +407,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 23. NPMI Coherence Difference
+### 25. NPMI Coherence Difference
 
 **Range:** -1 to 1
 **Computation:** NPMI_A - NPMI_B
@@ -384,7 +426,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 24. Embedding Coherence Difference
+### 26. Embedding Coherence Difference
 
 **Range:** -1 to 1
 **Computation:** EmbeddingCoherence_A - EmbeddingCoherence_B
@@ -403,7 +445,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 25. Semantic Diversity Difference
+### 27. Semantic Diversity Difference
 
 **Range:** -1 to 1
 **Computation:** SemanticDiversity_A - SemanticDiversity_B
@@ -422,7 +464,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 26. Lexical Diversity Difference
+### 28. Lexical Diversity Difference
 
 **Range:** -1 to 1
 **Computation:** LexicalDiversity_A - LexicalDiversity_B
@@ -441,7 +483,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 27. ARI (Adjusted Rand Index)
+### 29. ARI (Adjusted Rand Index)
 
 **Range:** -1 to 1 (typically 0 to 1)
 **Computation:** Adjusted Rand Index on document clustering assignments (only on overlapping documents)
@@ -462,7 +504,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 28. NMI (Normalized Mutual Information)
+### 30. NMI (Normalized Mutual Information)
 
 **Range:** 0 to 1
 **Computation:** Normalized Mutual Information on document clustering assignments (only on overlapping documents)
@@ -482,7 +524,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 29. Document Overlap (Jaccard)
+### 31. Document Overlap (Jaccard)
 
 **Range:** 0 to 1
 **Computation:** Jaccard similarity of sampled document IDs between methods
@@ -638,12 +680,15 @@ Investigate:
 
 See [FUTURE_WORK.md](FUTURE_WORK.md) for detailed plans on:
 
-- **Topic Specificity (IDF-based)** - Operationalize "less generic" observation
 - **Query Term Overlap** - Measure query-term bias in topics
 - **Corpus Coverage** - How many corpus documents match discovered topics
-- **Relevant Document Concentration** - % of sample that's relevant (from QRELs)
 - **Topic Purity** - Cluster purity using pseudo-clusters (half-baked idea)
 - **Vendiscore** - External topic quality metric with Python package
+
+**Recently Implemented (2025-11):**
+- ✅ **Topic Specificity (IDF-based)** - Now metric #9
+- ✅ **Relevant Document Concentration** - Now metric #8
+- ✅ **Document Overlap (Jaccard)** - Now metric #31
 
 ---
 
