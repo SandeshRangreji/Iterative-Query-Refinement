@@ -13,5 +13,9 @@ nltk==3.9.1
 rank-bm25==0.2.2
 keybert==0.9.0
 
+# Topic modeling
+gensim==4.3.3
+scipy<=1.13.1  # Required for gensim 4.3.3 compatibility (triu issue with 1.14+)
+
 # GPU acceleration
 cupy-cuda11x>=11.0.0

@@ -549,8 +549,8 @@ These compare two methods to quantify differences and similarities.
 
 ### 1. Intrinsic Quality Metrics Plot
 
-**Type:** 3×2 bar chart grid
-**Shows:** Per-method values for NPMI, Embedding Coherence, Semantic Diversity, Lexical Diversity, Document Coverage, Number of Topics
+**Type:** 4×2 bar chart grid
+**Shows:** Per-method values for NPMI Coherence, Embedding Coherence, Semantic Diversity, Lexical Diversity, Document Coverage, Topic Specificity, Number of Topics, Relevant Document Concentration
 
 **Usage:**
 - Compare intrinsic quality across methods

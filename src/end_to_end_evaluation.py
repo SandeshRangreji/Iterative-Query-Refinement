@@ -1,12 +1,18 @@
 # end_to_end_evaluation.py
 """
-End-to-end evaluation of BERTopic using different sampling strategies with pairwise comparisons.
+End-to-end evaluation of topic modeling (BERTopic or LDA) using different sampling strategies.
 
-Compares 4 methods:
+Supports multiple topic modeling methods:
+- BERTopic: Embedding-based with HDBSCAN clustering (auto-determines topic count)
+- LDA: Bag-of-words Latent Dirichlet Allocation (requires fixed topic count)
+
+Compares 6 sampling methods:
 1. Random Uniform Sampling
 2. Direct Retrieval (Hybrid BM25+SBERT)
-3. Query Expansion + Retrieval
-4. Simple Keyword Search (BM25 only)
+3. Direct Retrieval + MMR (High Diversity)
+4. Query Expansion + Retrieval
+5. Simple Keyword Search (BM25 only)
+6. Retrieval Pool + Random Sampling (Hybrid retrieval of 5000 docs, then random sample 1000)
 
 METRICS IMPLEMENTED:
 
@@ -39,7 +45,7 @@ Pairwise Comparison Metrics:
 - NMI (Normalized Mutual Information): Shared clustering information (overlap only)
 
 Visualizations Generated:
-1. intrinsic_quality_metrics.png: 3x2 grid of NPMI, Embedding Coherence, Semantic/Lexical Diversity, Coverage, Topic Count
+1. intrinsic_quality_metrics.png: 4x2 grid of NPMI, Embedding Coherence, Semantic/Lexical Diversity, Coverage, Topic Specificity, Topic Count, Relevant Concentration
 2. query_alignment_metrics.png: 1x3 grid of Avg/Max/Ratio query similarity metrics
 3. diversity_scatter.png: Semantic vs Lexical diversity scatter plot
 4. Pairwise heatmaps (14 plots): Similarity, Overlap, F1 @0.5/0.6/0.7, Precision @0.5/0.6/0.7, Recall @0.5/0.6/0.7, NPMI diff, Embedding diff, ARI
@@ -582,6 +588,66 @@ class EndToEndEvaluator:
 
         return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
 
+    def sample_retrieval_random(self, pool_size: int = 5000) -> Dict[str, Any]:
+        """Method 6: Retrieval Pool + Random Sampling
+
+        Retrieves large pool of relevant documents using hybrid search,
+        then randomly samples target size from that pool.
+
+        Tests whether relevance filtering alone (without ranking bias) affects
+        topic modeling outcomes.
+
+        Args:
+            pool_size: Size of retrieval pool to sample from (default: 5000)
+
+        Returns:
+            Dictionary with sampled documents and metadata
+        """
+        logger.info(f"Method 6: Retrieval Pool + Random Sampling ({self.sample_size} from {pool_size} pool)")
+
+        cache_path = os.path.join(self.samples_dir, "retrieval_random.pkl")
+
+        def compute():
+            # STEP 1: Retrieve large pool of relevant documents
+            logger.info(f"  Retrieving pool of {pool_size} documents using hybrid search...")
+
+            pool_results = self.search_engine.search(
+                query=self.query_text,
+                top_k=pool_size,
+                method=RetrievalMethod.HYBRID,
+                hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
+
+            # STEP 2: Random sample from pool
+            logger.info(f"  Randomly sampling {self.sample_size} documents from pool...")
+            pool_doc_ids = [doc_id for doc_id, _ in pool_results]
+
+            # Pure random sampling (uniform) - respects random seed
+            sampled_indices = random.sample(range(len(pool_doc_ids)), self.sample_size)
+            doc_ids = [pool_doc_ids[i] for i in sampled_indices]
+
+            # STEP 3: Extract document texts
+            doc_texts = []
+            for doc_id in tqdm(doc_ids, desc="Extracting retrieval-random docs"):
+                doc_text = self.search_engine.get_document_by_id(doc_id)
+                doc_texts.append(doc_text)
+
+            logger.info(f"  ✓ Selected {len(doc_ids)} documents (random sample from {len(pool_doc_ids)} retrieved)")
+
+            return {
+                'method': 'retrieval_random',
+                'doc_ids': doc_ids,
+                'doc_texts': doc_texts,
+                'sample_size': len(doc_ids),
+                'pool_size': len(pool_doc_ids),  # Actual pool size (may be < requested)
+                'requested_pool_size': pool_size,
+                'sampling_strategy': 'random_from_pool'
+            }
+
+        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+
 
     def _reciprocal_rank_fusion(
         self,
@@ -599,6 +665,36 @@ class EndToEndEvaluator:
 
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
+    def _get_bertopic_n_topics(self, method: str) -> int:
+        """
+        Read n_topics from BERTopic results for this query/method.
+        Falls back to default if not found.
+
+        This enables fair comparison: LDA uses same topic count as BERTopic discovered.
+
+        Args:
+            method: Sampling method name (e.g., "random_uniform")
+
+        Returns:
+            Number of topics found by BERTopic for this query/method, or 20 if not found
+        """
+        bertopic_csv = f"/home/srangre1/results/trec-covid/bertopic/query_{self.query_id}/results/per_method_summary.csv"
+
+        if os.path.exists(bertopic_csv):
+            try:
+                import pandas as pd
+                df = pd.read_csv(bertopic_csv)
+                row = df[df['method'] == method]
+                if not row.empty and 'n_topics' in row.columns:
+                    n_topics = int(row['n_topics'].values[0])
+                    logger.info(f"  Using n_topics={n_topics} from BERTopic results for {method}")
+                    return n_topics
+            except Exception as e:
+                logger.warning(f"  Could not read BERTopic results: {e}")
+
+        logger.info(f"  BERTopic results not found, using default n_topics=20")
+        return 20  # Default fallback
+
     def run_topic_modeling(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         """Run topic modeling on a document sample"""
         method = sample["method"]
@@ -611,10 +707,17 @@ class EndToEndEvaluator:
             docs = sample["doc_texts"]
             doc_ids = sample["doc_ids"]
 
+            # For LDA with "auto" n_topics, match BERTopic's discovered count
+            topic_model_params = self.topic_model_params.copy()
+            if self.topic_model_type == "lda":
+                if topic_model_params.get("n_topics") == "auto":
+                    topic_model_params["n_topics"] = self._get_bertopic_n_topics(method)
+                    logger.info(f"  LDA will use n_topics={topic_model_params['n_topics']} (matched to BERTopic)")
+
             # Use wrapper to dispatch to appropriate topic model
             topic_model = TopicModelWrapper(
                 model_type=self.topic_model_type,
-                **self.topic_model_params
+                **topic_model_params
             )
 
             # Call wrapper - returns EXACT same dict structure as before
@@ -1502,8 +1605,8 @@ class EndToEndEvaluator:
         methods = per_method_df['method'].tolist()
         n_methods = len(methods)
 
-        # Plot 1: Intrinsic Quality Metrics (3x2 grid)
-        fig, axes = plt.subplots(3, 2, figsize=(14, 16))
+        # Plot 1: Intrinsic Quality Metrics (4x2 grid)
+        fig, axes = plt.subplots(4, 2, figsize=(14, 20))
         fig.suptitle(f'Intrinsic Topic Quality Metrics - Query {self.query_id}', fontsize=16, fontweight='bold')
 
         quality_metrics = [
@@ -1512,7 +1615,9 @@ class EndToEndEvaluator:
             ('diversity_semantic', 'Semantic Diversity', 'Purples_d'),
             ('diversity_lexical', 'Lexical Diversity', 'Oranges_d'),
             ('document_coverage', 'Document Coverage', 'YlGn'),
-            ('n_topics', 'Number of Topics', 'Greys_d')
+            ('topic_specificity', 'Topic Specificity (IDF)', 'Reds_d'),
+            ('n_topics', 'Number of Topics', 'Greys_d'),
+            ('relevant_concentration', 'Relevant Doc Concentration', 'plasma')
         ]
 
         for idx, (metric, title, color) in enumerate(quality_metrics):
@@ -1748,6 +1853,7 @@ class EndToEndEvaluator:
         samples["direct_retrieval_mmr"] = self.sample_direct_retrieval_mmr()
         samples["query_expansion"] = self.sample_query_expansion()
         samples["keyword_search"] = self.sample_keyword_search()
+        samples["retrieval_random"] = self.sample_retrieval_random()
 
         # Step 2: Run topic modeling
         logger.info("\n" + "="*80)
@@ -2146,6 +2252,8 @@ def aggregate_cross_query_results(
         'diversity_lexical',
         'npmi_coherence',
         'embedding_coherence',
+        'relevant_concentration',
+        'topic_specificity',
         'outlier_ratio',
         'document_coverage',
         'topic_query_similarity',
@@ -2450,10 +2558,27 @@ def main():
 
     # Topic modeling configuration
     TOPIC_MODEL_TYPE = "bertopic"  # Options: "bertopic", "lda", "topicgpt"
+
+    # BERTopic parameters (when TOPIC_MODEL_TYPE = "bertopic")
     TOPIC_MODEL_PARAMS = {
         # Using defaults that match current behavior
         # Can override: "min_cluster_size": 5, "metric": "euclidean", etc.
     }
+
+    # LDA parameters (when TOPIC_MODEL_TYPE = "lda")
+    # TOPIC_MODEL_PARAMS = {
+    #     "n_topics": "auto",       # "auto" matches BERTopic results, or specify int (e.g., 20)
+    #     "alpha": "symmetric",     # Document-topic prior (standard default)
+    #     "eta": 0.01,              # Topic-word prior (0.01 = sparse, focused topics for biomedical text)
+    #     "passes": 15,             # Training passes (higher for technical corpus)
+    #     "iterations": 100,        # Iterations per pass (ensure convergence)
+    #     "random_state": 42,
+    #     "workers": 12,            # Multi-core training (use ~80% of available cores)
+    #     # Vocabulary params (match BERTopic for fair comparison)
+    #     "min_df": 2,
+    #     "ngram_range": (1, 2),
+    #     "max_features": 10000
+    # }
 
     # Directory configuration
     OUTPUT_DIR = "results"
@@ -2468,10 +2593,11 @@ def main():
     # Default: False (saves ~25.2 GB for 15 queries × 4 methods)
     SAVE_TOPIC_MODELS = False
 
-    # Force flags - SET TO TRUE FOR NEW SAMPLE SIZE (1000 docs)
-    FORCE_REGENERATE_SAMPLES = True
-    FORCE_REGENERATE_TOPICS = True
-    FORCE_REGENERATE_EVALUATION = True
+    # Force flags
+    # Regenerate evaluation to compute new metrics (topic_specificity, relevant_concentration)
+    FORCE_REGENERATE_SAMPLES = False      # Use cached samples
+    FORCE_REGENERATE_TOPICS = False       # Use cached topic models
+    FORCE_REGENERATE_EVALUATION = True    # Regenerate evaluation with new metrics
 
     # Random seed
     RANDOM_SEED = 42

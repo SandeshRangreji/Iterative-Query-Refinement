@@ -10,7 +10,9 @@ This project investigates the effects of retrieval-based document sampling on to
 
 ## Overview
 
-This is an **exploratory ablation study** examining how retrieval techniques control document relevance in samples, and how this relevance control affects topic modeling with BERTopic. The investigation is **descriptive and observational** - we measure effects and document trends without predetermined hypotheses about what constitutes "better" topic modeling.
+This is an **exploratory ablation study** examining how retrieval techniques control document relevance in samples, and how this relevance control affects topic modeling. The investigation is **descriptive and observational** - we measure effects and document trends without predetermined hypotheses about what constitutes "better" topic modeling.
+
+The framework supports multiple topic modeling methods (BERTopic, LDA). See [USAGE.md](USAGE.md) for configuration details.
 
 ### Key Observation
 
@@ -31,6 +33,7 @@ We compare sampling methods across a **spectrum of relevance bias**:
 | **Direct Retrieval** | Medium (lexical + semantic) | Hybrid BM25+SBERT (Simple Sum fusion) |
 | **Direct Retrieval + MMR** | Medium + High Diversity | Hybrid retrieval (5000 candidates) → MMR reranking (λ=0.3) → Top 1000 |
 | **Query Expansion** | High (expanded semantic) | KeyBERT keywords + Weighted RRF fusion |
+| **Retrieval Random** | Relevance Filtering Only | Hybrid retrieval (5000 pool) → Random sample (1000) |
 
 **Independent Variable:** Retrieval method (controls degree of relevance bias and diversity)
 **Dependent Variables:** 50+ topic modeling metrics (includes IDF-based specificity, relevance concentration, document overlap)
@@ -54,33 +57,46 @@ Planned extensions include:
 1. **Random Uniform Sampling**
    - Pure random selection from corpus
    - No relevance bias (control condition)
-   - Represents unbiased topic discovery
 
 2. **Keyword Search (BM25 only)**
    - Lexical retrieval based on term matching
-   - Low relevance control (exact term overlap)
+   - Low relevance control
 
 3. **Direct Retrieval (Hybrid BM25+SBERT)**
    - Combines lexical and semantic retrieval
-   - Medium relevance control (term + concept matching)
+   - Medium relevance control
    - Simple Sum fusion strategy
 
-4. **Query Expansion + Retrieval**
+4. **Direct Retrieval + MMR**
+   - Hybrid retrieval with diversity reranking
+   - Medium relevance + enforced diversity
+
+5. **Query Expansion + Retrieval**
    - KeyBERT extracts semantically related keywords
    - Weighted RRF fusion (70% original query, 30% keywords)
-   - High relevance control (expanded semantic coverage)
+   - High relevance control
 
-### BERTopic Configuration
+6. **Retrieval Random**
+   - Retrieves large pool (5000), randomly samples target size (1000)
+   - Tests relevance filtering vs. ranking bias
 
-All methods use **identical BERTopic parameters** for fair comparison:
+### Topic Modeling Configuration
 
-- **Embeddings:** all-mpnet-base-v2 (SentenceTransformer)
-- **Dimensionality Reduction:** UMAP (default params)
-- **Clustering:** HDBSCAN (min_cluster_size=5)
-- **Topic Representation:** c-TF-IDF with CountVectorizer
-- **Vocabulary:** English stopwords removed, unigrams + bigrams
+All methods use **identical topic modeling parameters** for fair comparison:
 
-This ensures differences in topic modeling outcomes are attributable to **sampling method**, not modeling configuration.
+**BERTopic (default):**
+- Embeddings: all-mpnet-base-v2 (SentenceTransformer)
+- Dimensionality Reduction: UMAP (default params)
+- Clustering: HDBSCAN (min_cluster_size=5)
+- Topic Representation: c-TF-IDF with CountVectorizer
+- Vocabulary: English stopwords removed, unigrams + bigrams
+
+**LDA (alternative):**
+- Algorithm: Gensim LdaMulticore with adaptive n_topics (matches BERTopic counts)
+- Hyperparameters: eta=0.01 (sparse topics), passes=15, iterations=100
+- Vocabulary: Same as BERTopic (min_df=2, ngram_range=(1,2))
+
+This ensures differences in topic modeling outcomes are attributable to **sampling method**, not modeling configuration. See [USAGE.md](USAGE.md) for switching between topic models.
 
 ---
 
@@ -163,33 +179,31 @@ We demonstrate generalizability by:
 ## Output Structure
 
 ```
-results/topic_evaluation/query_{query_id}/
-├── config.json                          # Experiment configuration
-├── samples/                             # Cached document samples
-│   ├── random_uniform.pkl
-│   ├── keyword_search.pkl
-│   ├── direct_retrieval.pkl
-│   └── query_expansion.pkl
-├── topic_models/                        # Cached BERTopic results
-│   ├── random_uniform_results.pkl
-│   ├── keyword_search_results.pkl
-│   ├── direct_retrieval_results.pkl
-│   └── query_expansion_results.pkl
-└── results/                             # Evaluation outputs
-    ├── per_method_summary.csv           # All per-method metrics
-    ├── pairwise_metrics.csv             # All pairwise comparisons
-    ├── topics_summary/                  # Human-readable topic summaries
-    │   ├── random_uniform_topics.txt
-    │   ├── keyword_search_topics.txt
-    │   ├── direct_retrieval_topics.txt
-    │   └── query_expansion_topics.txt
-    └── plots/                           # Visualizations (17 plots)
-        ├── intrinsic_quality_metrics.png
-        ├── query_alignment_metrics.png
-        ├── diversity_scatter.png
-        ├── relevancy_vs_diversity.png   # Methods plotted by relevance and diversity
-        └── 13 pairwise heatmaps (similarity, overlap, F1, precision, recall, etc.)
+results/trec-covid/
+├── bertopic/                            # BERTopic results
+│   └── query_{query_id}/
+│       ├── config.json
+│       ├── samples/                     # 6 sampling methods
+│       ├── topic_models/                # Cached BERTopic models
+│       └── results/
+│           ├── per_method_summary.csv
+│           ├── pairwise_metrics.csv
+│           ├── topics_summary/          # Human-readable summaries
+│           └── plots/                   # Visualizations
+│
+└── lda/                                 # LDA results (same structure)
+    └── query_{query_id}/
+        ├── config.json
+        ├── samples/                     # Reused from BERTopic
+        ├── topic_models/                # Cached LDA models
+        └── results/
+            ├── per_method_summary.csv   # 6 sampling methods
+            ├── pairwise_metrics.csv     # Compares sampling methods (NOT BERTopic vs LDA)
+            ├── topics_summary/
+            └── plots/
 ```
+
+**Note:** Pairwise comparisons compare sampling methods within the same topic model type. Cross-model comparison (BERTopic vs LDA) is done manually by comparing per_method_summary.csv files.
 
 ---
 
@@ -264,13 +278,13 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for:
 
 ## Technology Stack
 
-- **Topic Modeling:** BERTopic 0.17.0, HDBSCAN, UMAP
+- **Topic Modeling:** BERTopic 0.17.0 (HDBSCAN, UMAP), Gensim 4.3.3 (LDA)
 - **Retrieval:** rank-bm25, sentence-transformers 3.4.1
-- **Embeddings:** all-mpnet-base-v2 (default)
-- **Evaluation:** scikit-learn, scipy, numpy
+- **Embeddings:** all-mpnet-base-v2 (default, BERTopic only)
+- **Evaluation:** scikit-learn, scipy 1.13.1, numpy
 - **Visualization:** matplotlib, seaborn, plotly
 - **Dataset:** TREC-COVID via HuggingFace datasets
-- **GPU Support:** Optional CUDA/MPS acceleration
+- **GPU Support:** Optional CUDA/MPS acceleration (BERTopic only, LDA is CPU-based)
 
 ---
 

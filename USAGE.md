@@ -21,25 +21,29 @@ All configuration is in the `main()` function of `src/end_to_end_evaluation.py`:
 ```python
 def main():
     # Query configuration
-    QUERY_ID = "43"                    # Query to evaluate
-    SAMPLE_SIZE = 1000                 # Documents per sample
+    QUERY_IDS = ["2", "9", "10", ..., "48"]  # List of 15 queries or single query
+    SAMPLE_SIZE = 1000                       # Documents per sample
 
     # Model configuration
     EMBEDDING_MODEL = "all-mpnet-base-v2"
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     DATASET_NAME = "trec-covid"
 
+    # Topic modeling configuration
+    TOPIC_MODEL_TYPE = "bertopic"      # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_PARAMS = {}            # Model-specific parameters (see below)
+
     # Device configuration
     DEVICE = "cpu"                     # or "cuda", "mps" for GPU
 
     # Caching configuration
-    SAVE_TOPIC_MODELS = False          # Set True to save 420MB models
+    SAVE_TOPIC_MODELS = False          # Set True to save full models
     FORCE_REGENERATE_SAMPLES = False   # Force re-run sampling
     FORCE_REGENERATE_TOPICS = False    # Force re-run topic modeling
     FORCE_REGENERATE_EVALUATION = False  # Force re-compute metrics
 
     # Directory configuration
-    OUTPUT_DIR = "results/topic_evaluation"
+    OUTPUT_DIR = "results"
     CACHE_DIR = "cache"
     RANDOM_SEED = 42
 ```
@@ -48,19 +52,233 @@ def main():
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `QUERY_ID` | "43" | Query ID from TREC-COVID queries dataset |
+| `QUERY_IDS` | ["2", "9", ..., "48"] | List of query IDs or single query string |
 | `SAMPLE_SIZE` | 1000 | Number of documents to sample per method |
+| `TOPIC_MODEL_TYPE` | "bertopic" | Topic model type: "bertopic", "lda", "topicgpt" |
+| `TOPIC_MODEL_PARAMS` | {} | Model-specific parameters (see below) |
 | `EMBEDDING_MODEL` | "all-mpnet-base-v2" | SentenceTransformer model for embeddings |
 | `CROSS_ENCODER_MODEL` | "cross-encoder/ms-marco-MiniLM-L-6-v2" | Cross-encoder for reranking |
 | `DATASET_NAME` | "trec-covid" | Dataset name (used for caching) |
 | `DEVICE` | "cpu" | Device for embeddings ("cpu", "cuda", "mps") |
-| `SAVE_TOPIC_MODELS` | False | Whether to save full BERTopic models (420 MB each) |
+| `SAVE_TOPIC_MODELS` | False | Whether to save full topic models |
 | `FORCE_REGENERATE_SAMPLES` | False | Force re-run document sampling |
-| `FORCE_REGENERATE_TOPICS` | False | Force re-run BERTopic modeling |
+| `FORCE_REGENERATE_TOPICS` | False | Force re-run topic modeling |
 | `FORCE_REGENERATE_EVALUATION` | False | Force re-compute evaluation metrics |
-| `OUTPUT_DIR` | "results/topic_evaluation" | Output directory for results |
+| `OUTPUT_DIR` | "results" | Output directory for results |
 | `CACHE_DIR` | "cache" | Cache directory for indices and models |
 | `RANDOM_SEED` | 42 | Random seed for reproducibility |
+
+---
+
+## Switching Between Topic Models
+
+The evaluation framework supports multiple topic modeling methods. All metrics and visualizations work identically across models.
+
+### Available Topic Models
+
+1. **BERTopic** - Embedding-based topic modeling with HDBSCAN clustering
+2. **LDA** - Latent Dirichlet Allocation (bag-of-words, probabilistic)
+3. **TopicGPT** - LLM-based topic modeling (planned)
+
+### Using BERTopic (Default)
+
+```python
+# In main() of src/end_to_end_evaluation.py
+
+TOPIC_MODEL_TYPE = "bertopic"
+
+# BERTopic parameters
+TOPIC_MODEL_PARAMS = {
+    # Using defaults that match current behavior
+    # Optional overrides:
+    # "min_cluster_size": 5,
+    # "metric": "euclidean",
+    # "cluster_selection_method": "eom",
+    # "min_df": 2,
+    # "ngram_range": (1, 2),
+    # "max_features": 10000
+}
+```
+
+**BERTopic Characteristics:**
+- **Auto-determines topic count** using HDBSCAN clustering
+- **Outliers**: Some documents marked as outliers (topic ID = -1)
+- **Document Coverage**: Variable (typically 80-95%)
+- **Requires**: Embeddings (uses `EMBEDDING_MODEL`)
+- **Runtime**: ~5-8 min per query (1000 docs)
+- **Model Size**: ~420 MB per saved model
+
+---
+
+### Using LDA (Latent Dirichlet Allocation)
+
+```python
+# In main() of src/end_to_end_evaluation.py
+
+TOPIC_MODEL_TYPE = "lda"
+
+# LDA parameters (biomedical-optimized for TREC-COVID)
+TOPIC_MODEL_PARAMS = {
+    "n_topics": "auto",       # Match BERTopic results, or specify int (e.g., 20)
+    "alpha": "symmetric",     # Document-topic prior
+    "eta": 0.01,              # Topic-word prior (sparse for focused topics)
+    "passes": 15,             # Training passes
+    "iterations": 100,        # Iterations per pass
+    "random_state": 42,
+    "workers": 20,            # Multi-core training (adjust for your system)
+    # Vocabulary params (match BERTopic for fair comparison)
+    "min_df": 2,
+    "ngram_range": (1, 2),
+    "max_features": 10000
+}
+
+# Force flags for LDA (samples are shared with BERTopic)
+FORCE_REGENERATE_SAMPLES = False   # Use existing samples
+FORCE_REGENERATE_TOPICS = True     # Generate LDA models
+FORCE_REGENERATE_EVALUATION = True # Generate LDA results
+```
+
+**LDA Characteristics:**
+- **Fixed topic count** (must specify or use "auto" to match BERTopic)
+- **No outliers**: All documents assigned to topics (100% coverage)
+- **Probabilistic**: Returns full topic distribution per document
+- **Bag-of-words**: Does NOT use embeddings (CPU-only)
+- **Runtime**: ~2-5 min per query (1000 docs) - **faster than BERTopic**
+- **Model Size**: ~10-50 MB per saved model
+
+**LDA-Specific: "auto" n_topics**
+
+The special value `"auto"` makes LDA match BERTopic's discovered topic counts:
+
+1. Reads: `/home/srangre1/results/trec-covid/bertopic/query_{id}/results/per_method_summary.csv`
+2. Extracts `n_topics` for each sampling method
+3. Uses those exact values for LDA training
+4. **Result**: Perfect apples-to-apples comparison!
+
+Falls back to `n_topics=20` if BERTopic results not found.
+
+**LDA Hyperparameter Guide:**
+
+| Parameter | Recommended | Alternative | Effect |
+|-----------|-------------|-------------|--------|
+| `n_topics` | `"auto"` | `20` | Match BERTopic or fixed count |
+| `alpha` | `"symmetric"` | `0.01`, `1.0` | Document-topic sparsity |
+| `eta` | `0.01` | `None`, `0.05` | Topic-word sparsity (0.01 = focused topics) |
+| `passes` | `15` | `10`, `20` | More passes = better convergence |
+| `iterations` | `100` | `50`, `200` | More iterations = better quality |
+| `workers` | `20` | `4`, `os.cpu_count()-1` | Multi-core parallelization |
+
+**When to use each value:**
+- `eta=0.01`: **Biomedical/technical text** (focused, domain-specific topics)
+- `eta=None`: General text (moderate sparsity)
+- `eta=1.0`: Broad topics (less focused)
+- `alpha=0.01`: Few topics per document
+- `alpha=1.0`: Many topics per document
+
+---
+
+### Installation Requirements
+
+**BERTopic** (included by default):
+```bash
+pip install bertopic==0.17.0
+pip install sentence-transformers==3.4.1
+```
+
+**LDA** (requires Gensim):
+```bash
+pip install gensim==4.3.2
+```
+
+Already added to `requirements.txt`.
+
+---
+
+### Output Structure by Model Type
+
+Results are saved separately by model type:
+
+```
+results/
+└── trec-covid/
+    ├── bertopic/              # BERTopic results
+    │   └── query_2/
+    │       ├── samples/
+    │       ├── topic_models/
+    │       └── results/
+    │
+    └── lda/                   # LDA results (separate)
+        └── query_2/
+            ├── samples/       # Can share with BERTopic
+            ├── topic_models/
+            └── results/
+```
+
+**Sample Sharing:**
+- Document samples are **identical** across model types (determined by retrieval method)
+- Set `FORCE_REGENERATE_SAMPLES = False` to reuse existing samples
+- LDA will use BERTopic's samples if they exist
+
+---
+
+### Comparing BERTopic vs LDA
+
+Run both models on the same queries, then compare results:
+
+```bash
+# Step 1: Run BERTopic (if not already done)
+# Edit main(): TOPIC_MODEL_TYPE = "bertopic"
+python src/end_to_end_evaluation.py
+
+# Step 2: Run LDA
+# Edit main(): TOPIC_MODEL_TYPE = "lda"
+python src/end_to_end_evaluation.py
+
+# Step 3: Compare results
+# BERTopic: results/trec-covid/bertopic/query_2/results/per_method_summary.csv
+# LDA:      results/trec-covid/lda/query_2/results/per_method_summary.csv
+```
+
+**Key Metrics to Compare:**
+
+| Metric | Expected Pattern |
+|--------|-----------------|
+| **NPMI Coherence** | Could favor either (depends on data) |
+| **Embedding Coherence** | Usually higher for BERTopic (uses embeddings) |
+| **Semantic Diversity** | Usually higher for BERTopic (HDBSCAN flexibility) |
+| **Document Coverage** | LDA always 1.0, BERTopic variable |
+| **Number of Topics** | Same if LDA uses `n_topics="auto"` |
+| **Topic-Query Similarity** | Could favor either |
+| **Runtime** | LDA ~2x faster |
+
+---
+
+### Switching Models Mid-Project
+
+**Scenario**: Already ran BERTopic, now want to run LDA.
+
+**Steps:**
+
+1. **Keep existing BERTopic results** (don't regenerate)
+
+2. **Configure LDA in `main()`:**
+```python
+TOPIC_MODEL_TYPE = "lda"
+TOPIC_MODEL_PARAMS = {"n_topics": "auto", ...}  # Matches BERTopic
+FORCE_REGENERATE_SAMPLES = False    # Reuse BERTopic samples
+FORCE_REGENERATE_TOPICS = True      # Generate new LDA models
+```
+
+3. **Run evaluation:**
+```bash
+python src/end_to_end_evaluation.py
+```
+
+4. **Results saved separately:**
+   - BERTopic: `results/trec-covid/bertopic/`
+   - LDA: `results/trec-covid/lda/`
+
+**No conflicts** - models are completely isolated.
 
 ---
 
@@ -497,4 +715,4 @@ For questions or issues, see project README or create an issue in the repository
 
 ## Last Updated
 
-2025-11-10
+2025-11-13 - Added LDA topic modeling support and model switching guide
