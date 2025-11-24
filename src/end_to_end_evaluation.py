@@ -293,6 +293,62 @@ class EndToEndEvaluator:
 
         return result
 
+    def _load_or_compute_sample(self, sample_name: str, compute_fn, force: bool = False):
+        """
+        Load sample with cross-model sharing support.
+
+        Samples are identical across topic model types (BERTopic, LDA, TopicGPT),
+        so we check other model directories if the sample doesn't exist locally.
+
+        Priority order: current model dir -> bertopic -> lda -> topicgpt -> compute
+        """
+        cache_path = os.path.join(self.samples_dir, f"{sample_name}.pkl")
+
+        # If not forcing and file exists locally, use it
+        if not force and os.path.exists(cache_path):
+            logger.info(f"Loading sample from cache: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+
+        # Check other model type directories for shared samples
+        if not force:
+            other_model_types = ["bertopic", "lda", "topicgpt"]
+            for other_type in other_model_types:
+                if other_type == self.topic_model_type:
+                    continue
+
+                other_path = os.path.join(
+                    os.path.dirname(os.path.dirname(self.output_dir)),  # Go up to dataset level
+                    other_type,
+                    f"query_{self.query_id}",
+                    "samples",
+                    f"{sample_name}.pkl"
+                )
+
+                if os.path.exists(other_path):
+                    logger.info(f"Loading shared sample from {other_type}: {other_path}")
+                    with open(other_path, 'rb') as f:
+                        sample = pickle.load(f)
+
+                    # Copy to local cache for future use
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(sample, f)
+                    logger.info(f"Copied sample to local cache: {cache_path}")
+
+                    return sample
+
+        # Compute if no cache found
+        logger.info(f"Computing sample (cache miss or force=True)")
+        result = compute_fn()
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(result, f)
+        logger.info(f"Saved sample to cache: {cache_path}")
+
+        return result
+
     def _build_qrels_dict(self) -> Dict[int, Dict[str, int]]:
         """Build qrels dictionary for fast relevance lookup
 
@@ -357,8 +413,6 @@ class EndToEndEvaluator:
         """Method 1: Random uniform sampling"""
         logger.info(f"Method 1: Random uniform sampling ({self.sample_size} docs)")
 
-        cache_path = os.path.join(self.samples_dir, "random_uniform.pkl")
-
         def compute():
             # Pure random sampling
             all_indices = list(range(len(self.corpus_dataset)))
@@ -378,13 +432,11 @@ class EndToEndEvaluator:
                 "sample_size": len(docs)
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("random_uniform", compute, self.force_regenerate_samples)
 
     def sample_direct_retrieval(self) -> Dict[str, Any]:
         """Method 2: Direct retrieval (Hybrid BM25+SBERT)"""
         logger.info(f"Method 2: Direct retrieval ({self.sample_size} docs)")
-
-        cache_path = os.path.join(self.samples_dir, "direct_retrieval.pkl")
 
         def compute():
             # Perform hybrid search
@@ -411,13 +463,11 @@ class EndToEndEvaluator:
                 "sample_size": len(doc_ids)
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("direct_retrieval", compute, self.force_regenerate_samples)
 
     def sample_query_expansion(self) -> Dict[str, Any]:
         """Method 3: Query expansion + retrieval"""
         logger.info(f"Method 3: Query expansion + retrieval ({self.sample_size} docs)")
-
-        cache_path = os.path.join(self.samples_dir, "query_expansion.pkl")
 
         def compute():
             # Load cached keywords
@@ -482,13 +532,11 @@ class EndToEndEvaluator:
                 "keywords": query_keywords
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("query_expansion", compute, self.force_regenerate_samples)
 
     def sample_keyword_search(self) -> Dict[str, Any]:
         """Method 4: Simple keyword search (BM25 only)"""
         logger.info(f"Method 4: Simple keyword search ({self.sample_size} docs)")
-
-        cache_path = os.path.join(self.samples_dir, "keyword_search.pkl")
 
         def compute():
             # Perform BM25-only search
@@ -514,7 +562,7 @@ class EndToEndEvaluator:
                 "sample_size": len(doc_ids)
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("keyword_search", compute, self.force_regenerate_samples)
 
     def sample_direct_retrieval_mmr(self) -> Dict[str, Any]:
         """Method 5: Direct Retrieval + MMR (High Diversity)
@@ -523,8 +571,6 @@ class EndToEndEvaluator:
         then selects top 1000 documents.
         """
         logger.info(f"Method 5: Direct Retrieval + MMR (High Diversity, lambda=0.3)")
-
-        cache_path = os.path.join(self.samples_dir, "direct_retrieval_mmr.pkl")
 
         def compute():
             # STEP 1: Retrieve large candidate pool (5000 docs) WITHOUT MMR
@@ -586,7 +632,7 @@ class EndToEndEvaluator:
                 'candidate_pool_size': 5000
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("direct_retrieval_mmr", compute, self.force_regenerate_samples)
 
     def sample_retrieval_random(self, pool_size: int = 5000) -> Dict[str, Any]:
         """Method 6: Retrieval Pool + Random Sampling
@@ -604,8 +650,6 @@ class EndToEndEvaluator:
             Dictionary with sampled documents and metadata
         """
         logger.info(f"Method 6: Retrieval Pool + Random Sampling ({self.sample_size} from {pool_size} pool)")
-
-        cache_path = os.path.join(self.samples_dir, "retrieval_random.pkl")
 
         def compute():
             # STEP 1: Retrieve large pool of relevant documents
@@ -646,7 +690,7 @@ class EndToEndEvaluator:
                 'sampling_strategy': 'random_from_pool'
             }
 
-        return self._load_or_compute(cache_path, compute, self.force_regenerate_samples)
+        return self._load_or_compute_sample("retrieval_random", compute, self.force_regenerate_samples)
 
 
     def _reciprocal_rank_fusion(
@@ -2544,7 +2588,8 @@ def main():
     # ===== CONFIGURATION PARAMETERS =====
 
     # Query configuration - can be a single query ID or a list of query IDs
-    QUERY_IDS = ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]  # 15 open-ended queries
+    # Full set: ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]
+    QUERY_IDS = ["10", "24", "43"]  # 3 representative queries for TopicGPT pilot
 
     # Sample size (fixed at 1000 documents for all methods)
     SAMPLE_SIZE = 1000
@@ -2557,13 +2602,43 @@ def main():
     DATASET_NAME = "trec-covid"
 
     # Topic modeling configuration
-    TOPIC_MODEL_TYPE = "bertopic"  # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_TYPE = "topicgpt"  # Options: "bertopic", "lda", "topicgpt"
+
+    # TopicGPT parameters - using cheapest models (gpt-4o-mini)
+    # Requires OPENAI_API_KEY environment variable
+    TOPIC_MODEL_PARAMS = {
+        # Model selection (cheapest available)
+        "generation_model": "gpt-4o-mini",    # $0.15/1M input, $0.60/1M output
+        "assignment_model": "gpt-4o-mini",    # Same pricing
+
+        # Topic generation parameters
+        "max_topics": 50,
+        "min_topics": 5,
+        "generation_sample_size": 500,        # Use 500 docs for topic discovery
+        "topic_temperature": 0.0,
+        "topic_max_tokens": 500,
+
+        # Topic assignment parameters
+        "assignment_temperature": 0.0,
+        "assignment_max_tokens": 300,
+
+        # Refinement
+        "do_refine": True,
+
+        # Vocabulary params (match BERTopic/LDA)
+        "min_df": 2,
+        "ngram_range": (1, 2),
+        "max_features": 10000,
+
+        # Output
+        "verbose": True
+    }
 
     # BERTopic parameters (when TOPIC_MODEL_TYPE = "bertopic")
-    TOPIC_MODEL_PARAMS = {
-        # Using defaults that match current behavior
-        # Can override: "min_cluster_size": 5, "metric": "euclidean", etc.
-    }
+    # TOPIC_MODEL_PARAMS = {
+    #     # Using defaults that match current behavior
+    #     # Can override: "min_cluster_size": 5, "metric": "euclidean", etc.
+    # }
 
     # LDA parameters (when TOPIC_MODEL_TYPE = "lda")
     # TOPIC_MODEL_PARAMS = {
@@ -2580,6 +2655,38 @@ def main():
     #     "max_features": 10000
     # }
 
+    # TopicGPT parameters (when TOPIC_MODEL_TYPE = "topicgpt")
+    # Requires OPENAI_API_KEY environment variable
+    # TOPIC_MODEL_PARAMS = {
+    #     # Model selection (use cheapest models for cost efficiency)
+    #     "generation_model": "gpt-4o-mini",    # Model for topic generation (needs good reasoning)
+    #     "assignment_model": "gpt-4o-mini",    # Model for topic assignment (simpler task)
+    #     # Alternative cheap models: "gpt-4o-mini", "gpt-3.5-turbo"
+    #     # Higher quality: "gpt-4o", "gpt-4-turbo"
+    #
+    #     # Topic generation parameters
+    #     "max_topics": 50,                     # Maximum topics to generate
+    #     "min_topics": 5,                      # Minimum topics
+    #     "generation_sample_size": 500,        # Documents to use for topic generation (subset for cost)
+    #     "topic_temperature": 0.0,             # Temperature for generation (0 = deterministic)
+    #     "topic_max_tokens": 500,              # Max tokens for topic generation response
+    #
+    #     # Topic assignment parameters
+    #     "assignment_temperature": 0.0,        # Temperature for assignment (0 = deterministic)
+    #     "assignment_max_tokens": 300,         # Max tokens for assignment response
+    #
+    #     # Refinement
+    #     "do_refine": True,                    # Whether to refine topics (merge similar, remove irrelevant)
+    #
+    #     # Vocabulary params (match BERTopic/LDA for fair comparison)
+    #     "min_df": 2,
+    #     "ngram_range": (1, 2),
+    #     "max_features": 10000,
+    #
+    #     # Output
+    #     "verbose": True
+    # }
+
     # Directory configuration
     OUTPUT_DIR = "results"
     CACHE_DIR = "cache"
@@ -2594,9 +2701,9 @@ def main():
     SAVE_TOPIC_MODELS = False
 
     # Force flags
-    # Regenerate evaluation to compute new metrics (topic_specificity, relevant_concentration)
-    FORCE_REGENERATE_SAMPLES = False      # Use cached samples
-    FORCE_REGENERATE_TOPICS = False       # Use cached topic models
+    # For TopicGPT: reuse samples from BERTopic, generate new topic models
+    FORCE_REGENERATE_SAMPLES = False      # Use cached samples (from BERTopic runs)
+    FORCE_REGENERATE_TOPICS = True        # Generate TopicGPT models (new)
     FORCE_REGENERATE_EVALUATION = True    # Regenerate evaluation with new metrics
 
     # Random seed

@@ -2,13 +2,23 @@
 
 ## Quick Start
 
+### Local Execution
 ```bash
 cd /home/srangre1/Iterative-Query-Refinement
 conda activate coreset_proj
 python src/end_to_end_evaluation.py
 ```
 
-This runs the full evaluation pipeline on Query 43 (default) with all caching enabled.
+### SLURM/HPC Execution
+```bash
+# Set environment variables (if needed)
+export OPENAI_API_KEY="sk-..."  # For TopicGPT
+
+# Submit job to SLURM
+sbatch --export=ALL run_search.sh
+```
+
+The SLURM script (`run_search.sh`) runs on CPU partition with 24 cores and 32GB memory. No GPU required.
 
 ---
 
@@ -78,7 +88,7 @@ The evaluation framework supports multiple topic modeling methods. All metrics a
 
 1. **BERTopic** - Embedding-based topic modeling with HDBSCAN clustering
 2. **LDA** - Latent Dirichlet Allocation (bag-of-words, probabilistic)
-3. **TopicGPT** - LLM-based topic modeling (planned)
+3. **TopicGPT** - LLM-based topic modeling using OpenAI API
 
 ### Using BERTopic (Default)
 
@@ -190,7 +200,91 @@ pip install sentence-transformers==3.4.1
 pip install gensim==4.3.2
 ```
 
+**TopicGPT** (requires OpenAI API):
+```bash
+pip install topicgpt_python>=0.1.0
+export OPENAI_API_KEY="your-api-key"
+```
+
 Already added to `requirements.txt`.
+
+---
+
+### Using TopicGPT (LLM-Based Topic Modeling)
+
+TopicGPT uses large language models to generate and assign topics. It provides more interpretable topic descriptions but requires an OpenAI API key and incurs API costs.
+
+```python
+# In main() of src/end_to_end_evaluation.py
+
+TOPIC_MODEL_TYPE = "topicgpt"
+
+# TopicGPT parameters
+TOPIC_MODEL_PARAMS = {
+    # Model selection (use cheaper models for cost efficiency)
+    "generation_model": "gpt-4o-mini",    # Model for topic generation
+    "assignment_model": "gpt-4o-mini",    # Model for topic assignment
+
+    # Sampling parameters
+    "generation_sample_size": 500,        # Documents to sample for topic generation
+
+    # Vocabulary (match BERTopic/LDA)
+    "min_df": 2,
+    "ngram_range": (1, 2),
+    "max_features": 10000,
+
+    # Output
+    "verbose": True
+}
+
+# Force flags for TopicGPT
+FORCE_REGENERATE_SAMPLES = False   # Use existing samples
+FORCE_REGENERATE_TOPICS = True     # Generate TopicGPT models
+FORCE_REGENERATE_EVALUATION = True # Generate TopicGPT results
+```
+
+**Environment Setup:**
+```bash
+# Set API key (required)
+export OPENAI_API_KEY="sk-..."
+
+# Run evaluation
+python src/end_to_end_evaluation.py
+```
+
+**TopicGPT Characteristics:**
+- **LLM-generated topics**: Natural language topic descriptions via OpenAI API
+- **Two-stage process**: Topic generation (500 docs) → Topic assignment (all docs)
+- **CPU-only execution**: Uses sentence-transformers on CPU (no GPU required)
+- **No outliers**: All documents assigned (100% coverage)
+- **Requires**: OpenAI API key (OPENAI_API_KEY environment variable)
+- **Runtime**: Varies by model and rate limits (~10-30 min per query)
+- **Cost**: ~$1-15 per sample depending on models used
+
+**Model Selection Guide:**
+
+| Model | Input/1M | Output/1M | Best For |
+|-------|----------|-----------|----------|
+| `gpt-4o-mini` | $0.15 | $0.60 | **Recommended default** |
+| `gpt-3.5-turbo` | $0.50 | $1.50 | Legacy cheap option |
+| `gpt-4o` | $5.00 | $15.00 | Higher quality |
+| `gpt-4-turbo` | $10.00 | $30.00 | Best quality |
+
+**Cost Estimation (1000 docs per sample):**
+
+| Configuration | Cost/Sample | 90 Samples (Full Run) |
+|---------------|-------------|------------------------|
+| gpt-4o-mini / gpt-4o-mini | ~$1.50 | ~$135 |
+| gpt-4o / gpt-4o-mini | ~$8.00 | ~$720 |
+| gpt-4-turbo / gpt-4o-mini | ~$12.00 | ~$1,080 |
+
+**TopicGPT-Specific Outputs:**
+
+TopicGPT results include additional fields:
+- `topic_descriptions`: Natural language topic descriptions from LLM
+- `assignment_quotes`: Supporting quotes from documents
+
+These are saved in `topic_models/{method}_results.pkl` and can be accessed for qualitative analysis.
 
 ---
 
@@ -207,9 +301,15 @@ results/
     │       ├── topic_models/
     │       └── results/
     │
-    └── lda/                   # LDA results (separate)
+    ├── lda/                   # LDA results
+    │   └── query_2/
+    │       ├── samples/       # Can share with BERTopic
+    │       ├── topic_models/
+    │       └── results/
+    │
+    └── topicgpt/              # TopicGPT results
         └── query_2/
-            ├── samples/       # Can share with BERTopic
+            ├── samples/       # Can share with BERTopic/LDA
             ├── topic_models/
             └── results/
 ```
@@ -221,9 +321,9 @@ results/
 
 ---
 
-### Comparing BERTopic vs LDA
+### Comparing Topic Models
 
-Run both models on the same queries, then compare results:
+Run multiple models on the same queries, then compare results:
 
 ```bash
 # Step 1: Run BERTopic (if not already done)
@@ -234,22 +334,28 @@ python src/end_to_end_evaluation.py
 # Edit main(): TOPIC_MODEL_TYPE = "lda"
 python src/end_to_end_evaluation.py
 
-# Step 3: Compare results
+# Step 3: Run TopicGPT
+# Edit main(): TOPIC_MODEL_TYPE = "topicgpt"
+# Set OPENAI_API_KEY environment variable
+python src/end_to_end_evaluation.py
+
+# Step 4: Compare results
 # BERTopic: results/trec-covid/bertopic/query_2/results/per_method_summary.csv
 # LDA:      results/trec-covid/lda/query_2/results/per_method_summary.csv
+# TopicGPT: results/trec-covid/topicgpt/query_2/results/per_method_summary.csv
 ```
 
 **Key Metrics to Compare:**
 
-| Metric | Expected Pattern |
-|--------|-----------------|
-| **NPMI Coherence** | Could favor either (depends on data) |
-| **Embedding Coherence** | Usually higher for BERTopic (uses embeddings) |
-| **Semantic Diversity** | Usually higher for BERTopic (HDBSCAN flexibility) |
-| **Document Coverage** | LDA always 1.0, BERTopic variable |
-| **Number of Topics** | Same if LDA uses `n_topics="auto"` |
-| **Topic-Query Similarity** | Could favor either |
-| **Runtime** | LDA ~2x faster |
+| Metric | BERTopic | LDA | TopicGPT |
+|--------|----------|-----|----------|
+| **NPMI Coherence** | Variable | Variable | Variable |
+| **Embedding Coherence** | Usually highest (uses embeddings) | Lower (BoW) | Medium |
+| **Semantic Diversity** | Usually highest (HDBSCAN) | Medium | Depends on LLM |
+| **Document Coverage** | Variable (has outliers) | Always 1.0 | Always 1.0 |
+| **Interpretability** | Word lists | Word lists | Natural language |
+| **Cost** | Free (local) | Free (local) | API costs |
+| **Speed** | Medium | Fast | Slow (API calls) |
 
 ---
 

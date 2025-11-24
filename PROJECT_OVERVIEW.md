@@ -278,13 +278,13 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for:
 
 ## Technology Stack
 
-- **Topic Modeling:** BERTopic 0.17.0 (HDBSCAN, UMAP), Gensim 4.3.3 (LDA)
+- **Topic Modeling:** BERTopic 0.17.0 (HDBSCAN, UMAP), Gensim 4.3.3 (LDA), topicgpt_python (TopicGPT)
 - **Retrieval:** rank-bm25, sentence-transformers 3.4.1
 - **Embeddings:** all-mpnet-base-v2 (default, BERTopic only)
 - **Evaluation:** scikit-learn, scipy 1.13.1, numpy
 - **Visualization:** matplotlib, seaborn, plotly
 - **Dataset:** TREC-COVID via HuggingFace datasets
-- **GPU Support:** Optional CUDA/MPS acceleration (BERTopic only, LDA is CPU-based)
+- **Execution:** CPU-only (no GPU required)
 
 ---
 
