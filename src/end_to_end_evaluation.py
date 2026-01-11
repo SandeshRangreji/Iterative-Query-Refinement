@@ -1835,11 +1835,27 @@ class EndToEndEvaluator:
                         # Find the metric value
                         row = pairwise_df[(pairwise_df['method_a'] == method_a) & (pairwise_df['method_b'] == method_b)]
                         if row.empty:
-                            # Try reverse order
+                            # Try reverse order - but use the COMPLEMENTARY metric for precision/recall
                             row = pairwise_df[(pairwise_df['method_a'] == method_b) & (pairwise_df['method_b'] == method_a)]
-                            if not row.empty and metric_key in row.columns:
-                                value = row[metric_key].values[0]
-                                matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
+                            if not row.empty:
+                                # Determine which metric to use from the reverse row
+                                # For precision_b metrics, use recall_a from reverse (and vice versa)
+                                # because precision_b(A,B) = recall_a(B,A)
+                                reverse_metric_key = metric_key
+                                if 'precision_b' in metric_key:
+                                    # precision_b(A=i,B=j) should use recall_a(A=j,B=i)
+                                    reverse_metric_key = metric_key.replace('precision_b', 'recall_a')
+                                elif 'recall_a' in metric_key:
+                                    # recall_a(A=i,B=j) should use precision_b(A=j,B=i)
+                                    reverse_metric_key = metric_key.replace('recall_a', 'precision_b')
+
+                                if reverse_metric_key in row.columns:
+                                    value = row[reverse_metric_key].values[0]
+                                    matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
+                                elif metric_key in row.columns:
+                                    # Fallback for symmetric metrics (F1, similarity, etc.)
+                                    value = row[metric_key].values[0]
+                                    matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
                         elif metric_key in row.columns:
                             value = row[metric_key].values[0]
                             matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
@@ -2575,11 +2591,343 @@ def _generate_aggregate_visualizations(
     logger.info("\nCreating cross-query intrinsic metric visualizations...")
     create_cross_query_intrinsic_plots(all_per_method, plots_dir)
 
+    # Create aggregate scatter plots for relevancy vs diversity trade-off
+    logger.info("\nCreating aggregate scatter plots...")
+    plot_aggregate_scatter_plots(all_per_method, plots_dir)
+
     # Return aggregated data
     return {
         "per_method": all_per_method,
         "pairwise": pairwise_agg
     }
+
+
+def draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.2, **kwargs):
+    """
+    Draw a 2D error ellipse representing ±1 standard deviation in both X and Y.
+
+    Args:
+        ax: Matplotlib axes object
+        x_mean: Mean X value
+        x_std: Standard deviation in X
+        y_mean: Mean Y value
+        y_std: Standard deviation in Y
+        color: Color of the ellipse
+        alpha: Transparency
+        **kwargs: Additional arguments for Ellipse patch
+    """
+    from matplotlib.patches import Ellipse
+
+    ellipse = Ellipse(
+        xy=(x_mean, y_mean),
+        width=2 * x_std,  # ±1 std
+        height=2 * y_std,  # ±1 std
+        facecolor=color,
+        alpha=alpha,
+        edgecolor=color,
+        linewidth=1.5,
+        **kwargs
+    )
+    ax.add_patch(ellipse)
+
+
+def draw_convex_hull(ax, points, color, alpha=0.15, linewidth=2):
+    """
+    Draw a convex hull around a set of 2D points.
+
+    Args:
+        ax: Matplotlib axes object
+        points: Nx2 numpy array of (x, y) coordinates
+        color: Color of the hull outline
+        alpha: Fill transparency
+        linewidth: Line width for hull boundary
+    """
+    from scipy.spatial import ConvexHull
+    from matplotlib.patches import Polygon
+
+    if len(points) < 3:
+        # Need at least 3 points for a hull
+        return
+
+    try:
+        hull = ConvexHull(points)
+        hull_points = points[hull.vertices]
+
+        polygon = Polygon(
+            hull_points,
+            facecolor=color,
+            alpha=alpha,
+            edgecolor=color,
+            linewidth=linewidth
+        )
+        ax.add_patch(polygon)
+    except Exception as e:
+        logger.warning(f"Could not compute convex hull: {e}")
+
+
+def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
+    """
+    Create aggregate scatter plots across all queries.
+
+    Generates 4 plots:
+    1. Relevancy vs Diversity - Mean with error ellipses
+    2. Relevancy vs Diversity - All points with convex hulls
+    3. Relevancy vs Diversity - Combined (all points + means)
+    4. Diversity Scatter (Semantic vs Lexical) - Mean with error ellipses
+
+    Args:
+        all_per_method: DataFrame with all per-method data across queries
+        plots_dir: Directory to save plots
+    """
+    logger.info("Generating aggregate scatter plots...")
+
+    # Compute aggregated statistics per method
+    methods = sorted(all_per_method['method'].unique())
+    n_methods = len(methods)
+
+    # Aggregate stats
+    agg_stats = all_per_method.groupby('method').agg({
+        'topic_query_similarity': ['mean', 'std'],
+        'diversity_semantic': ['mean', 'std'],
+        'diversity_lexical': ['mean', 'std']
+    }).reset_index()
+
+    # Flatten column names
+    agg_stats.columns = ['_'.join(col).strip('_') for col in agg_stats.columns.values]
+
+    # Color palette
+    colors_list = sns.color_palette("tab10", n_methods)
+    method_colors = {method: colors_list[i] for i, method in enumerate(methods)}
+
+    # ===== Plot 1: Relevancy vs Diversity - Mean with Error Ellipses =====
+    logger.info("Creating relevancy vs diversity (mean + ellipses)...")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    for i, method in enumerate(methods):
+        stats = agg_stats[agg_stats['method'] == method].iloc[0]
+
+        x_mean = stats['topic_query_similarity_mean']
+        x_std = stats['topic_query_similarity_std']
+        y_mean = stats['diversity_semantic_mean']
+        y_std = stats['diversity_semantic_std']
+
+        color = method_colors[method]
+
+        # Draw error ellipse first (background)
+        draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.2)
+
+        # Draw mean point on top
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+                  alpha=0.8, edgecolors='black', linewidths=2, zorder=10)
+
+        # Annotate
+        ax.annotate(method, (x_mean, y_mean),
+                   xytext=(8, 8), textcoords='offset points',
+                   fontsize=10, fontweight='bold', zorder=11)
+
+    # Add median lines for quadrants
+    all_x_means = agg_stats['topic_query_similarity_mean'].values
+    all_y_means = agg_stats['diversity_semantic_mean'].values
+
+    x_median = np.median(all_x_means)
+    y_median = np.median(all_y_means)
+
+    ax.axvline(x=x_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax.axhline(y=y_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+
+    # Quadrant labels
+    ax.text(x_median + 0.01, y_median + 0.01,
+           "High Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+    ax.text(x_median - 0.08, y_median + 0.01,
+           "Low Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+    ax.text(x_median + 0.01, y_median - 0.02,
+           "High Rel.\nLow Div.", fontsize=9, alpha=0.6)
+    ax.text(x_median - 0.08, y_median - 0.02,
+           "Low Rel.\nLow Div.", fontsize=9, alpha=0.6)
+
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_title('Relevancy vs. Diversity Trade-off - Aggregated Across Queries\n(Mean ± 1 Std)',
+                fontsize=15, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, 'relevancy_vs_diversity_mean.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {plot_path}")
+
+    # ===== Plot 2: Relevancy vs Diversity - All Points with Convex Hulls =====
+    logger.info("Creating relevancy vs diversity (all points + convex hulls)...")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # Plot convex hulls first (background)
+    for i, method in enumerate(methods):
+        method_data = all_per_method[all_per_method['method'] == method]
+        points = method_data[['topic_query_similarity', 'diversity_semantic']].values
+
+        color = method_colors[method]
+        draw_convex_hull(ax, points, color, alpha=0.15, linewidth=2)
+
+    # Plot all individual points
+    for i, method in enumerate(methods):
+        method_data = all_per_method[all_per_method['method'] == method]
+
+        x_vals = method_data['topic_query_similarity'].values
+        y_vals = method_data['diversity_semantic'].values
+
+        color = method_colors[method]
+
+        ax.scatter(x_vals, y_vals, s=100, color=color, label=method,
+                  alpha=0.5, edgecolors='white', linewidths=0.5)
+
+    # Add median lines
+    all_x = all_per_method['topic_query_similarity'].values
+    all_y = all_per_method['diversity_semantic'].values
+
+    x_median_all = np.median(all_x)
+    y_median_all = np.median(all_y)
+
+    ax.axvline(x=x_median_all, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax.axhline(y=y_median_all, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_title('Relevancy vs. Diversity Trade-off - All Queries\n(Individual Points + Convex Hulls)',
+                fontsize=15, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, 'relevancy_vs_diversity_all_points.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {plot_path}")
+
+    # ===== Plot 3: Relevancy vs Diversity - Combined (All + Means) =====
+    logger.info("Creating relevancy vs diversity (combined)...")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # 1. Plot all individual points (semi-transparent, small)
+    for i, method in enumerate(methods):
+        method_data = all_per_method[all_per_method['method'] == method]
+
+        x_vals = method_data['topic_query_similarity'].values
+        y_vals = method_data['diversity_semantic'].values
+
+        color = method_colors[method]
+
+        ax.scatter(x_vals, y_vals, s=60, color=color,
+                  alpha=0.25, edgecolors='none', zorder=1)
+
+    # 2. Plot convex hulls
+    for i, method in enumerate(methods):
+        method_data = all_per_method[all_per_method['method'] == method]
+        points = method_data[['topic_query_similarity', 'diversity_semantic']].values
+
+        color = method_colors[method]
+        draw_convex_hull(ax, points, color, alpha=0.1, linewidth=1.5)
+
+    # 3. Plot error ellipses
+    for i, method in enumerate(methods):
+        stats = agg_stats[agg_stats['method'] == method].iloc[0]
+
+        x_mean = stats['topic_query_similarity_mean']
+        x_std = stats['topic_query_similarity_std']
+        y_mean = stats['diversity_semantic_mean']
+        y_std = stats['diversity_semantic_std']
+
+        color = method_colors[method]
+        draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.25)
+
+    # 4. Plot mean points on top
+    for i, method in enumerate(methods):
+        stats = agg_stats[agg_stats['method'] == method].iloc[0]
+
+        x_mean = stats['topic_query_similarity_mean']
+        y_mean = stats['diversity_semantic_mean']
+
+        color = method_colors[method]
+
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+                  alpha=0.9, edgecolors='black', linewidths=2.5, zorder=10)
+
+        ax.annotate(method, (x_mean, y_mean),
+                   xytext=(8, 8), textcoords='offset points',
+                   fontsize=10, fontweight='bold', zorder=11)
+
+    # Add median lines
+    ax.axvline(x=x_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax.axhline(y=y_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_title('Relevancy vs. Diversity Trade-off - Combined View\n(All Points + Mean ± 1 Std + Convex Hulls)',
+                fontsize=15, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, 'relevancy_vs_diversity_combined.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {plot_path}")
+
+    # ===== Plot 4: Diversity Scatter (Semantic vs Lexical) - Mean with Ellipses =====
+    logger.info("Creating diversity scatter (semantic vs lexical)...")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    for i, method in enumerate(methods):
+        stats = agg_stats[agg_stats['method'] == method].iloc[0]
+
+        x_mean = stats['diversity_lexical_mean']
+        x_std = stats['diversity_lexical_std']
+        y_mean = stats['diversity_semantic_mean']
+        y_std = stats['diversity_semantic_std']
+
+        color = method_colors[method]
+
+        # Draw error ellipse
+        draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.2)
+
+        # Draw mean point
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+                  alpha=0.8, edgecolors='black', linewidths=2, zorder=10)
+
+        # Annotate
+        ax.annotate(method, (x_mean, y_mean),
+                   xytext=(8, 8), textcoords='offset points',
+                   fontsize=10, fontweight='bold', zorder=11)
+
+    # Add median lines
+    all_x_lex = agg_stats['diversity_lexical_mean'].values
+    all_y_sem = agg_stats['diversity_semantic_mean'].values
+
+    x_median_lex = np.median(all_x_lex)
+    y_median_sem = np.median(all_y_sem)
+
+    ax.axvline(x=x_median_lex, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    ax.axhline(y=y_median_sem, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+
+    ax.set_xlabel('Lexical Diversity', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_title('Diversity Balance - Aggregated Across Queries\n(Mean ± 1 Std)',
+                fontsize=15, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, 'diversity_scatter_mean.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {plot_path}")
+
+    logger.info("✓ All aggregate scatter plots created successfully")
 
 
 def main():
@@ -2588,8 +2936,9 @@ def main():
     # ===== CONFIGURATION PARAMETERS =====
 
     # Query configuration - can be a single query ID or a list of query IDs
-    # Full set: ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]
-    QUERY_IDS = ["10", "24", "43"]  # 3 representative queries for TopicGPT pilot
+    QUERY_IDS = ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]  # Full set of 15 queries - EVALUATION ONLY
+    # QUERY_IDS = ["10", "24"]  # TopicGPT queries (regenerate topics and evaluation)
+    # QUERY_IDS = ["43"]  # SINGLE TEST QUERY - TopicGPT evaluation-only mode
 
     # Sample size (fixed at 1000 documents for all methods)
     SAMPLE_SIZE = 1000
@@ -2602,37 +2951,69 @@ def main():
     DATASET_NAME = "trec-covid"
 
     # Topic modeling configuration
-    TOPIC_MODEL_TYPE = "topicgpt"  # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_TYPE = "bertopic"  # Options: "bertopic", "lda", "topicgpt"
 
-    # TopicGPT parameters - using cheapest models (gpt-4o-mini)
+    # BERTopic parameters - ACTIVE CONFIGURATION (EVALUATION-ONLY MODE)
+    # Using cached BERTopic models, only regenerating evaluation metrics
+    # BERTopic uses sensible defaults, so empty dict is appropriate
+    TOPIC_MODEL_PARAMS = {}
+
+    # BERTopic parameters (currently commented out)
+    # TOPIC_MODEL_PARAMS = {}
+
+    # TopicGPT parameters (currently commented out)
     # Requires OPENAI_API_KEY environment variable
-    TOPIC_MODEL_PARAMS = {
-        # Model selection (cheapest available)
-        "generation_model": "gpt-4o-mini",    # $0.15/1M input, $0.60/1M output
-        "assignment_model": "gpt-4o-mini",    # Same pricing
+    # TOPIC_MODEL_PARAMS = {
+    #     # Model selection (use gpt-4o-mini for cost efficiency)
+    #     "generation_model": "gpt-4o-mini",    # Model for topic generation
+    #     "assignment_model": "gpt-4o-mini",    # Model for topic assignment
+    #
+    #     # Sampling for topic generation (use subset of documents)
+    #     "generation_sample_size": 500,        # Use 500 docs for topic discovery (out of 1000 sampled)
+    #
+    #     # Vocabulary params (match BERTopic/LDA for fair comparison)
+    #     "min_df": 2,
+    #     "ngram_range": (1, 2),
+    #     "max_features": 10000,
+    #
+    #     # Output
+    #     "verbose": True
+    # }
 
-        # Topic generation parameters
-        "max_topics": 50,
-        "min_topics": 5,
-        "generation_sample_size": 500,        # Use 500 docs for topic discovery
-        "topic_temperature": 0.0,
-        "topic_max_tokens": 500,
+    # BERTopic parameters (when TOPIC_MODEL_TYPE = "bertopic") - COMMENTED OUT
+    # TOPIC_MODEL_PARAMS = {
+    #     # Using BERTopic defaults that match current behavior
+    #     # Can override: "min_cluster_size": 5, "metric": "euclidean", etc.
+    # }
 
-        # Topic assignment parameters
-        "assignment_temperature": 0.0,
-        "assignment_max_tokens": 300,
-
-        # Refinement
-        "do_refine": True,
-
-        # Vocabulary params (match BERTopic/LDA)
-        "min_df": 2,
-        "ngram_range": (1, 2),
-        "max_features": 10000,
-
-        # Output
-        "verbose": True
-    }
+    # TopicGPT parameters (when TOPIC_MODEL_TYPE = "topicgpt")
+    # TOPIC_MODEL_PARAMS = {
+    #     # Model selection (cheapest available)
+    #     "generation_model": "gpt-4o-mini",    # $0.15/1M input, $0.60/1M output
+    #     "assignment_model": "gpt-4o-mini",    # Same pricing
+    #
+    #     # Topic generation parameters
+    #     "max_topics": 50,
+    #     "min_topics": 5,
+    #     "generation_sample_size": 500,        # Use 500 docs for topic discovery
+    #     "topic_temperature": 0.0,
+    #     "topic_max_tokens": 500,
+    #
+    #     # Topic assignment parameters
+    #     "assignment_temperature": 0.0,
+    #     "assignment_max_tokens": 300,
+    #
+    #     # Refinement
+    #     "do_refine": True,
+    #
+    #     # Vocabulary params (match BERTopic/LDA)
+    #     "min_df": 2,
+    #     "ngram_range": (1, 2),
+    #     "max_features": 10000,
+    #
+    #     # Output
+    #     "verbose": True
+    # }
 
     # BERTopic parameters (when TOPIC_MODEL_TYPE = "bertopic")
     # TOPIC_MODEL_PARAMS = {
@@ -2701,10 +3082,19 @@ def main():
     SAVE_TOPIC_MODELS = False
 
     # Force flags
-    # For TopicGPT: reuse samples from BERTopic, generate new topic models
-    FORCE_REGENERATE_SAMPLES = False      # Use cached samples (from BERTopic runs)
-    FORCE_REGENERATE_TOPICS = True        # Generate TopicGPT models (new)
-    FORCE_REGENERATE_EVALUATION = True    # Regenerate evaluation with new metrics
+    # Set to True to force regeneration (ignoring cache), False to use cache
+    #
+    # EVALUATION-ONLY MODE (for regenerating plots from cached topic models):
+    #   FORCE_REGENERATE_SAMPLES = False
+    #   FORCE_REGENERATE_TOPICS = False
+    #   FORCE_REGENERATE_EVALUATION = True
+    # This regenerates metrics/plots in ~2-5 min per query (vs. ~8-12 min full pipeline).
+    # Useful for: (1) Fixing visualization bugs, (2) Adding new aggregate scatter plots
+    #
+    # CURRENT MODE: EVALUATION-ONLY for all 15 BERTopic queries
+    FORCE_REGENERATE_SAMPLES = False      # Use cached samples (shared with LDA/TopicGPT)
+    FORCE_REGENERATE_TOPICS = False       # Use cached BERTopic models (already generated)
+    FORCE_REGENERATE_EVALUATION = True    # REGENERATE evaluation (to create new aggregate scatter plots)
 
     # Random seed
     RANDOM_SEED = 42
