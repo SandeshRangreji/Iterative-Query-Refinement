@@ -465,13 +465,12 @@ class TopicModelWrapper:
 
         try:
             # --- Create data file (JSONL format) ---
-            # Sample documents for topic generation
+            # Use top-K documents for topic generation (no sampling)
             if len(docs) > generation_sample_size:
-                step = len(docs) // generation_sample_size
-                gen_indices = list(range(0, len(docs), step))[:generation_sample_size]
-                generation_docs = [docs[i] for i in gen_indices]
-                generation_ids = [doc_ids[i] for i in gen_indices]
-                logger.info(f"  Using {len(generation_docs)} documents for topic generation")
+                # Take first generation_sample_size documents (top-ranked by relevance)
+                generation_docs = docs[:generation_sample_size]
+                generation_ids = doc_ids[:generation_sample_size]
+                logger.info(f"  Using top {len(generation_docs)} documents for topic generation")
             else:
                 generation_docs = docs
                 generation_ids = doc_ids
@@ -491,39 +490,78 @@ class TopicModelWrapper:
                     f.write("\n")
 
             # --- Create prompt files ---
-            generation_prompt = """I have a document that is a part of a larger corpus. Help me identify the top-level topics present in this document such that we can create a hierarchical topic structure.
+            # Using original TopicGPT prompts from https://github.com/chtmp223/topicGPT
+            generation_prompt = """You will receive a document and a set of top-level topics from a topic hierarchy. Your task is to identify generalizable topics within the document that can act as top-level topics in the hierarchy. If any relevant topics are missing from the provided set, please add them. Otherwise, output the existing top-level topics as identified in the document.
 
-If the document fits well into an existing topic listed below, return that topic.
-If the document doesn't fit well, or the topic is too specific/too general, add a new top-level topic that is general enough to be useful for the larger corpus.
-
-Topics must be:
-- Generalizable (not document-specific)
-- Single topics (not combinations)
-- Broad enough for future subtopics
-- Formatted as: [1] Label: Brief description
-
-[Existing Topics]
+[Top-level topics]
 {Topics}
+
+[Examples]
+Example 1: Adding "[1] Infectious Disease Research"
+Document:
+A study investigating the transmission dynamics of SARS-CoV-2 in healthcare settings, examining viral load correlations with disease severity and outcomes in hospitalized COVID-19 patients.
+
+Your response:
+[1] Infectious Disease Research: Studies on pathogen transmission, disease mechanisms, and clinical outcomes.
+
+Example 2: Duplicate "[1] Public Health Interventions", returning the existing topic
+Document:
+Analysis of social distancing measures' effectiveness in reducing COVID-19 transmission rates across different population densities and demographic groups.
+
+Your response:
+[1] Public Health Interventions: Measures and policies implemented to control disease spread.
+
+[Instructions]
+Step 1: Determine topics mentioned in the document.
+- The topic labels must be as GENERALIZABLE as possible. They must not be document-specific.
+- The topics must reflect a SINGLE topic instead of a combination of topics.
+- The new topics must have a level number, a short general label, and a topic description.
+- The topics must be broad enough to accommodate future subtopics.
+Step 2: Perform ONE of the following operations:
+1. If there are already duplicates or relevant topics in the hierarchy, output those topics and stop here.
+2. If the document contains no topic, return "None".
+3. Otherwise, add your topic as a top-level topic. Stop here and output the added topic(s). DO NOT add any additional levels.
 
 [Document]
 {Document}
 
-Return ONLY the relevant or new top-level topics in the specified format. One topic per line."""
+Please ONLY return the relevant or modified topics at the top level in the hierarchy. Your response should be in the following format:
+[Topic Level] Topic Label: Topic Description
 
-            assignment_prompt = """You will receive a document and a topic hierarchy. Assign the document to the most relevant topic in the hierarchy. Then, output the topic label, assignment reasoning, and a supporting quote from the document.
+Your response:"""
 
-DO NOT make up new topics or quotes.
+            assignment_prompt = """You will receive a document and a topic hierarchy. Assign the document to the most relevant topics the hierarchy. Then, output the topic labels, assignment reasoning and supporting quotes from the document. DO NOT make up new topics or quotes.
 
 [Topic Hierarchy]
 {tree}
 
+[Examples]
+Example 1: Assign "[1] Infectious Disease Research" to the document
+Document:
+A study investigating the transmission dynamics of SARS-CoV-2 in healthcare settings, examining viral load correlations with disease severity and outcomes in hospitalized COVID-19 patients.
+
+Assignment:
+[1] Infectious Disease Research: Examines pathogen transmission and clinical outcomes ("...examining viral load correlations with disease severity...")
+
+Example 2: Assigned "[1] Public Health Interventions" to the document
+Document:
+Analysis of social distancing measures' effectiveness in reducing COVID-19 transmission rates across different population densities and demographic groups.
+
+Assignment:
+[1] Public Health Interventions: Evaluates disease control measures ("...social distancing measures' effectiveness in reducing COVID-19 transmission...")
+
+[Instructions]
+1. Topic labels must be present in the provided topic hierarchy. You MUST NOT make up new topics.
+2. The quote must be taken from the document. You MUST NOT make up quotes.
+
 [Document]
 {Document}
 
+Double check that your assignment exists in the hierarchy!
 Your response should be in the following format:
-[1] Topic Label: Assignment reasoning ("Supporting quote from document")
+[Topic Level] Topic Label: Assignment reasoning (Supporting quote)
 
-Double check that your assignment exists in the hierarchy!"""
+Your response:"""
 
             gen_prompt_file = os.path.join(temp_dir, "generation_prompt.txt")
             with open(gen_prompt_file, "w") as f:
@@ -616,33 +654,68 @@ Double check that your assignment exists in the hierarchy!"""
             # Read assignment output
             assign_df = pd.read_json(assign_out_file, lines=True)
 
+            # Log first few responses for debugging
+            logger.info(f"  Sample assignment responses (first 3):")
+            for idx in range(min(3, len(assign_df))):
+                resp = assign_df.iloc[idx].get("responses", "")
+                logger.info(f"    Doc {idx}: {resp[:150]}...")
+
             for i in range(len(docs)):
                 if i < len(assign_df):
                     response = assign_df.iloc[i].get("responses", "")
+                    response_str = str(response).strip()
 
-                    # Parse response format: "[1] Topic Label: Reasoning ("quote")"
-                    match = re.match(r"^\[(\d+)\]\s*(.+?):\s*(.+)$", str(response).strip())
-                    if match:
-                        level, assigned_label, rest = match.groups()
-                        assigned_label = assigned_label.strip()
+                    # Parse multi-line response format:
+                    # [1] Topic Label: <topic_name>
+                    # Reasoning: <reasoning>
+                    # Supporting quote from document: "<quote>"
 
-                        # Extract quote if present
-                        quote_match = re.search(r'\("([^"]+)"\)', rest)
-                        quote = quote_match.group(1) if quote_match else ""
+                    # Extract topic label - try different patterns
+                    label_match = re.search(r'^\[(\d+)\]\s*Topic Label:\s*(.+?)(?:\n|$)', response_str, re.MULTILINE | re.IGNORECASE)
+                    if not label_match:
+                        # Fallback: try simpler pattern [1] Label: ...
+                        label_match = re.match(r'^\[(\d+)\]\s*(.+?):\s', response_str)
 
-                        # Find matching topic index
-                        topic_idx = 0
-                        for j, name in enumerate(topic_names):
-                            if name.lower() == assigned_label.lower():
-                                topic_idx = j
+                    if label_match:
+                        level = label_match.group(1)
+                        assigned_label = label_match.group(2).strip()
+
+                        # Extract quote - try multiple patterns
+                        quote = ""
+                        quote_patterns = [
+                            r'Supporting quote from document:\s*["\']([^"\']+)["\']',  # Supporting quote from document: "..."
+                            r'["\']([^"\']{20,})["\']',  # Any quoted text with 20+ chars
+                            r'\(["\'"]([^"\']+)["\']\)',  # ("...")
+                        ]
+                        for pattern in quote_patterns:
+                            quote_match = re.search(pattern, response_str, re.IGNORECASE)
+                            if quote_match:
+                                quote = quote_match.group(1).strip()
                                 break
-                            elif assigned_label.lower() in name.lower() or name.lower() in assigned_label.lower():
+
+                        # Find matching topic index - exact match only, then first partial match
+                        topic_idx = 0
+                        found = False
+
+                        # Try exact match first
+                        for j, name in enumerate(topic_names):
+                            if name.lower().strip() == assigned_label.lower().strip():
                                 topic_idx = j
+                                found = True
+                                break
+
+                        # If no exact match, try partial match (take first only)
+                        if not found:
+                            for j, name in enumerate(topic_names):
+                                if assigned_label.lower() in name.lower() or name.lower() in assigned_label.lower():
+                                    topic_idx = j
+                                    break
 
                         topic_assignments.append(topic_idx)
                         assignment_quotes.append(quote)
                     else:
-                        # Default to first topic
+                        # Parsing failed - default to topic 0
+                        logger.warning(f"  Failed to parse response for doc {i}: {response_str[:100]}...")
                         topic_assignments.append(0)
                         assignment_quotes.append("")
                 else:
