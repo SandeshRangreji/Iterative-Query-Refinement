@@ -121,9 +121,15 @@ class IndexManager:
         logger.info("Building BM25 index from scratch...")
         corpus_texts = []
         corpus_ids = []
-        
+
         for doc in corpus_dataset:
-            corpus_texts.append(doc["title"] + "\n\n" + doc["text"])
+            # Handle documents with or without title field
+            title = doc.get("title", "")
+            text = doc.get("text", "")
+            if title:
+                corpus_texts.append(title + "\n\n" + text)
+            else:
+                corpus_texts.append(text)
             corpus_ids.append(doc["_id"])
 
         tokenized_corpus = [self.preprocessor.preprocess_text(text) for text in corpus_texts]
@@ -379,11 +385,16 @@ class SearchEngine:
         if doc_embeddings.device != device:
             doc_embeddings = doc_embeddings.to(device)
 
-        cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
-        
-        # Sort by cosine similarity (descending)
-        sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
-        results = [(self.corpus_ids[idx], cos_scores[idx]) for idx in sorted_indices]
+        # Keep similarity computation on GPU
+        cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0]
+
+        # Sort by cosine similarity (descending) using GPU operations
+        sorted_indices = torch.argsort(cos_scores, descending=True)[:top_k]
+
+        # Only convert to Python at the final step
+        sorted_indices_cpu = sorted_indices.cpu().tolist()
+        cos_scores_cpu = cos_scores.cpu().tolist()
+        results = [(self.corpus_ids[idx], cos_scores_cpu[idx]) for idx in sorted_indices_cpu]
         
         # Apply MMR if requested
         if use_mmr:
@@ -441,9 +452,15 @@ class SearchEngine:
         doc_embeddings = self.doc_embeddings
         if doc_embeddings.device != device:
             doc_embeddings = doc_embeddings.to(device)
-            
-        cos_scores = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
-        sbert_sorted_indices = np.argsort(cos_scores)[::-1][:top_k]
+
+        # Keep similarity computation on GPU
+        cos_scores_tensor = util.cos_sim(query_embedding, doc_embeddings)[0]
+
+        # Sort on GPU, then convert top-k indices to NumPy
+        sbert_sorted_indices = torch.argsort(cos_scores_tensor, descending=True)[:top_k].cpu().numpy()
+
+        # Convert scores to NumPy for hybrid combination (needed for BM25 compatibility)
+        cos_scores = cos_scores_tensor.cpu().numpy()
         
         # Apply hybrid strategy
         if hybrid_strategy == HybridStrategy.SIMPLE_SUM:
@@ -564,7 +581,8 @@ class SearchEngine:
     ) -> List[Tuple[str, float]]:
         """
         Perform Maximal Marginal Relevance (MMR) reranking to diversify results.
-        
+        GPU-optimized version that keeps all operations on GPU.
+
         Args:
             query_embedding: Query embedding tensor
             doc_embeddings: Document embeddings tensor
@@ -572,58 +590,63 @@ class SearchEngine:
             scores: List of initial relevance scores
             top_k: Number of results to return
             lambda_param: MMR lambda parameter (0-1), higher values favor relevance
-            
+
         Returns:
             List of tuples (document_id, score)
         """
         # Ensure we have valid data
         if len(doc_ids) == 0:
             return []
-        
+
         # Move to same device as query_embedding
         device = query_embedding.device
         if doc_embeddings.device != device:
             doc_embeddings = doc_embeddings.to(device)
-        
-        # Compute similarity between query and docs
-        query_sim = util.cos_sim(query_embedding, doc_embeddings)[0].cpu().numpy()
-        
-        # Precompute pairwise similarities between docs
-        doc_sims = util.cos_sim(doc_embeddings, doc_embeddings).cpu().numpy()
-        
-        # MMR selection
+
+        # Compute similarity between query and docs (KEEP ON GPU)
+        query_sim = util.cos_sim(query_embedding, doc_embeddings)[0]  # Shape: [n_docs]
+
+        # Precompute pairwise similarities between docs (KEEP ON GPU)
+        doc_sims = util.cos_sim(doc_embeddings, doc_embeddings)  # Shape: [n_docs, n_docs]
+
+        # MMR selection using GPU tensors
+        num_docs = len(doc_ids)
         selected_indices = []
-        remaining_indices = list(range(len(doc_ids)))
-        
-        for _ in range(min(top_k, len(doc_ids))):
-            if not remaining_indices:
+        remaining_mask = torch.ones(num_docs, dtype=torch.bool, device=device)
+
+        for _ in range(min(top_k, num_docs)):
+            # Get indices of remaining candidates
+            remaining_indices = torch.where(remaining_mask)[0]
+
+            if len(remaining_indices) == 0:
                 break
-                
-            mmr_scores = []
-            
-            for i, idx in enumerate(remaining_indices):
-                # If we have no selected docs yet, MMR score is just relevance
-                if not selected_indices:
-                    mmr_scores.append((idx, query_sim[idx]))
-                    continue
-                
-                # Compute relevance and diversity components
-                relevance = query_sim[idx]
-                
-                # Find max similarity to any selected document
-                diversity_penalty = max(doc_sims[idx][j] for j in selected_indices)
-                
-                # Compute MMR score
-                mmr_score = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
-                mmr_scores.append((idx, mmr_score))
-            
-            # Select document with highest MMR score
-            best_idx, _ = max(mmr_scores, key=lambda x: x[1])
-            
+
+            # If no documents selected yet, pick highest relevance
+            if len(selected_indices) == 0:
+                best_idx = remaining_indices[torch.argmax(query_sim[remaining_indices])].item()
+            else:
+                # Compute MMR scores for remaining candidates
+                # relevance: query similarity for remaining docs
+                relevance = query_sim[remaining_indices]
+
+                # diversity penalty: max similarity to any selected doc
+                # doc_sims[remaining_indices][:, selected_indices] -> [n_remaining, n_selected]
+                selected_tensor = torch.tensor(selected_indices, device=device, dtype=torch.long)
+                similarities_to_selected = doc_sims[remaining_indices][:, selected_tensor]
+                diversity_penalty = torch.max(similarities_to_selected, dim=1)[0]
+
+                # Compute MMR scores
+                mmr_scores = lambda_param * relevance - (1 - lambda_param) * diversity_penalty
+
+                # Select best document
+                best_local_idx = torch.argmax(mmr_scores).item()
+                best_idx = remaining_indices[best_local_idx].item()
+
+            # Update selection
             selected_indices.append(best_idx)
-            remaining_indices.remove(best_idx)
-        
-        # Return selected documents with their original scores
+            remaining_mask[best_idx] = False
+
+        # Return selected documents with their original scores (only move to CPU at the end)
         return [(doc_ids[idx], scores[idx]) for idx in selected_indices]
         
     def load_indices(

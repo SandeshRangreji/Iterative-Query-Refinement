@@ -25,6 +25,9 @@ def load_dataset(dataset_name: str):
     elif dataset_name == "20newsgroups":
         return _load_20newsgroups()
 
+    elif dataset_name == "doctor-reviews":
+        return _load_doctor_reviews()
+
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -58,3 +61,44 @@ def _load_20newsgroups():
     logger.info("Loading 20 Newsgroups dataset...")
     # TODO: Implement when needed
     raise NotImplementedError("20 Newsgroups not implemented yet")
+
+
+def _load_doctor_reviews():
+    """
+    Load pre-filtered Family Medicine doctor reviews dataset.
+
+    The corpus must be created first by running:
+        sbatch run_create_filtered_corpus.sh
+
+    Returns:
+        corpus: HuggingFace dataset with _id, title, text fields
+        queries: List of query dicts with _id and text fields
+        qrels: None (no relevance judgments for this dataset)
+    """
+    from datasets import load_from_disk, Dataset
+
+    CORPUS_PATH = '/home/srangre1/datasets/doctor_reviews_family_med_filtered'
+
+    logger.info("Loading Doctor Reviews dataset...")
+
+    # Load pre-filtered corpus
+    corpus = load_from_disk(CORPUS_PATH)
+
+    # Define queries (manual list - no HuggingFace dataset)
+    queries_list = [
+        {"_id": "1", "text": "How do patients find and choose their doctors?"},
+        {"_id": "2", "text": "What are patients' experiences with specialist referrals?"},
+        {"_id": "3", "text": "What breathing problems do patients report and how are they treated?"},
+        {"_id": "4", "text": "How do doctors manage patients with asthma?"},
+        {"_id": "5", "text": "What do patients like about their doctors?"},
+        {"_id": "6", "text": "What do patients dislike about their doctors?"},
+    ]
+
+    # Convert to HuggingFace Dataset for compatibility with existing code
+    queries = Dataset.from_list(queries_list)
+
+    # No relevance judgments for doctor reviews
+    qrels = None
+
+    logger.info(f"Loaded {len(corpus)} documents, {len(queries)} queries, 0 qrels")
+    return corpus, queries, qrels

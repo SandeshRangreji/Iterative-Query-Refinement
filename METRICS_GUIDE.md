@@ -302,11 +302,130 @@ These measure how well discovered topics align with the query.
 
 ---
 
+## Relevant Topic Diversity Metrics (Per-Method)
+
+These metrics address a key insight: **overall diversity can be inflated by "noise" topics unrelated to the query**. By focusing on query-relevant topics, we measure whether the method discovers distinct facets of the query rather than generic corpus topics.
+
+### 14. Relevant Topic Diversity
+
+**Range:** 0 to 1
+**Computation:** Average pairwise distance (1 - cosine similarity) between topic embeddings, computed only on topics with query similarity ≥ 0.5
+**Measures:** Semantic diversity among query-relevant topics only
+
+**Interpretation:**
+- Higher values indicate query-relevant topics cover different facets of the query
+- Lower values indicate query-relevant topics are redundant/overlapping
+- Unlike overall diversity, this excludes "noise" topics that artificially inflate diversity
+- Requires at least 2 relevant topics to compute (otherwise returns None)
+
+**Relevance effects:**
+- Expected: Retrieval methods may have **higher** relevant diversity than keyword search
+- The key insight: Keyword Search's high overall diversity is inflated by off-topic noise
+- QE/DR may discover distinct, nuanced facets (gun violence, domestic violence, cybercrime) while KS drowns them in noise
+
+**Related metrics:** Semantic Diversity (overall), Relevance-Weighted Diversity, Relevant Diversity Ratio
+
+---
+
+### 15. Relevance-Weighted Diversity
+
+**Range:** 0 to 1
+**Computation:** Weighted average pairwise distance between topics, where weights are the product of query similarities for each topic pair: `weight_ij = sim_i × sim_j`
+**Measures:** Diversity with more weight given to highly query-relevant topic pairs
+
+**Interpretation:**
+- Higher values indicate diverse, query-relevant topics
+- Lower values indicate either low diversity or low relevance
+- No hard threshold - uses continuous weighting by relevance
+- More robust than hard threshold when relevance values are near 0.5
+
+**Relevance effects:**
+- Combines relevance and diversity into a single score
+- High relevance + high diversity = high weighted diversity
+- High relevance + low diversity = moderate weighted diversity
+- Low relevance (regardless of diversity) = low weighted diversity
+
+**Related metrics:** Relevant Topic Diversity (hard threshold version), Topic-Query Similarity
+
+---
+
+### 16. Top-K Relevant Diversity
+
+**Range:** 0 to 1
+**Computation:** Average pairwise distance among the top-K most query-relevant topics (default K=5)
+**Measures:** Diversity among the best query-aligned topics
+
+**Interpretation:**
+- Higher values indicate top topics cover different query facets
+- Lower values indicate top topics are redundant
+- Fixed K makes it comparable across methods with different topic counts
+- Robust to methods that produce many low-relevance topics
+
+**Relevance effects:**
+- Focuses on the "best" topics regardless of total topic count
+- Useful when only top topics matter (e.g., summarization)
+- May reveal that retrieval methods produce more diverse top topics
+
+**Related metrics:** Relevant Topic Diversity, Top-3 Average Similarity
+
+---
+
+### 17. Number of Relevant Topics
+
+**Range:** 0 to N (total topics)
+**Computation:** Count of topics with query similarity ≥ 0.5 threshold
+**Measures:** How many topics are meaningfully related to the query
+
+**Interpretation:**
+- Higher values indicate more query-relevant topics discovered
+- Lower values indicate fewer relevant topics (more noise)
+- Combined with Query-Relevant Ratio, shows absolute vs. relative relevance
+- Zero relevant topics indicates complete failure to find query-related structure
+
+**Relevance effects:**
+- Expected: Retrieval methods discover more relevant topics
+- KS may have fewer relevant topics despite having more total topics
+- This is the absolute count; Query-Relevant Ratio is the percentage
+
+**Related metrics:** Query-Relevant Ratio, Number of Topics
+
+---
+
+### 18. Relevant Diversity Ratio
+
+**Range:** 0 to 1+ (can exceed 1.0)
+**Computation:** `relevant_topic_diversity / overall_semantic_diversity`
+**Measures:** What proportion of a method's diversity comes from meaningful (query-relevant) topics
+
+**Interpretation:**
+- Values near 1.0 indicate diversity is mostly from relevant topics
+- Values < 1.0 indicate diversity is inflated by noise topics
+- Values > 1.0 indicate relevant topics are MORE diverse than overall (rare)
+- **Key metric for detecting "fake diversity"** from noise
+
+**Relevance effects:**
+- **Primary metric for the noise-diversity hypothesis**
+- Expected: QE/DR have higher ratios (75-80%) than KS (50-60%)
+- KS's high overall diversity is "fake" - inflated by off-topic noise
+- Random sampling has lowest ratio (diversity is almost entirely noise)
+
+**Example (Query 43 - Violence):**
+| Method | Overall Diversity | Relevant Diversity | Ratio |
+|--------|------------------|-------------------|-------|
+| Query Expansion | 0.64 | 0.51 | **0.80** |
+| Direct Retrieval | 0.51 | 0.38 | **0.75** |
+| Keyword Search | 0.82 | 0.43 | **0.53** |
+| Random Uniform | 0.86 | 0.36 | **0.42** |
+
+**Related metrics:** Semantic Diversity, Relevant Topic Diversity, Query-Relevant Ratio
+
+---
+
 ## Pairwise Comparison Metrics (Between Methods)
 
 These compare two methods to quantify differences and similarities.
 
-### 14. Topic Word Overlap (Jaccard)
+### 19. Topic Word Overlap (Jaccard)
 
 **Range:** 0 to 1
 **Computation:** Jaccard similarity of top-10 words for Hungarian-matched topic pairs
@@ -326,27 +445,39 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 15. Topic Semantic Similarity
+### 20. Topic Semantic Similarity
 
 **Range:** 0 to 1
-**Computation:** Cosine similarity of topic embeddings for Hungarian-matched pairs
-**Measures:** Semantic similarity between matched topics
+**Computation:**
+1. Compute topic embeddings for all topics in both methods (concatenate top-10 words, encode with sentence transformer)
+2. Compute cosine similarity matrix between all topic pairs
+3. **Hungarian algorithm** finds optimal 1-to-1 matching that maximizes total similarity
+4. Report mean similarity of matched pairs
+5. Creates `min(n_topics_A, n_topics_B)` matched pairs
+
+**Measures:** Semantic similarity between optimally-matched topics
 
 **Interpretation:**
 - Higher values indicate methods discover conceptually similar topics
 - More robust than word overlap (captures synonyms and paraphrases)
-- Used for F1/Precision/Recall thresholds
+- Used for thresholding in F1/Precision/Recall metrics
+- **Hungarian matching ensures fairness**: Each topic matched to its best counterpart (1-to-1 constraint)
 
 **Method comparisons:**
 - High similarity = methods produce similar topic structures
 - Low similarity = methods produce different topic structures
 - Compare retrieval methods to each other (stability) vs. random (difference)
 
-**Related metrics:** Topic Word Overlap (lexical vs. semantic), F1 @ thresholds
+**Important constraint:**
+- **1-to-1 matching only**: If method A has 50 topics and method B has 30, only 30 pairs are created
+- Unmatched topics (20 in this case) are ignored in similarity calculation
+- This affects precision/recall: they measure coverage of the matchable topic space
+
+**Related metrics:** Topic Word Overlap (lexical vs. semantic), Precision/Recall @ thresholds (use this similarity for matching)
 
 ---
 
-### 16-18. F1 @ Thresholds (0.5, 0.6, 0.7)
+### 21-23. F1 @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
 **Computation:** Harmonic mean of precision and recall at different semantic similarity thresholds
@@ -369,45 +500,67 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 19-21. Precision @ Thresholds (0.5, 0.6, 0.7)
+### 24-26. Precision_B @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
-**Computation:** Fraction of method B's topics that match method A's topics
-**Measures:** Coverage of B by A (directional)
+**Computation:**
+1. Hungarian algorithm creates optimal 1-to-1 topic matchings between methods A and B
+2. Count matched pairs with semantic similarity ≥ threshold (0.5, 0.6, or 0.7)
+3. `precision_b = matched_count / n_topics_B`
+
+**Measures:** What fraction of method B's topics are covered by method A at the given similarity threshold
 
 **Interpretation:**
-- Higher values indicate most of B's topics appear in A
-- Asymmetric: Precision_B ≠ Precision_A
-- Low precision = B discovers topics not in A
+- Higher values indicate most of B's topics have high-similarity matches in A
+- Lower values indicate many of B's topics are NOT covered by A (unique to B)
+- **Asymmetric**: `precision_b(A,B) ≠ precision_b(B,A)` when topic counts differ
+- Same numerator as recall_a, but different denominator (n_topics_B vs n_topics_A)
 
 **Method comparisons:**
-- If Precision_B is high, A "covers" B's topics
-- If Precision_B is low, B discovers novel topics
+- **High precision_b**: A "covers" most of B's topic space
+- **Low precision_b**: B discovers many topics not present in A
+- **Example**: If Direct Retrieval (37 topics) vs Query Expansion (50 topics) has 31 matched pairs at threshold 0.7:
+  - `precision_b = 31/50 = 0.62` (62% of QE's topics covered by DR)
+  - `recall_a = 31/37 = 0.84` (84% of DR's topics covered by QE)
 
-**Related metrics:** Recall @ thresholds (inverse direction), F1 @ thresholds
+**Mathematical relationship:**
+- `precision_b(A, B) = recall_a(B, A)` (they measure the same coverage, from opposite perspectives)
+
+**Related metrics:** Recall_A @ thresholds (complementary metric), F1 @ thresholds
 
 ---
 
-### 22-24. Recall @ Thresholds (0.5, 0.6, 0.7)
+### 27-29. Recall_A @ Thresholds (0.5, 0.6, 0.7)
 
 **Range:** 0 to 1
-**Computation:** Fraction of method A's topics that match method B's topics
-**Measures:** Coverage of A by B (directional)
+**Computation:**
+1. Hungarian algorithm creates optimal 1-to-1 topic matchings between methods A and B
+2. Count matched pairs with semantic similarity ≥ threshold (0.5, 0.6, or 0.7)
+3. `recall_a = matched_count / n_topics_A`
+
+**Measures:** What fraction of method A's topics are covered by method B at the given similarity threshold
 
 **Interpretation:**
-- Higher values indicate most of A's topics appear in B
-- Asymmetric: Recall_A ≠ Recall_B
-- Low recall = A discovers topics not in B
+- Higher values indicate most of A's topics have high-similarity matches in B
+- Lower values indicate many of A's topics are NOT covered by B (unique to A)
+- **Asymmetric**: `recall_a(A,B) ≠ recall_a(B,A)` when topic counts differ
+- Same numerator as precision_b, but different denominator (n_topics_A vs n_topics_B)
 
 **Method comparisons:**
-- If Recall_A is high, B "covers" A's topics
-- If Recall_A is low, A discovers novel topics
+- **High recall_a**: B "covers" most of A's topic space
+- **Low recall_a**: A discovers many topics not present in B
+- **Example**: If Keyword Search (51 topics) vs Direct Retrieval (37 topics) has 19 matched pairs at threshold 0.7:
+  - `recall_a = 19/51 = 0.37` (37% of KS's topics covered by DR)
+  - `precision_b = 19/37 = 0.51` (51% of DR's topics covered by KS)
 
-**Related metrics:** Precision @ thresholds (inverse direction), F1 @ thresholds
+**Mathematical relationship:**
+- `recall_a(A, B) = precision_b(B, A)` (they measure the same coverage, from opposite perspectives)
+
+**Related metrics:** Precision_B @ thresholds (complementary metric), F1 @ thresholds
 
 ---
 
-### 25. NPMI Coherence Difference
+### 30. NPMI Coherence Difference
 
 **Range:** -1 to 1
 **Computation:** NPMI_A - NPMI_B
@@ -426,7 +579,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 26. Embedding Coherence Difference
+### 31. Embedding Coherence Difference
 
 **Range:** -1 to 1
 **Computation:** EmbeddingCoherence_A - EmbeddingCoherence_B
@@ -445,7 +598,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 27. Semantic Diversity Difference
+### 32. Semantic Diversity Difference
 
 **Range:** -1 to 1
 **Computation:** SemanticDiversity_A - SemanticDiversity_B
@@ -464,7 +617,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 28. Lexical Diversity Difference
+### 33. Lexical Diversity Difference
 
 **Range:** -1 to 1
 **Computation:** LexicalDiversity_A - LexicalDiversity_B
@@ -483,7 +636,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 29. ARI (Adjusted Rand Index)
+### 34. ARI (Adjusted Rand Index)
 
 **Range:** -1 to 1 (typically 0 to 1)
 **Computation:** Adjusted Rand Index on document clustering assignments (only on overlapping documents)
@@ -504,7 +657,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 30. NMI (Normalized Mutual Information)
+### 35. NMI (Normalized Mutual Information)
 
 **Range:** 0 to 1
 **Computation:** Normalized Mutual Information on document clustering assignments (only on overlapping documents)
@@ -524,7 +677,7 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 31. Document Overlap (Jaccard)
+### 36. Document Overlap (Jaccard)
 
 **Range:** 0 to 1
 **Computation:** Jaccard similarity of sampled document IDs between methods
@@ -604,15 +757,22 @@ These compare two methods to quantify differences and similarities.
 
 ### 5-17. Pairwise Heatmaps
 
-**Type:** Method × Method heatmap (4×4 grid)
+**Type:** Method × Method heatmap (6×6 grid)
 **Metrics:** 13 pairwise metrics (similarity, overlap, F1, precision, recall, coherence diff, etc.)
 
 **Usage:**
 - Compare all method pairs
 - Identify which methods are most similar/different
-- Diagonal = self-comparison (not meaningful)
-- Symmetric metrics (e.g., F1) produce symmetric heatmaps
-- Asymmetric metrics (e.g., precision/recall) produce asymmetric heatmaps
+- Diagonal = self-comparison (always 1.0 for precision/recall)
+- **Symmetric metrics** (e.g., F1, topic_semantic_similarity) produce symmetric heatmaps
+- **Asymmetric metrics** (e.g., precision_b, recall_a) produce **asymmetric heatmaps**
+
+**Important:**
+- **Precision_B and Recall_A heatmaps are asymmetric** (fixed in Dec 2025)
+  - Row i, Col j for precision_b: "How much of method j's topics are covered by method i?"
+  - Row i, Col j for recall_a: "How much of method i's topics are covered by method j?"
+  - `heatmap[i,j] ≠ heatmap[j,i]` when topic counts differ
+- See [PRECISION_RECALL_FIX.md](PRECISION_RECALL_FIX.md) for details on the visualization bug fix
 
 ---
 
@@ -688,7 +848,14 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for detailed plans on:
 **Recently Implemented (2025-11):**
 - ✅ **Topic Specificity (IDF-based)** - Now metric #9
 - ✅ **Relevant Document Concentration** - Now metric #8
-- ✅ **Document Overlap (Jaccard)** - Now metric #31
+- ✅ **Document Overlap (Jaccard)** - Now metric #36
+
+**Recently Implemented (2026-01):**
+- ✅ **Relevant Topic Diversity** - Now metric #14 (diversity among query-relevant topics only)
+- ✅ **Relevance-Weighted Diversity** - Now metric #15 (diversity weighted by query relevance)
+- ✅ **Top-K Relevant Diversity** - Now metric #16 (diversity among top-K most relevant topics)
+- ✅ **Number of Relevant Topics** - Now metric #17 (count of topics above relevance threshold)
+- ✅ **Relevant Diversity Ratio** - Now metric #18 (key metric for detecting "fake diversity" from noise)
 
 ---
 
@@ -703,9 +870,19 @@ python src/end_to_end_evaluation.py
 Results saved to:
 ```
 results/topic_evaluation/query_X/
-├── per_method_summary.csv       # All per-method metrics
+├── per_method_summary.csv       # All per-method metrics (36 metrics)
 ├── pairwise_metrics.csv         # All pairwise comparisons
 └── plots/                       # All visualizations
+
+# Per-method summary columns include:
+# - method, n_topics, n_docs
+# - diversity_semantic, diversity_lexical
+# - npmi_coherence, embedding_coherence
+# - relevant_concentration, topic_specificity
+# - outlier_ratio, document_coverage, avg_topic_size
+# - topic_query_similarity, max_query_similarity, query_relevant_ratio, top3_avg_similarity
+# - relevant_topic_diversity, relevance_weighted_diversity, topk_relevant_diversity
+# - n_relevant_topics, relevant_diversity_ratio
 ```
 
 ### Analyzing Results

@@ -423,9 +423,9 @@ class TopicModelWrapper:
         # Import TopicGPT functions
         try:
             from topicgpt_python import generate_topic_lvl1, assign_topics
-        except ImportError:
+        except ImportError as e:
             raise ImportError(
-                "topicgpt_python not installed. Install with: pip install topicgpt_python"
+                f"topicgpt_python not installed. Install with: pip install topicgpt_python. Original error: {e}"
             )
 
         # Check for API key

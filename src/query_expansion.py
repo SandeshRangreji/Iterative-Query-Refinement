@@ -49,24 +49,33 @@ class QueryExpander:
         index_manager: IndexManager,
         cache_dir: str = "cache",
         sbert_model_name: str = "all-mpnet-base-v2",
-        cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        device: str = None
     ):
         """
         Initialize query expander
-        
+
         Args:
             preprocessor: TextPreprocessor instance
             index_manager: IndexManager instance
             cache_dir: Directory for caching
             sbert_model_name: SBERT model name
             cross_encoder_model_name: Cross encoder model name
+            device: Device to use ('cpu', 'cuda'). None for auto-detection
         """
         self.preprocessor = preprocessor
         self.index_manager = index_manager
         self.cache_dir = cache_dir
         self.sbert_model_name = sbert_model_name
         self.cross_encoder_model_name = cross_encoder_model_name
-        
+
+        # Set device
+        if device is None:
+            import torch
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
     
@@ -160,16 +169,17 @@ class QueryExpander:
             dataset_name=dataset_name,
             force_reindex=force_reindex
         )
-        
+
         logger.info("Loading or building SBERT index...")
         sbert_model, doc_embeddings = self.index_manager.build_sbert_index(
             corpus_texts,
             model_name=self.sbert_model_name,
             dataset_name=dataset_name,
             batch_size=64,
-            force_reindex=force_reindex
+            force_reindex=force_reindex,
+            device=self.device
         )
-        
+
         return bm25, corpus_texts, corpus_ids, sbert_model, doc_embeddings
     
     def _deduplicate_query_and_keywords(self, query_text: str, keywords: List[str]) -> str:
@@ -649,7 +659,8 @@ class QueryExpander:
             keybert_model=self.sbert_model_name,
             cache_dir=self.cache_dir,
             top_k_docs=kw_top_k_docs,
-            top_n_docs_for_extraction=kw_top_n_docs_for_extraction
+            top_n_docs_for_extraction=kw_top_n_docs_for_extraction,
+            device=self.device
         )
         
         # Extract keywords for all queries
@@ -814,7 +825,7 @@ def main():
     from datasets import load_dataset
     
     # ===== CACHING CONTROL FLAGS =====
-    FORCE_REINDEX = False                      # For search indices
+    FORCE_REINDEX = False                      # GPU indices already built
     FORCE_REGENERATE_KEYWORDS = False          # For keyword extraction
     FORCE_REGENERATE_BASELINE = False          # For baseline search results
     FORCE_REGENERATE_EXPANSION = False         # For expansion results
@@ -841,17 +852,27 @@ def main():
     # ===== MODEL PARAMETERS =====
     SBERT_MODEL = "all-mpnet-base-v2"
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    
+
+    # ===== DEVICE CONFIGURATION =====
+    import torch
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
     # ===== OTHER PARAMETERS =====
     OUTPUT_DIR = "results/query_expansion"
     CACHE_DIR = "cache"
     LOG_LEVEL = "INFO"
-    
+
     # Configure logging
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+
+    # Log device info
+    logger.info(f"Selected device: {DEVICE}")
+    if DEVICE == "cuda":
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     # Load datasets
     logger.info("Loading datasets...")
@@ -870,30 +891,147 @@ def main():
         index_manager=index_manager,
         cache_dir=CACHE_DIR,
         sbert_model_name=SBERT_MODEL,
-        cross_encoder_model_name=CROSS_ENCODER_MODEL
+        cross_encoder_model_name=CROSS_ENCODER_MODEL,
+        device=DEVICE
     )
     
-    # Define expansion configurations to evaluate
-    expansion_configs = [
+    # Define all search method configurations to test
+    search_configs = [
+        # Method 1: BM25 only
         {
-            "name": "KeyBERT + Weighted RRF",
-            "expansion_method": QueryExpansionMethod.KEYBERT.value,
-            "combination_strategy": QueryCombinationStrategy.WEIGHTED_RRF.value
+            "name": "BM25",
+            "retrieval_method": RetrievalMethod.BM25,
+            "hybrid_strategy": None,
+            "use_mmr": False,
+            "use_cross_encoder": False
         },
+        # Method 2: SBERT only
         {
-            "name": "KeyBERT + Concatenated",
-            "expansion_method": QueryExpansionMethod.KEYBERT.value,
-            "combination_strategy": QueryCombinationStrategy.CONCATENATED.value
+            "name": "SBERT",
+            "retrieval_method": RetrievalMethod.SBERT,
+            "hybrid_strategy": None,
+            "use_mmr": False,
+            "use_cross_encoder": False
         },
+        # Method 3: Hybrid (Simple Sum)
         {
-            "name": "KeyBERT + Concatenated + CrossEncoder",
-            "expansion_method": QueryExpansionMethod.KEYBERT.value,
-            "combination_strategy": QueryCombinationStrategy.CONCATENATED_RERANKED.value
+            "name": "Hybrid (Simple Sum)",
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        # Method 4: Hybrid (RRF)
+        {
+            "name": "Hybrid (RRF)",
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.RRF,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        # Method 5: Hybrid (Weighted)
+        {
+            "name": "Hybrid (Weighted)",
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.WEIGHTED,
+            "use_mmr": False,
+            "use_cross_encoder": False
+        },
+        # Method 6: Hybrid + Cross-encoder
+        {
+            "name": "Hybrid (Simple Sum) + CrossEncoder",
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": False,
+            "use_cross_encoder": True
+        },
+        # Method 7: Hybrid + MMR
+        {
+            "name": "Hybrid (Simple Sum) + MMR",
+            "retrieval_method": RetrievalMethod.HYBRID,
+            "hybrid_strategy": HybridStrategy.SIMPLE_SUM,
+            "use_mmr": True,
+            "use_cross_encoder": False
         }
     ]
-    
-    # Run evaluation suite
-    results = query_expander.run_evaluation_suite(
+
+    # Load or build indices (shared across all methods)
+    logger.info("Loading or building search indices...")
+    bm25, corpus_texts, corpus_ids, sbert_model, doc_embeddings = query_expander._load_or_build_indices(
+        corpus_dataset,
+        dataset_name=DATASET_NAME,
+        force_reindex=FORCE_REINDEX
+    )
+
+    # Initialize search engine
+    search_engine = SearchEngine(
+        preprocessor=preprocessor,
+        bm25=bm25,
+        corpus_texts=corpus_texts,
+        corpus_ids=corpus_ids,
+        sbert_model=sbert_model,
+        doc_embeddings=doc_embeddings,
+        cross_encoder_model_name=CROSS_ENCODER_MODEL
+    )
+
+    # Run all baseline methods
+    all_results = []
+
+    for config in search_configs:
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Evaluating: {config['name']}")
+        logger.info(f"{'='*80}")
+
+        # Run search for all queries
+        results_by_query_id = run_search_for_multiple_queries(
+            search_engine=search_engine,
+            queries_dataset=queries_dataset,
+            top_k=TOP_K_RESULTS,
+            method=config["retrieval_method"],
+            hybrid_strategy=config["hybrid_strategy"],
+            use_mmr=config["use_mmr"],
+            use_cross_encoder=config["use_cross_encoder"]
+        )
+
+        # Evaluate results
+        avg_precisions, avg_recalls, num_evaluated = SearchEvaluationUtils.evaluate_results(
+            results_by_query_id=results_by_query_id,
+            qrels_dataset=qrels_dataset,
+            top_k_p=20,
+            top_k_r=TOP_K_RESULTS
+        )
+
+        # Add to all_results (add "method" key for compatibility with save function)
+        config_copy = config.copy()
+        config_copy["method"] = config["retrieval_method"]
+        result_entry = {
+            "config": config_copy,
+            "avg_precisions": avg_precisions,
+            "avg_recalls": avg_recalls,
+            "num_evaluated": num_evaluated
+        }
+        all_results.append(result_entry)
+
+        # Log results
+        precision = avg_precisions["overall"]
+        recall = avg_recalls["overall"]
+        f1 = SearchEvaluationUtils.calculate_f1_score(precision, recall)
+        logger.info(f"P@20: {precision:.4f}, R@{TOP_K_RESULTS}: {recall:.4f}, F1: {f1:.4f}")
+
+    # Method 8: Query Expansion (on top of Hybrid Simple Sum)
+    logger.info(f"\n{'='*80}")
+    logger.info("Evaluating: Query Expansion (Hybrid Simple Sum + KeyBERT)")
+    logger.info(f"{'='*80}")
+
+    expansion_configs = [
+        {
+            "name": "Query Expansion (KeyBERT)",
+            "expansion_method": QueryExpansionMethod.KEYBERT.value,
+            "combination_strategy": QueryCombinationStrategy.CONCATENATED.value
+        }
+    ]
+
+    expansion_results = query_expander.run_evaluation_suite(
         queries_dataset=queries_dataset,
         corpus_dataset=corpus_dataset,
         qrels_dataset=qrels_dataset,
@@ -904,46 +1042,80 @@ def main():
         kw_top_k_docs=KW_TOP_K_DOCS,
         kw_top_n_docs_for_extraction=KW_TOP_N_DOCS,
         top_k_results=TOP_K_RESULTS,
-        retrieval_method=RETRIEVAL_METHOD,
-        hybrid_strategy=HYBRID_STRATEGY,
-        use_mmr=USE_MMR,
-        use_cross_encoder=USE_CROSS_ENCODER_BASELINE,
+        retrieval_method=RetrievalMethod.HYBRID,
+        hybrid_strategy=HybridStrategy.SIMPLE_SUM,
+        use_mmr=False,
+        use_cross_encoder=False,
         dataset_name=DATASET_NAME,
-        force_reindex=FORCE_REINDEX,
+        force_reindex=False,  # Already built indices
         force_regenerate_keywords=FORCE_REGENERATE_KEYWORDS,
         force_regenerate_baseline=FORCE_REGENERATE_BASELINE,
         force_regenerate_expansion=FORCE_REGENERATE_EXPANSION,
         output_dir=OUTPUT_DIR
     )
-    
-    # Print results summary
-    logger.info("\n===== QUERY EXPANSION EVALUATION RESULTS =====")
-    logger.info(f"{'Method':<40} {'P@20':<10} {'R@'+str(TOP_K_RESULTS):<10} {'F1':<10}")
-    logger.info("-" * 70)
-    
-    for result in results["visualization_results"]:
+
+    # Add expansion results to all_results (skip baseline, only add expansion)
+    for result in expansion_results["visualization_results"]:
+        if result["config"]["name"] != "Baseline":
+            all_results.append(result)
+
+    # Print final summary
+    logger.info(f"\n{'='*80}")
+    logger.info("COMPREHENSIVE SEARCH METHOD EVALUATION RESULTS")
+    logger.info(f"{'='*80}")
+    logger.info(f"{'Method':<45} {'P@20':<10} {'R@1000':<10} {'F1':<10}")
+    logger.info("-" * 75)
+
+    for result in all_results:
         config_name = result["config"]["name"]
         precision = result["avg_precisions"]["overall"]
         recall = result["avg_recalls"]["overall"]
-        
-        # Calculate F1
         f1 = SearchEvaluationUtils.calculate_f1_score(precision, recall)
-        
-        logger.info(f"{config_name:<40} {precision:.4f}     {recall:.4f}     {f1:.4f}")
-    
-    if results["output_file"]:
-        logger.info(f"\nResults saved to {results['output_file']}")
-    
-    if results["plot_paths"]:
-        logger.info(f"Visualization plots saved to {os.path.dirname(results['plot_paths'][0])}")
-    
-    # Print cache structure info
-    logger.info(f"\n===== CACHE STRUCTURE =====")
-    logger.info(f"Keyword cache: cache/keywords/")
-    logger.info(f"Baseline cache: cache/retrieval/baseline/")
-    logger.info(f"Expansion cache: cache/retrieval/expanded/")
-    
-    return results
+        logger.info(f"{config_name:<45} {precision:.4f}     {recall:.4f}     {f1:.4f}")
+
+    # Save results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_file = os.path.join(OUTPUT_DIR, "comprehensive_search_results.json")
+    SearchEvaluationUtils.save_evaluation_results(all_results, output_file)
+    logger.info(f"\nResults saved to {output_file}")
+
+    # Generate comprehensive visualizations
+    logger.info("\nGenerating comprehensive visualizations...")
+    plots_dir = os.path.join(OUTPUT_DIR, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    from search_viz import visualize_all_results, create_comprehensive_comparison_plot, create_detailed_grid_plot
+
+    # Original plots
+    plot_paths = visualize_all_results(all_results, top_k_p=20, top_k_r=TOP_K_RESULTS, output_dir=plots_dir)
+
+    # New comprehensive plots
+    comprehensive_plot_path = create_comprehensive_comparison_plot(
+        all_results,
+        relevance_level="highly_relevant",
+        top_k_p=20,
+        top_k_r=TOP_K_RESULTS,
+        output_dir=plots_dir
+    )
+    plot_paths.append(comprehensive_plot_path)
+
+    detailed_grid_plot_path = create_detailed_grid_plot(
+        all_results,
+        top_k_p=20,
+        top_k_r=TOP_K_RESULTS,
+        output_dir=plots_dir
+    )
+    plot_paths.append(detailed_grid_plot_path)
+
+    logger.info(f"Visualization plots saved to {plots_dir}/")
+    logger.info(f"  - Comprehensive comparison: {comprehensive_plot_path}")
+    logger.info(f"  - Detailed grid: {detailed_grid_plot_path}")
+
+    return {
+        "all_results": all_results,
+        "output_file": output_file,
+        "plot_paths": plot_paths
+    }
 
 
 # Execute main function if called directly

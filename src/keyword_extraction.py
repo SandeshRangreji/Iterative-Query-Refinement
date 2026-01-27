@@ -38,33 +38,42 @@ class KeywordExtractor:
     """Class for extracting keywords from retrieved documents"""
     
     def __init__(
-        self, 
+        self,
         keybert_model: str = 'all-mpnet-base-v2',
         cache_dir: str = 'cache',
         top_k_docs: int = 1000,  # Number of docs to retrieve
-        top_n_docs_for_extraction: int = 10  # Number of docs to use for extraction
+        top_n_docs_for_extraction: int = 10,  # Number of docs to use for extraction
+        device: str = None  # Device to use ('cpu', 'cuda', 'mps'). None for auto-detection
     ):
         """
         Initialize keyword extractor
-        
+
         Args:
             keybert_model: Model name for KeyBERT or SentenceTransformer model
             cache_dir: Directory to store cache files
             top_k_docs: Number of documents to retrieve
             top_n_docs_for_extraction: Number of top documents to use for extraction
+            device: Device to use ('cpu', 'cuda', 'mps'). None for auto-detection
         """
         self.top_k_docs = top_k_docs
         self.top_n_docs_for_extraction = top_n_docs_for_extraction
         self.stop_words = set(stopwords.words('english'))
         self.cache_dir = cache_dir
         self.keybert_model_name = keybert_model
-        
+
+        # Select device with auto-detection
+        if device is None:
+            import torch
+            self.device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        else:
+            self.device = device
+
         # Create cache directory if it doesn't exist
         os.makedirs(self.cache_dir, exist_ok=True)
-        
-        # Initialize KeyBERT with sbert model
+
+        # Initialize KeyBERT with sbert model on specified device
         if isinstance(keybert_model, str):
-            self.sbert_model = SentenceTransformer(keybert_model)
+            self.sbert_model = SentenceTransformer(keybert_model, device=self.device)
             self.keybert = KeyBERT(model=self.sbert_model)
         else:
             # Assume it's already a SentenceTransformer model

@@ -97,6 +97,519 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
 
+class TimingTracker:
+    """
+    Track timing for pipeline steps and write to JSONL file.
+
+    Each timing event is written as a JSON object with:
+    - event: Name of the event (e.g., "sample_generation", "topic_modeling")
+    - timestamp: ISO format timestamp when the event completed
+    - duration_seconds: Time taken in seconds
+    - Additional fields depending on event type (e.g., method, query_id)
+    """
+
+    def __init__(self, output_path: str):
+        """
+        Initialize timing tracker.
+
+        Args:
+            output_path: Path to write timing.jsonl file
+        """
+        self.output_path = output_path
+        self.events = []
+        self._start_times = {}
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    def start(self, event_name: str, **metadata):
+        """Start timing an event."""
+        import time
+        self._start_times[event_name] = {
+            'start_time': time.time(),
+            'metadata': metadata
+        }
+
+    def stop(self, event_name: str, **extra_metadata):
+        """Stop timing an event and record it."""
+        import time
+        from datetime import datetime
+
+        if event_name not in self._start_times:
+            logger.warning(f"Timing event '{event_name}' was never started")
+            return
+
+        start_info = self._start_times.pop(event_name)
+        duration = time.time() - start_info['start_time']
+
+        # Merge metadata
+        metadata = {**start_info['metadata'], **extra_metadata}
+
+        event = {
+            'event': event_name,
+            'timestamp': datetime.now().isoformat(),
+            'duration_seconds': round(duration, 2),
+            **metadata
+        }
+
+        self.events.append(event)
+
+        # Append to file immediately (so we don't lose data on crash)
+        with open(self.output_path, 'a') as f:
+            f.write(json.dumps(event) + '\n')
+
+    def record(self, event_name: str, duration_seconds: float, **metadata):
+        """Record a timing event directly (without start/stop)."""
+        from datetime import datetime
+
+        event = {
+            'event': event_name,
+            'timestamp': datetime.now().isoformat(),
+            'duration_seconds': round(duration_seconds, 2),
+            **metadata
+        }
+
+        self.events.append(event)
+
+        with open(self.output_path, 'a') as f:
+            f.write(json.dumps(event) + '\n')
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Get summary of all recorded events."""
+        return {
+            'total_events': len(self.events),
+            'events': self.events
+        }
+
+
+# ============================================================================
+# Statistical Testing Functions
+# ============================================================================
+
+def compute_cohens_d(group1: np.ndarray, group2: np.ndarray) -> float:
+    """
+    Compute Cohen's d effect size for two groups.
+
+    Args:
+        group1: Array of values for group 1
+        group2: Array of values for group 2
+
+    Returns:
+        Cohen's d effect size (positive if group1 > group2)
+    """
+    n1, n2 = len(group1), len(group2)
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+
+    # Pooled standard deviation
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+
+    if pooled_std == 0:
+        return 0.0
+
+    return (np.mean(group1) - np.mean(group2)) / pooled_std
+
+
+def interpret_cohens_d(d: float) -> str:
+    """
+    Interpret Cohen's d effect size.
+
+    Args:
+        d: Cohen's d value
+
+    Returns:
+        String interpretation of effect size
+    """
+    abs_d = abs(d)
+    if abs_d < 0.2:
+        return "negligible"
+    elif abs_d < 0.5:
+        return "small"
+    elif abs_d < 0.8:
+        return "medium"
+    else:
+        return "large"
+
+
+def paired_ttest(group1: np.ndarray, group2: np.ndarray) -> Tuple[float, float]:
+    """
+    Perform paired t-test between two groups.
+
+    Args:
+        group1: Array of values for group 1
+        group2: Array of values for group 2
+
+    Returns:
+        Tuple of (t-statistic, p-value)
+    """
+    from scipy import stats
+
+    # Handle edge cases
+    if len(group1) != len(group2):
+        raise ValueError("Groups must have same length for paired t-test")
+
+    if len(group1) < 2:
+        return (np.nan, np.nan)
+
+    # Check if all differences are zero (no variance)
+    differences = group1 - group2
+    if np.all(differences == 0):
+        return (0.0, 1.0)
+
+    t_stat, p_value = stats.ttest_rel(group1, group2)
+    return (t_stat, p_value)
+
+
+def benjamini_hochberg_correction(p_values: List[float], alpha: float = 0.05) -> Tuple[List[float], List[bool]]:
+    """
+    Apply Benjamini-Hochberg FDR correction for multiple comparisons.
+
+    Args:
+        p_values: List of raw p-values
+        alpha: Significance threshold (default 0.05)
+
+    Returns:
+        Tuple of (adjusted p-values, list of booleans indicating significance)
+    """
+    n = len(p_values)
+    if n == 0:
+        return [], []
+
+    # Handle NaN values
+    p_array = np.array(p_values)
+    valid_mask = ~np.isnan(p_array)
+
+    if not np.any(valid_mask):
+        return list(p_array), [False] * n
+
+    # Sort p-values and get ranks
+    sorted_indices = np.argsort(p_array[valid_mask])
+    sorted_p = p_array[valid_mask][sorted_indices]
+
+    # Calculate adjusted p-values
+    m = len(sorted_p)
+    ranks = np.arange(1, m + 1)
+    adjusted_p_sorted = sorted_p * m / ranks
+
+    # Ensure monotonicity (each adjusted p-value >= previous)
+    adjusted_p_sorted = np.minimum.accumulate(adjusted_p_sorted[::-1])[::-1]
+    adjusted_p_sorted = np.clip(adjusted_p_sorted, 0, 1)
+
+    # Map back to original order
+    adjusted_p = np.full(n, np.nan)
+    valid_indices = np.where(valid_mask)[0]
+    adjusted_p[valid_indices[sorted_indices]] = adjusted_p_sorted
+
+    # Determine significance
+    significant = adjusted_p < alpha
+
+    return list(adjusted_p), list(significant)
+
+
+def run_pairwise_statistical_tests(
+    data: pd.DataFrame,
+    metric: str,
+    method_col: str = 'method',
+    alpha: float = 0.05
+) -> pd.DataFrame:
+    """
+    Run pairwise statistical tests (paired t-test + Cohen's d) for a metric across methods.
+
+    Args:
+        data: DataFrame with columns [method_col, metric, 'query_id']
+        metric: Name of the metric column to test
+        method_col: Name of the method column
+        alpha: Significance threshold
+
+    Returns:
+        DataFrame with columns:
+        - method_a, method_b: Method pair
+        - mean_a, mean_b: Mean values
+        - diff: Difference in means (a - b)
+        - t_stat: t-statistic
+        - p_value: Raw p-value
+        - p_adjusted: BH-adjusted p-value
+        - cohens_d: Effect size
+        - effect_size: Interpretation of Cohen's d
+        - significant: Whether difference is significant after correction
+    """
+    methods = sorted(data[method_col].unique())
+    results = []
+
+    for i, method_a in enumerate(methods):
+        for method_b in methods[i+1:]:
+            # Get paired data (same queries for both methods)
+            data_a = data[data[method_col] == method_a].set_index('query_id')[metric]
+            data_b = data[data[method_col] == method_b].set_index('query_id')[metric]
+
+            # Align by query_id
+            common_queries = data_a.index.intersection(data_b.index)
+            values_a = data_a.loc[common_queries].values
+            values_b = data_b.loc[common_queries].values
+
+            if len(common_queries) < 2:
+                continue
+
+            # Compute statistics
+            mean_a = np.mean(values_a)
+            mean_b = np.mean(values_b)
+            diff = mean_a - mean_b
+
+            t_stat, p_value = paired_ttest(values_a, values_b)
+            d = compute_cohens_d(values_a, values_b)
+
+            results.append({
+                'method_a': method_a,
+                'method_b': method_b,
+                'n_queries': len(common_queries),
+                'mean_a': round(mean_a, 4),
+                'mean_b': round(mean_b, 4),
+                'diff': round(diff, 4),
+                't_stat': round(t_stat, 4) if not np.isnan(t_stat) else np.nan,
+                'p_value': round(p_value, 6) if not np.isnan(p_value) else np.nan,
+                'cohens_d': round(d, 4),
+                'effect_size': interpret_cohens_d(d)
+            })
+
+    if not results:
+        return pd.DataFrame()
+
+    results_df = pd.DataFrame(results)
+
+    # Apply BH correction
+    p_values = results_df['p_value'].tolist()
+    adjusted_p, significant = benjamini_hochberg_correction(p_values, alpha)
+
+    results_df['p_adjusted'] = [round(p, 6) if not np.isnan(p) else np.nan for p in adjusted_p]
+    results_df['significant'] = significant
+
+    return results_df
+
+
+def plot_statistical_heatmaps(
+    stats_df: pd.DataFrame,
+    metric_name: str,
+    output_dir: str,
+    filename_prefix: str
+) -> None:
+    """
+    Create heatmap visualizations for statistical test results.
+
+    Generates two heatmaps:
+    1. P-value heatmap with significance markers
+    2. Cohen's d heatmap with effect size coloring
+
+    Args:
+        stats_df: DataFrame from run_pairwise_statistical_tests()
+        metric_name: Human-readable name of the metric
+        output_dir: Directory to save plots
+        filename_prefix: Prefix for output filenames
+    """
+    if stats_df.empty:
+        logger.warning(f"No statistical results to plot for {metric_name}")
+        return
+
+    methods = sorted(set(stats_df['method_a'].tolist() + stats_df['method_b'].tolist()))
+    n_methods = len(methods)
+    method_to_idx = {m: i for i, m in enumerate(methods)}
+
+    # Create matrices
+    p_matrix = np.ones((n_methods, n_methods))  # Default p=1 (no difference)
+    d_matrix = np.zeros((n_methods, n_methods))  # Default d=0 (no effect)
+    sig_matrix = np.zeros((n_methods, n_methods), dtype=bool)
+
+    for _, row in stats_df.iterrows():
+        i = method_to_idx[row['method_a']]
+        j = method_to_idx[row['method_b']]
+
+        p_val = row['p_adjusted'] if not np.isnan(row['p_adjusted']) else 1.0
+        d_val = row['cohens_d']
+        sig = row['significant']
+
+        # Fill both triangles (symmetric)
+        p_matrix[i, j] = p_val
+        p_matrix[j, i] = p_val
+        d_matrix[i, j] = d_val
+        d_matrix[j, i] = -d_val  # Reverse sign for other direction
+        sig_matrix[i, j] = sig
+        sig_matrix[j, i] = sig
+
+    # Set diagonal to NaN for display
+    np.fill_diagonal(p_matrix, np.nan)
+    np.fill_diagonal(d_matrix, np.nan)
+
+    # ===== Plot 1: P-value Heatmap =====
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Use log scale for p-values for better visualization
+    p_display = p_matrix.copy()
+
+    # Create annotation matrix with significance markers
+    annot_matrix = np.empty((n_methods, n_methods), dtype=object)
+    for i in range(n_methods):
+        for j in range(n_methods):
+            if i == j:
+                annot_matrix[i, j] = ""
+            elif np.isnan(p_matrix[i, j]):
+                annot_matrix[i, j] = ""
+            else:
+                p_val = p_matrix[i, j]
+                if p_val < 0.001:
+                    annot_matrix[i, j] = f"{p_val:.0e}***"
+                elif p_val < 0.01:
+                    annot_matrix[i, j] = f"{p_val:.3f}**"
+                elif p_val < 0.05:
+                    annot_matrix[i, j] = f"{p_val:.3f}*"
+                else:
+                    annot_matrix[i, j] = f"{p_val:.3f}"
+
+    # Mask diagonal
+    mask = np.eye(n_methods, dtype=bool)
+
+    sns.heatmap(
+        p_display,
+        annot=annot_matrix,
+        fmt="",
+        cmap="RdYlGn_r",  # Red = low p (significant), Green = high p
+        vmin=0,
+        vmax=0.1,
+        mask=mask,
+        xticklabels=methods,
+        yticklabels=methods,
+        ax=ax,
+        cbar_kws={'label': 'Adjusted p-value'}
+    )
+
+    ax.set_title(f'{metric_name}\nPairwise Significance (Paired t-test, BH-corrected)\n* p<0.05, ** p<0.01, *** p<0.001',
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel('Method', fontsize=11)
+    ax.set_ylabel('Method', fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_pvalues.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {filename_prefix}_pvalues.png")
+
+    # ===== Plot 2: Cohen's d Heatmap =====
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Create annotation with effect size labels
+    annot_d = np.empty((n_methods, n_methods), dtype=object)
+    for i in range(n_methods):
+        for j in range(n_methods):
+            if i == j:
+                annot_d[i, j] = ""
+            elif np.isnan(d_matrix[i, j]):
+                annot_d[i, j] = ""
+            else:
+                d_val = d_matrix[i, j]
+                effect = interpret_cohens_d(d_val)
+                annot_d[i, j] = f"{d_val:.2f}\n({effect[0].upper()})"  # First letter of effect size
+
+    # Diverging colormap centered at 0
+    vmax = max(abs(np.nanmin(d_matrix)), abs(np.nanmax(d_matrix)), 0.8)
+
+    sns.heatmap(
+        d_matrix,
+        annot=annot_d,
+        fmt="",
+        cmap="RdBu_r",  # Red = positive (row > col), Blue = negative
+        vmin=-vmax,
+        vmax=vmax,
+        center=0,
+        mask=mask,
+        xticklabels=methods,
+        yticklabels=methods,
+        ax=ax,
+        cbar_kws={'label': "Cohen's d (row - column)"}
+    )
+
+    ax.set_title(f"{metric_name}\nEffect Size (Cohen's d)\nN=negligible, S=small, M=medium, L=large",
+                 fontsize=12, fontweight='bold')
+    ax.set_xlabel('Method', fontsize=11)
+    ax.set_ylabel('Method', fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{filename_prefix}_cohens_d.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"✓ Saved {filename_prefix}_cohens_d.png")
+
+
+def run_aggregate_statistical_analysis(
+    all_per_method: pd.DataFrame,
+    output_dir: str,
+    metrics_to_test: List[Dict[str, str]] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    Run statistical analysis for multiple metrics and save results.
+
+    Args:
+        all_per_method: DataFrame with per-method data across all queries
+        output_dir: Directory to save results
+        metrics_to_test: List of dicts with 'column' and 'name' keys
+                        If None, uses default metrics
+
+    Returns:
+        Dictionary mapping metric names to results DataFrames
+    """
+    if metrics_to_test is None:
+        metrics_to_test = [
+            {'column': 'topic_query_similarity', 'name': 'Avg Topic-Query Similarity'},
+            {'column': 'diversity_semantic', 'name': 'Semantic Diversity'},
+            {'column': 'topic_specificity', 'name': 'Topic Specificity'}
+        ]
+
+    os.makedirs(output_dir, exist_ok=True)
+    all_results = {}
+
+    logger.info("Running aggregate statistical analysis...")
+
+    for metric_info in metrics_to_test:
+        column = metric_info['column']
+        name = metric_info['name']
+
+        if column not in all_per_method.columns:
+            logger.warning(f"Column '{column}' not found, skipping statistical tests")
+            continue
+
+        logger.info(f"  Testing: {name}")
+
+        # Run pairwise tests
+        stats_df = run_pairwise_statistical_tests(
+            data=all_per_method,
+            metric=column,
+            method_col='method',
+            alpha=0.05
+        )
+
+        if stats_df.empty:
+            logger.warning(f"  No results for {name}")
+            continue
+
+        # Save CSV
+        csv_path = os.path.join(output_dir, f"statistical_tests_{column}.csv")
+        stats_df.to_csv(csv_path, index=False)
+        logger.info(f"  ✓ Saved {csv_path}")
+
+        # Create heatmaps
+        plot_statistical_heatmaps(
+            stats_df=stats_df,
+            metric_name=name,
+            output_dir=output_dir,
+            filename_prefix=f"statistical_{column}"
+        )
+
+        all_results[column] = stats_df
+
+        # Log summary
+        n_significant = stats_df['significant'].sum()
+        n_total = len(stats_df)
+        logger.info(f"  Summary: {n_significant}/{n_total} pairs significantly different")
+
+    logger.info("✓ Aggregate statistical analysis complete")
+
+    return all_results
+
+
 class EndToEndEvaluator:
     """End-to-end evaluator for topic modeling with pairwise method comparisons"""
 
@@ -119,7 +632,8 @@ class EndToEndEvaluator:
         save_topic_models: bool = False,
         force_regenerate_samples: bool = False,
         force_regenerate_topics: bool = False,
-        force_regenerate_evaluation: bool = False
+        force_regenerate_evaluation: bool = False,
+        keyword_cache_path: Optional[str] = None
     ):
         """
         Initialize the end-to-end evaluator
@@ -143,6 +657,7 @@ class EndToEndEvaluator:
             force_regenerate_samples: Force regenerate samples
             force_regenerate_topics: Force regenerate topic models
             force_regenerate_evaluation: Force regenerate evaluation
+            keyword_cache_path: Path to keyword cache for query expansion (dataset-specific)
         """
         self.corpus_dataset = corpus_dataset
         self.queries_dataset = queries_dataset
@@ -160,6 +675,7 @@ class EndToEndEvaluator:
         self.force_regenerate_samples = force_regenerate_samples
         self.force_regenerate_topics = force_regenerate_topics
         self.force_regenerate_evaluation = force_regenerate_evaluation
+        self.keyword_cache_path = keyword_cache_path
 
         # Set random seeds
         random.seed(random_seed)
@@ -208,6 +724,12 @@ class EndToEndEvaluator:
         # Build qrels dictionary for fast relevance lookup
         self.qrels_dict = self._build_qrels_dict()
         logger.info(f"QRELs loaded for {len(self.qrels_dict)} queries")
+
+        # Initialize shared embedding model for metric computation (reused across all metrics)
+        # This prevents loading the model multiple times and saves GPU memory
+        logger.info(f"Loading shared embedding model for metrics: {self.embedding_model_name}")
+        self.metrics_embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        logger.info("Shared embedding model loaded")
 
     def _get_query_text(self) -> str:
         """Get query text for given query ID"""
@@ -355,6 +877,11 @@ class EndToEndEvaluator:
         Returns:
             Dict mapping query_id -> {doc_id: relevance_score}
         """
+        # Handle datasets without QRELs (e.g., doctor-reviews)
+        if self.qrels_dataset is None:
+            logger.info("No QRELs provided - relevant_concentration metric will return 0.0")
+            return {}
+
         qrels_dict = defaultdict(dict)
         for item in self.qrels_dataset:
             query_id = int(item['query-id'])
@@ -422,7 +949,13 @@ class EndToEndEvaluator:
             doc_ids = []
             for idx in tqdm(sample_indices, desc="Extracting random docs"):
                 doc = self.corpus_dataset[idx]
-                docs.append(doc["title"] + "\n\n" + doc["text"])
+                # Handle documents with or without title field
+                title = doc.get("title", "")
+                text = doc.get("text", "")
+                if title:
+                    docs.append(title + "\n\n" + text)
+                else:
+                    docs.append(text)
                 doc_ids.append(doc["_id"])
 
             return {
@@ -470,8 +1003,11 @@ class EndToEndEvaluator:
         logger.info(f"Method 3: Query expansion + retrieval ({self.sample_size} docs)")
 
         def compute():
-            # Load cached keywords
-            keyword_cache_path = "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json"
+            # Load cached keywords (use configured path or default)
+            keyword_cache_path = self.keyword_cache_path
+            if keyword_cache_path is None:
+                # Default to TREC-COVID keywords for backward compatibility
+                keyword_cache_path = "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json"
 
             if not os.path.exists(keyword_cache_path):
                 raise FileNotFoundError(f"Keyword cache not found: {keyword_cache_path}")
@@ -866,6 +1402,20 @@ class EndToEndEvaluator:
         metrics["query_relevant_ratio_a"] = alignment_a["query_relevant_ratio"]
         metrics["query_relevant_ratio_b"] = alignment_b["query_relevant_ratio"]
         metrics["top3_avg_similarity_a"] = alignment_a["top3_avg_similarity"]
+
+        # Relevant topic diversity metrics (diversity among query-relevant topics only)
+        rel_div_a = self._compute_relevant_topic_diversity(results_a)
+        rel_div_b = self._compute_relevant_topic_diversity(results_b)
+        metrics["relevant_topic_diversity_a"] = rel_div_a["relevant_topic_diversity"]
+        metrics["relevant_topic_diversity_b"] = rel_div_b["relevant_topic_diversity"]
+        metrics["relevance_weighted_diversity_a"] = rel_div_a["relevance_weighted_diversity"]
+        metrics["relevance_weighted_diversity_b"] = rel_div_b["relevance_weighted_diversity"]
+        metrics["topk_relevant_diversity_a"] = rel_div_a["topk_relevant_diversity"]
+        metrics["topk_relevant_diversity_b"] = rel_div_b["topk_relevant_diversity"]
+        metrics["n_relevant_topics_a"] = rel_div_a["n_relevant_topics"]
+        metrics["n_relevant_topics_b"] = rel_div_b["n_relevant_topics"]
+        metrics["relevant_diversity_ratio_a"] = rel_div_a["relevant_diversity_ratio"]
+        metrics["relevant_diversity_ratio_b"] = rel_div_b["relevant_diversity_ratio"]
         metrics["top3_avg_similarity_b"] = alignment_b["top3_avg_similarity"]
 
         # Topic matching using Hungarian algorithm
@@ -979,8 +1529,8 @@ class EndToEndEvaluator:
         if len(topic_words) < 2:
             return 0.0
 
-        # Load embedding model
-        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Use shared embedding model (loaded once in __init__)
+        model = self.metrics_embedding_model
 
         # Get embeddings for topics
         topic_embeddings = []
@@ -1034,8 +1584,8 @@ class EndToEndEvaluator:
         if not topics_a or not topics_b:
             return [], []
 
-        # Load embedding model
-        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Use shared embedding model (loaded once in __init__)
+        model = self.metrics_embedding_model
 
         # Get topic IDs
         topic_ids_a = list(topics_a.keys())
@@ -1101,8 +1651,8 @@ class EndToEndEvaluator:
         if not topic_words:
             return 0.0
 
-        # Load embedding model
-        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Use shared embedding model (loaded once in __init__)
+        model = self.metrics_embedding_model
 
         # Encode query
         query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
@@ -1152,8 +1702,8 @@ class EndToEndEvaluator:
                 "per_topic_similarities": []
             }
 
-        # Load embedding model
-        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Use shared embedding model (loaded once in __init__)
+        model = self.metrics_embedding_model
 
         # Encode query
         query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
@@ -1186,6 +1736,142 @@ class EndToEndEvaluator:
             "query_relevant_ratio": relevant_ratio,
             "top3_avg_similarity": top3_avg,
             "per_topic_similarities": similarities_sorted
+        }
+
+    def _compute_relevant_topic_diversity(
+        self,
+        results: Dict[str, Any],
+        relevance_threshold: float = 0.5,
+        top_k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Compute semantic diversity among query-relevant topics only.
+
+        This metric addresses the insight that overall diversity can be inflated by
+        "noise" topics unrelated to the query. By focusing on relevant topics, we
+        measure whether the method discovers distinct facets of the query.
+
+        Three approaches are computed:
+        1. Hard Threshold: Diversity among topics with query similarity >= threshold
+        2. Top-K: Diversity among top-K most query-relevant topics
+        3. Relevance-Weighted: Diversity weighted by query relevance (no threshold)
+
+        Args:
+            results: Topic modeling results containing topic_words
+            relevance_threshold: Threshold for "relevant" topics (default 0.5)
+            top_k: Number of top topics for top-k diversity (default 5)
+
+        Returns:
+            Dictionary with:
+            - relevant_topic_diversity: Diversity among relevant topics (hard threshold)
+            - relevance_weighted_diversity: Diversity weighted by query relevance
+            - topk_relevant_diversity: Diversity among top-K topics
+            - n_relevant_topics: Count of topics above threshold
+            - relevant_diversity_ratio: relevant_div / overall_div (>1 = good facet coverage)
+        """
+        topic_words = results.get("topic_words", {})
+
+        # Filter out outlier topic
+        topic_words = {k: v for k, v in topic_words.items() if k != -1}
+
+        if len(topic_words) < 2:
+            return {
+                "relevant_topic_diversity": None,
+                "relevance_weighted_diversity": None,
+                "topk_relevant_diversity": None,
+                "n_relevant_topics": 0,
+                "relevant_diversity_ratio": None
+            }
+
+        model = self.metrics_embedding_model
+
+        # Encode query
+        query_embedding = model.encode(
+            self.query_text,
+            convert_to_tensor=False,
+            show_progress_bar=False
+        )
+
+        # Compute embeddings and query similarities for all topics
+        topic_data = []
+        for topic_id, words in topic_words.items():
+            topic_text = " ".join(words[:10])
+            topic_embedding = model.encode(
+                topic_text,
+                convert_to_tensor=False,
+                show_progress_bar=False
+            )
+            similarity = float(cosine_similarity([query_embedding], [topic_embedding])[0][0])
+            topic_data.append({
+                "topic_id": topic_id,
+                "embedding": topic_embedding,
+                "query_similarity": similarity
+            })
+
+        # Helper to compute diversity from embeddings
+        def compute_diversity(embeddings):
+            if len(embeddings) < 2:
+                return None
+            sim_matrix = cosine_similarity(embeddings)
+            n = len(embeddings)
+            distances = 1 - sim_matrix
+            upper_triangle = distances[np.triu_indices(n, k=1)]
+            return float(np.mean(upper_triangle))
+
+        # ===== 1. Hard Threshold Diversity =====
+        relevant_topics = [t for t in topic_data if t["query_similarity"] >= relevance_threshold]
+        n_relevant = len(relevant_topics)
+
+        if n_relevant >= 2:
+            relevant_embeddings = np.array([t["embedding"] for t in relevant_topics])
+            relevant_diversity = compute_diversity(relevant_embeddings)
+        else:
+            relevant_diversity = None
+
+        # ===== 2. Top-K Diversity =====
+        topic_data_sorted = sorted(topic_data, key=lambda x: x["query_similarity"], reverse=True)
+        top_k_topics = topic_data_sorted[:min(top_k, len(topic_data_sorted))]
+
+        if len(top_k_topics) >= 2:
+            topk_embeddings = np.array([t["embedding"] for t in top_k_topics])
+            topk_diversity = compute_diversity(topk_embeddings)
+        else:
+            topk_diversity = None
+
+        # ===== 3. Relevance-Weighted Diversity =====
+        n = len(topic_data)
+        embeddings = np.array([t["embedding"] for t in topic_data])
+        query_sims = np.array([t["query_similarity"] for t in topic_data])
+
+        sim_matrix = cosine_similarity(embeddings)
+        dist_matrix = 1 - sim_matrix
+        weight_matrix = np.outer(query_sims, query_sims)
+
+        mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+        pairwise_distances = dist_matrix[mask]
+        pairwise_weights = weight_matrix[mask]
+        total_weight = pairwise_weights.sum()
+
+        if total_weight > 0:
+            weighted_diversity = float((pairwise_distances * pairwise_weights).sum() / total_weight)
+        else:
+            weighted_diversity = None
+
+        # ===== 4. Overall Diversity (for ratio) =====
+        overall_diversity = compute_diversity(embeddings)
+
+        # ===== 5. Compute Ratio =====
+        if overall_diversity and overall_diversity > 0 and relevant_diversity is not None:
+            relevant_ratio = relevant_diversity / overall_diversity
+        else:
+            relevant_ratio = None
+
+        return {
+            "relevant_topic_diversity": relevant_diversity,
+            "relevance_weighted_diversity": weighted_diversity,
+            "topk_relevant_diversity": topk_diversity,
+            "n_relevant_topics": n_relevant,
+            "relevant_diversity_ratio": relevant_ratio
         }
 
     def _compute_npmi_coherence(self, topic_words: Dict[int, List[str]], doc_texts: List[str], top_k: int = 10) -> float:
@@ -1275,8 +1961,8 @@ class EndToEndEvaluator:
         if not topic_words:
             return 0.0
 
-        # Load embedding model
-        model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        # Use shared embedding model (loaded once in __init__)
+        model = self.metrics_embedding_model
 
         topic_coherences = []
 
@@ -1569,6 +2255,12 @@ class EndToEndEvaluator:
             max_query_sims = []
             query_relevant_ratios = []
             top3_avg_sims = []
+            # New: Relevant topic diversity metrics
+            relevant_topic_diversities = []
+            relevance_weighted_diversities = []
+            topk_relevant_diversities = []
+            n_relevant_topics_list = []
+            relevant_diversity_ratios = []
 
             for _, row in method_comparisons.iterrows():
                 if row['method_a'] == method:
@@ -1585,6 +2277,12 @@ class EndToEndEvaluator:
                     max_query_sims.append(row['max_query_similarity_a'])
                     query_relevant_ratios.append(row['query_relevant_ratio_a'])
                     top3_avg_sims.append(row['top3_avg_similarity_a'])
+                    # New metrics
+                    relevant_topic_diversities.append(row.get('relevant_topic_diversity_a'))
+                    relevance_weighted_diversities.append(row.get('relevance_weighted_diversity_a'))
+                    topk_relevant_diversities.append(row.get('topk_relevant_diversity_a'))
+                    n_relevant_topics_list.append(row.get('n_relevant_topics_a'))
+                    relevant_diversity_ratios.append(row.get('relevant_diversity_ratio_a'))
                 else:  # method_b == method
                     topic_counts.append(row['n_topics_b'])
                     diversity_semantic.append(row['diversity_semantic_b'])
@@ -1599,6 +2297,12 @@ class EndToEndEvaluator:
                     max_query_sims.append(row['max_query_similarity_b'])
                     query_relevant_ratios.append(row['query_relevant_ratio_b'])
                     top3_avg_sims.append(row['top3_avg_similarity_b'])
+                    # New metrics
+                    relevant_topic_diversities.append(row.get('relevant_topic_diversity_b'))
+                    relevance_weighted_diversities.append(row.get('relevance_weighted_diversity_b'))
+                    topk_relevant_diversities.append(row.get('topk_relevant_diversity_b'))
+                    n_relevant_topics_list.append(row.get('n_relevant_topics_b'))
+                    relevant_diversity_ratios.append(row.get('relevant_diversity_ratio_b'))
 
             summary_data.append({
                 "method": method,
@@ -1616,7 +2320,13 @@ class EndToEndEvaluator:
                 "max_query_similarity": max_query_sims[0] if max_query_sims else 0,
                 "query_relevant_ratio": query_relevant_ratios[0] if query_relevant_ratios else 0,
                 "top3_avg_similarity": top3_avg_sims[0] if top3_avg_sims else 0,
-                "n_docs": topic_results[method]['n_docs']
+                "n_docs": topic_results[method]['n_docs'],
+                # New: Relevant topic diversity metrics
+                "relevant_topic_diversity": relevant_topic_diversities[0] if relevant_topic_diversities else None,
+                "relevance_weighted_diversity": relevance_weighted_diversities[0] if relevance_weighted_diversities else None,
+                "topk_relevant_diversity": topk_relevant_diversities[0] if topk_relevant_diversities else None,
+                "n_relevant_topics": n_relevant_topics_list[0] if n_relevant_topics_list else 0,
+                "relevant_diversity_ratio": relevant_diversity_ratios[0] if relevant_diversity_ratios else None,
             })
 
         summary_df = pd.DataFrame(summary_data)
@@ -2319,11 +3029,16 @@ def aggregate_cross_query_results(
         'topic_query_similarity',
         'max_query_similarity',
         'query_relevant_ratio',
-        'top3_avg_similarity'
+        'top3_avg_similarity',
+        # Relevant topic diversity metrics
+        'relevant_topic_diversity',
+        'relevance_weighted_diversity',
+        'topk_relevant_diversity',
+        'relevant_diversity_ratio'
     ]
 
     # Metrics to report but not aggregate (query-dependent)
-    descriptive_metrics = ['n_topics', 'avg_topic_size']
+    descriptive_metrics = ['n_topics', 'avg_topic_size', 'n_relevant_topics']
 
     per_method_aggregates = []
 
@@ -2519,14 +3234,33 @@ def _generate_aggregate_visualizations(
     logger.info("Creating pairwise difference heatmaps...")
 
     pairwise_heatmap_metrics = [
+        # Difference metrics (asymmetric - negate for lower triangle)
         ('npmi_coherence_diff_mean', 'Avg NPMI Coherence Difference', 'RdYlGn'),
         ('embedding_coherence_diff_mean', 'Avg Embedding Coherence Difference', 'RdYlGn'),
         ('diversity_semantic_diff_mean', 'Avg Semantic Diversity Difference', 'RdYlGn'),
         ('topic_query_similarity_diff_mean', 'Avg Topic-Query Similarity Difference', 'RdYlGn'),
-        ('f1_@05_mean', 'Avg F1 Score @ 0.5 Threshold', 'YlGnBu'),
+        # Similarity/overlap metrics (symmetric - mirror directly)
         ('topic_word_overlap_mean_mean', 'Avg Topic Word Overlap', 'YlOrRd'),
-        ('topic_semantic_similarity_mean_mean', 'Avg Topic Semantic Similarity', 'YlOrRd')
+        ('topic_semantic_similarity_mean_mean', 'Avg Topic Semantic Similarity', 'YlOrRd'),
+        # Precision metrics (% of B's topics matched) - use reverse row for lower triangle
+        ('precision_b_@05_mean', 'Topic Match Rate (% of B\'s topics matched) @ 0.5', 'YlGnBu'),
+        ('precision_b_@06_mean', 'Topic Match Rate (% of B\'s topics matched) @ 0.6', 'YlGnBu'),
+        ('precision_b_@07_mean', 'Topic Match Rate (% of B\'s topics matched) @ 0.7', 'YlGnBu'),
+        # Recall metrics (% of A's topics matched) - use reverse row for lower triangle
+        ('recall_a_@05_mean', 'Topic Match Rate (% of A\'s topics matched) @ 0.5', 'YlGnBu'),
+        ('recall_a_@06_mean', 'Topic Match Rate (% of A\'s topics matched) @ 0.6', 'YlGnBu'),
+        ('recall_a_@07_mean', 'Topic Match Rate (% of A\'s topics matched) @ 0.7', 'YlGnBu'),
+        # F1 metrics (harmonic mean - symmetric)
+        ('f1_@05_mean', 'Topic Match F1 @ 0.5', 'YlGnBu'),
+        ('f1_@06_mean', 'Topic Match F1 @ 0.6', 'YlGnBu'),
+        ('f1_@07_mean', 'Topic Match F1 @ 0.7', 'YlGnBu'),
     ]
+
+    # Build a lookup dict for quick access to pairwise rows: (method_a, method_b) -> row
+    pairwise_lookup = {}
+    for _, row in pairwise_agg.iterrows():
+        key = (row['method_a'], row['method_b'])
+        pairwise_lookup[key] = row
 
     for metric, title, cmap in pairwise_heatmap_metrics:
         if metric in pairwise_agg.columns:
@@ -2537,29 +3271,61 @@ def _generate_aggregate_visualizations(
 
             method_to_idx = {m: i for i, m in enumerate(methods)}
 
+            # Determine metric type for proper handling
+            is_diff_metric = 'diff' in metric
+            is_precision_metric = 'precision_b' in metric
+            is_recall_metric = 'recall_a' in metric
+            is_f1_metric = 'f1_@' in metric
+            is_symmetric = not is_diff_metric and not is_precision_metric and not is_recall_metric
+
+            # Fill the matrix
             for _, row in pairwise_agg.iterrows():
                 i = method_to_idx[row['method_a']]
                 j = method_to_idx[row['method_b']]
                 value = row[metric]
                 if pd.notna(value):
                     pivot_data[i, j] = value
-                    # For symmetric metrics, mirror the value
-                    if 'diff' not in metric:
-                        pivot_data[j, i] = value
-                    else:
+
+                    # Handle lower triangle based on metric type
+                    if is_diff_metric:
+                        # Difference metrics: negate for reverse direction
                         pivot_data[j, i] = -value
+                    elif is_symmetric or is_f1_metric:
+                        # Symmetric metrics (overlap, similarity, F1): mirror directly
+                        pivot_data[j, i] = value
+                    elif is_precision_metric:
+                        # For precision_b(A,B), the reverse precision_b(B,A) = recall_a(A,B)
+                        # So lower triangle [j,i] gets recall_a from the same row
+                        complementary_metric = metric.replace('precision_b', 'recall_a')
+                        if complementary_metric in row:
+                            complementary_value = row[complementary_metric]
+                            if pd.notna(complementary_value):
+                                pivot_data[j, i] = complementary_value
+                    elif is_recall_metric:
+                        # For recall_a(A,B), the reverse recall_a(B,A) = precision_b(A,B)
+                        # So lower triangle [j,i] gets precision_b from the same row
+                        complementary_metric = metric.replace('recall_a', 'precision_b')
+                        if complementary_metric in row:
+                            complementary_value = row[complementary_metric]
+                            if pd.notna(complementary_value):
+                                pivot_data[j, i] = complementary_value
+
+            # Set diagonal to 1.0 for non-diff metrics (self-comparison is perfect)
+            if not is_diff_metric:
+                for i in range(len(methods)):
+                    pivot_data[i, i] = 1.0
 
             # Create heatmap
             fig, ax = plt.subplots(figsize=(10, 8))
 
-            # Determine color scale center
-            if 'diff' in metric:
+            # Determine color scale
+            if is_diff_metric:
                 vmax = np.nanmax(np.abs(pivot_data))
                 vmin = -vmax
                 center = 0
             else:
-                vmin = np.nanmin(pivot_data)
-                vmax = np.nanmax(pivot_data)
+                vmin = 0.0  # These metrics range from 0 to 1
+                vmax = 1.0
                 center = None
 
             sns.heatmap(
@@ -2577,6 +3343,8 @@ def _generate_aggregate_visualizations(
             )
 
             ax.set_title(f'{title}\n(Averaged Across Queries)', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Method B', fontsize=11)
+            ax.set_ylabel('Method A', fontsize=11)
 
             plt.tight_layout()
 
@@ -2585,7 +3353,7 @@ def _generate_aggregate_visualizations(
             plt.savefig(os.path.join(plots_dir, f"pairwise_{safe_metric}_heatmap.png"), dpi=300, bbox_inches='tight')
             plt.close()
 
-    logger.info(f"Saved all aggregate visualizations to {plots_dir}")
+    logger.info(f"Saved all aggregate pairwise heatmaps to {plots_dir}")
 
     # Create cross-query intrinsic metric visualizations (consolidates visualize_intrinsic_metrics.py)
     logger.info("\nCreating cross-query intrinsic metric visualizations...")
@@ -2594,6 +3362,15 @@ def _generate_aggregate_visualizations(
     # Create aggregate scatter plots for relevancy vs diversity trade-off
     logger.info("\nCreating aggregate scatter plots...")
     plot_aggregate_scatter_plots(all_per_method, plots_dir)
+
+    # Create standalone aggregate bar charts for key metrics
+    logger.info("\nCreating standalone aggregate bar charts...")
+    plot_aggregate_bar_charts(all_per_method, plots_dir)
+
+    # Run statistical significance tests
+    logger.info("\nRunning statistical significance tests...")
+    stats_dir = os.path.join(output_dir, "statistical_tests")
+    run_aggregate_statistical_analysis(all_per_method, stats_dir)
 
     # Return aggregated data
     return {
@@ -2930,15 +3707,202 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
     logger.info("✓ All aggregate scatter plots created successfully")
 
 
+def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
+    """
+    Create standalone aggregate bar charts for key metrics.
+
+    Generates 6 plots (3 metrics × 2 error types):
+    - Topic Specificity (std and 95% CI versions)
+    - Average Topic-Query Similarity (std and 95% CI versions)
+    - Semantic Diversity (std and 95% CI versions)
+
+    Args:
+        all_per_method: DataFrame with all per-method data across queries
+        plots_dir: Directory to save plots
+    """
+    logger.info("Generating standalone aggregate bar charts...")
+
+    # Compute aggregated statistics per method
+    methods = sorted(all_per_method['method'].unique())
+    n_methods = len(methods)
+
+    # Define metrics to plot
+    metrics_config = [
+        {
+            'column': 'topic_specificity',
+            'title': 'Topic Specificity (IDF-based)',
+            'ylabel': 'Specificity (higher = more specific terms)',
+            'filename': 'aggregate_topic_specificity'
+        },
+        {
+            'column': 'topic_query_similarity',
+            'title': 'Average Topic-Query Similarity',
+            'ylabel': 'Similarity (0-1)',
+            'filename': 'aggregate_topic_query_similarity'
+        },
+        {
+            'column': 'diversity_semantic',
+            'title': 'Semantic Diversity',
+            'ylabel': 'Diversity (higher = more distinct topics)',
+            'filename': 'aggregate_semantic_diversity'
+        },
+        {
+            'column': 'relevant_topic_diversity',
+            'title': 'Relevant Topic Diversity',
+            'ylabel': 'Diversity among query-relevant topics (similarity ≥ 0.5)',
+            'filename': 'aggregate_relevant_topic_diversity'
+        },
+        {
+            'column': 'n_relevant_topics',
+            'title': 'Number of Relevant Topics',
+            'ylabel': 'Count of topics with query similarity ≥ 0.5',
+            'filename': 'aggregate_n_relevant_topics'
+        }
+    ]
+
+    # Color palette
+    colors_list = sns.color_palette("tab10", n_methods)
+    method_colors = {method: colors_list[i] for i, method in enumerate(methods)}
+
+    for metric_info in metrics_config:
+        column = metric_info['column']
+        title_base = metric_info['title']
+        ylabel = metric_info['ylabel']
+        filename_base = metric_info['filename']
+
+        if column not in all_per_method.columns:
+            logger.warning(f"Column '{column}' not found in data, skipping...")
+            continue
+
+        # Compute statistics per method
+        stats = all_per_method.groupby('method')[column].agg(['mean', 'std', 'count']).reset_index()
+        stats.columns = ['method', 'mean', 'std', 'count']
+
+        # Calculate 95% CI (using SEM-based approach)
+        stats['sem'] = stats['std'] / np.sqrt(stats['count'])
+        stats['ci_95'] = 1.96 * stats['sem']
+
+        # Sort by method name for consistency
+        stats = stats.sort_values('method').reset_index(drop=True)
+
+        # ===== Plot 1: Bar chart with ±1 Std Error Bars =====
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        x_pos = np.arange(len(stats))
+        bars = ax.bar(
+            x_pos,
+            stats['mean'],
+            yerr=stats['std'],
+            color=[method_colors[m] for m in stats['method']],
+            capsize=6,
+            alpha=0.8,
+            edgecolor='black',
+            linewidth=1.5,
+            error_kw={'elinewidth': 2, 'capthick': 2}
+        )
+
+        # Add value labels on top of bars
+        for i, (bar, mean_val, std_val) in enumerate(zip(bars, stats['mean'], stats['std'])):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + std_val + 0.01,
+                f'{mean_val:.3f}',
+                ha='center', va='bottom',
+                fontsize=11, fontweight='bold'
+            )
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(stats['method'], fontsize=11)
+        ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 1 Std)', fontsize=14, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3)
+
+        # Set y-axis to start from 0 if all values are positive
+        if stats['mean'].min() >= 0:
+            ax.set_ylim(bottom=0)
+
+        plt.tight_layout()
+        plot_path = os.path.join(plots_dir, f'{filename_base}.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved {plot_path}")
+
+        # ===== Plot 2: Bar chart with 95% CI Error Bars =====
+        fig, ax = plt.subplots(figsize=(12, 7))
+
+        bars = ax.bar(
+            x_pos,
+            stats['mean'],
+            yerr=stats['ci_95'],
+            color=[method_colors[m] for m in stats['method']],
+            capsize=6,
+            alpha=0.8,
+            edgecolor='black',
+            linewidth=1.5,
+            error_kw={'elinewidth': 2, 'capthick': 2}
+        )
+
+        # Add value labels on top of bars
+        for i, (bar, mean_val, ci_val) in enumerate(zip(bars, stats['mean'], stats['ci_95'])):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + ci_val + 0.01,
+                f'{mean_val:.3f}',
+                ha='center', va='bottom',
+                fontsize=11, fontweight='bold'
+            )
+
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(stats['method'], fontsize=11)
+        ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 95% CI)', fontsize=14, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3)
+
+        # Set y-axis to start from 0 if all values are positive
+        if stats['mean'].min() >= 0:
+            ax.set_ylim(bottom=0)
+
+        plt.tight_layout()
+        plot_path = os.path.join(plots_dir, f'{filename_base}_95ci.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved {plot_path}")
+
+    logger.info("✓ All standalone aggregate bar charts created successfully")
+
+
 def main():
     """Main function"""
 
+    # ===== DATASET SELECTION =====
+    # Options: "trec-covid", "doctor-reviews"
+    DATASET_NAME = "trec-covid"
+
+    # ===== DATASET-SPECIFIC CONFIGURATION =====
+    DATASET_CONFIGS = {
+        "trec-covid": {
+            "query_ids": ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"],
+            "keyword_cache_path": "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json",
+        },
+        "doctor-reviews": {
+            "query_ids": ["1", "2", "3", "4", "5", "6"],
+            "keyword_cache_path": "/home/srangre1/cache/keywords/doctor_reviews_keybert.json",
+        }
+    }
+
+    # Get config for selected dataset
+    dataset_config = DATASET_CONFIGS[DATASET_NAME]
+
     # ===== CONFIGURATION PARAMETERS =====
 
-    # Query configuration - can be a single query ID or a list of query IDs
-    QUERY_IDS = ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"]  # Full set of 15 queries - EVALUATION ONLY
-    # QUERY_IDS = ["10", "24"]  # TopicGPT queries (regenerate topics and evaluation)
-    # QUERY_IDS = ["43"]  # SINGLE TEST QUERY - TopicGPT evaluation-only mode
+    # Query configuration - use dataset-specific query IDs or override here
+    QUERY_IDS = dataset_config["query_ids"]  # All queries for selected dataset
+    # QUERY_IDS = [dataset_config["query_ids"][0]]  # Single test query
+
+    # Keyword cache path for query expansion (dataset-specific)
+    KEYWORD_CACHE_PATH = dataset_config["keyword_cache_path"]
 
     # Sample size (fixed at 1000 documents for all methods)
     SAMPLE_SIZE = 1000
@@ -2947,16 +3911,27 @@ def main():
     EMBEDDING_MODEL = "all-mpnet-base-v2"
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-    # Dataset configuration
-    DATASET_NAME = "trec-covid"
-
     # Topic modeling configuration
-    TOPIC_MODEL_TYPE = "bertopic"  # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_TYPE = "topicgpt"  # Options: "bertopic", "lda", "topicgpt"
 
-    # BERTopic parameters - ACTIVE CONFIGURATION (EVALUATION-ONLY MODE)
-    # Using cached BERTopic models, only regenerating evaluation metrics
-    # BERTopic uses sensible defaults, so empty dict is appropriate
-    TOPIC_MODEL_PARAMS = {}
+    # TopicGPT parameters - ACTIVE CONFIGURATION
+    # Requires OPENAI_API_KEY environment variable
+    TOPIC_MODEL_PARAMS = {
+        # Model selection (use gpt-4o-mini for cost efficiency)
+        "generation_model": "gpt-4o-mini",    # Model for topic generation
+        "assignment_model": "gpt-4o-mini",    # Model for topic assignment
+
+        # Sampling for topic generation (use subset of documents)
+        "generation_sample_size": 500,        # Use 500 docs for topic discovery (out of 1000 sampled)
+
+        # Vocabulary params (match BERTopic/LDA for fair comparison)
+        "min_df": 2,
+        "ngram_range": (1, 2),
+        "max_features": 10000,
+
+        # Output
+        "verbose": True
+    }
 
     # BERTopic parameters (currently commented out)
     # TOPIC_MODEL_PARAMS = {}
@@ -3072,8 +4047,13 @@ def main():
     OUTPUT_DIR = "results"
     CACHE_DIR = "cache"
 
-    # Device configuration
-    DEVICE = "cpu"  # Use "cpu" to avoid CUDA errors, "cuda" if GPU is compatible
+    # Device configuration - Auto-detect GPU with CPU fallback
+    import torch
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Selected device: {DEVICE}")
+    if DEVICE == "cuda":
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
     # Topic model saving configuration
     # Set to True to save full BERTopic models (420 MB each, only needed for interactive exploration)
@@ -3091,24 +4071,39 @@ def main():
     # This regenerates metrics/plots in ~2-5 min per query (vs. ~8-12 min full pipeline).
     # Useful for: (1) Fixing visualization bugs, (2) Adding new aggregate scatter plots
     #
-    # CURRENT MODE: EVALUATION-ONLY for all 15 BERTopic queries
-    FORCE_REGENERATE_SAMPLES = False      # Use cached samples (shared with LDA/TopicGPT)
-    FORCE_REGENERATE_TOPICS = False       # Use cached BERTopic models (already generated)
-    FORCE_REGENERATE_EVALUATION = True    # REGENERATE evaluation (to create new aggregate scatter plots)
+    # CURRENT MODE: Evaluation-only (recompute metrics from cached topic models)
+    FORCE_REGENERATE_SAMPLES = False      # Use cached samples
+    FORCE_REGENERATE_TOPICS = False       # Use cached topic models
+    FORCE_REGENERATE_EVALUATION = False   # Use cached metrics, just regenerate plots
 
     # Random seed
     RANDOM_SEED = 42
 
+    # ===== INITIALIZE TIMING TRACKER =====
+    import time
+    from datetime import datetime
+    pipeline_start_time = time.time()
+
+    # Create timing filename with dataset, model, and timestamp
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timing_filename = f"timing_{DATASET_NAME}_{TOPIC_MODEL_TYPE}_{timestamp_str}.jsonl"
+    timing_file_path = os.path.join(OUTPUT_DIR, DATASET_NAME, TOPIC_MODEL_TYPE, timing_filename)
+    os.makedirs(os.path.dirname(timing_file_path), exist_ok=True)
+    timing = TimingTracker(timing_file_path)
+    logger.info(f"Timing will be written to: {timing_file_path}")
+
     # ===== LOAD DATASETS =====
 
-    logger.info("Loading datasets...")
-    from datasets import load_dataset
+    timing.start("dataset_loading", dataset=DATASET_NAME)
+    logger.info(f"Loading dataset: {DATASET_NAME}...")
+    from dataset_loaders import load_dataset as load_project_dataset
 
-    corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
-    queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
-    qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
+    corpus_dataset, queries_dataset, qrels_dataset = load_project_dataset(DATASET_NAME)
 
-    logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {len(qrels_dataset)} qrels")
+    # Log dataset info
+    qrels_count = len(qrels_dataset) if qrels_dataset is not None else 0
+    logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries, {qrels_count} qrels")
+    timing.stop("dataset_loading", n_documents=len(corpus_dataset), n_queries=len(queries_dataset))
 
     # ===== HANDLE SINGLE QUERY VS MULTIPLE QUERIES =====
 
@@ -3121,11 +4116,16 @@ def main():
     # ===== RUN EVALUATION FOR EACH QUERY =====
 
     all_results = {}
+    first_query = True  # Track if this is the first query (index initialization happens here)
 
     for query_id in query_ids_to_run:
         logger.info("\n" + "="*80)
         logger.info(f"PROCESSING QUERY {query_id} ({query_ids_to_run.index(query_id) + 1}/{len(query_ids_to_run)})")
         logger.info("="*80 + "\n")
+
+        # Time index initialization only for first query (indices are reused)
+        if first_query:
+            timing.start("index_initialization", dataset=DATASET_NAME)
 
         evaluator = EndToEndEvaluator(
             corpus_dataset=corpus_dataset,
@@ -3145,11 +4145,27 @@ def main():
             save_topic_models=SAVE_TOPIC_MODELS,
             force_regenerate_samples=FORCE_REGENERATE_SAMPLES,
             force_regenerate_topics=FORCE_REGENERATE_TOPICS,
-            force_regenerate_evaluation=FORCE_REGENERATE_EVALUATION
+            force_regenerate_evaluation=FORCE_REGENERATE_EVALUATION,
+            keyword_cache_path=KEYWORD_CACHE_PATH
         )
 
+        if first_query:
+            timing.stop("index_initialization", embedding_model=EMBEDDING_MODEL)
+            first_query = False
+
+        # Time the full evaluation for this query
+        timing.start("query_evaluation", query_id=query_id)
         results = evaluator.run_full_evaluation()
+        timing.stop("query_evaluation", query_id=query_id)
+
         all_results[query_id] = results
+
+        # Monitor GPU memory usage if using CUDA
+        if DEVICE == "cuda":
+            allocated = torch.cuda.memory_allocated(0) / 1e9
+            reserved = torch.cuda.memory_reserved(0) / 1e9
+            logger.info(f"GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+            torch.cuda.empty_cache()  # Clear unused cached memory
 
     # ===== FINAL SUMMARY =====
 
@@ -3168,11 +4184,13 @@ def main():
         logger.info("AGGREGATING RESULTS ACROSS ALL QUERIES")
         logger.info("="*80 + "\n")
 
+        timing.start("aggregation", n_queries=len(query_ids_to_run))
         results_base_dir = os.path.join(OUTPUT_DIR, DATASET_NAME, TOPIC_MODEL_TYPE)
         aggregate_results = aggregate_cross_query_results(
             results_base_dir=results_base_dir,
             query_ids=query_ids_to_run
         )
+        timing.stop("aggregation")
 
         if aggregate_results:
             logger.info("\n" + "="*80)
@@ -3182,6 +4200,16 @@ def main():
             logger.info("="*80 + "\n")
     else:
         logger.info("\nSkipping cross-query aggregation (only 1 query processed)")
+
+    # Record total pipeline time
+    total_duration = time.time() - pipeline_start_time
+    timing.record("total_pipeline", total_duration,
+                  dataset=DATASET_NAME,
+                  topic_model=TOPIC_MODEL_TYPE,
+                  n_queries=len(query_ids_to_run))
+
+    logger.info(f"\nTotal pipeline time: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
+    logger.info(f"Timing data saved to: {timing_file_path}")
 
     return all_results
 

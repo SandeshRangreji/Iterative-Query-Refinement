@@ -209,10 +209,16 @@ class SearchEvaluationUtils:
         # Convert results to a serializable format
         serializable_results = []
         for result in results:
+            # Handle method field - could be string, enum, or missing
+            method_value = result["config"].get("method")
+            if method_value is not None:
+                if not isinstance(method_value, str):
+                    method_value = method_value.value
+
             serializable_result = {
                 "config": {
                     "name": result["config"]["name"],
-                    "method": result["config"]["method"] if isinstance(result["config"]["method"], str) else result["config"]["method"].value,
+                    "method": method_value,
                     "use_mmr": result["config"]["use_mmr"],
                     "use_cross_encoder": result["config"]["use_cross_encoder"]
                 },
@@ -222,18 +228,18 @@ class SearchEvaluationUtils:
             }
             
             # Add hybrid strategy if present
-            if "hybrid_strategy" in result["config"]:
+            if "hybrid_strategy" in result["config"] and result["config"]["hybrid_strategy"] is not None:
                 serializable_result["config"]["hybrid_strategy"] = (
-                    result["config"]["hybrid_strategy"] 
-                    if isinstance(result["config"]["hybrid_strategy"], str) 
+                    result["config"]["hybrid_strategy"]
+                    if isinstance(result["config"]["hybrid_strategy"], str)
                     else result["config"]["hybrid_strategy"].value
                 )
                 
             # Add other optional parameters if present
-            for param in ["mmr_lambda", "hybrid_weight"]:
+            for param in ["mmr_lambda", "hybrid_weight", "expansion_method", "combination_strategy"]:
                 if param in result["config"]:
                     serializable_result["config"][param] = result["config"][param]
-                
+
             serializable_results.append(serializable_result)
         
         # Create directory if it doesn't exist

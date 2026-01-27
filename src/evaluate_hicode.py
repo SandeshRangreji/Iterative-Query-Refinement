@@ -509,7 +509,7 @@ def run_hicode_evaluation(
     embedding_model: str = "all-mpnet-base-v2",
     cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     dataset_name: str = "trec-covid",
-    device: str = "cpu",
+    device: str = None,
     random_seed: int = 42
 ):
     """
@@ -539,6 +539,21 @@ def run_hicode_evaluation(
     logger.info("="*80)
     logger.info(f"HICODE EVALUATION - QUERY {query_id}")
     logger.info("="*80)
+
+    # Auto-detect device if not specified
+    if device is None:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+            logger.info(f"Auto-detected CUDA device: {torch.cuda.get_device_name(0)}")
+        elif torch.backends.mps.is_available():
+            device = "mps"
+            logger.info("Auto-detected MPS (Apple Silicon) device")
+        else:
+            device = "cpu"
+            logger.info("No GPU available, using CPU")
+    else:
+        logger.info(f"Using specified device: {device}")
 
     # Define sampling methods
     methods = [
@@ -754,8 +769,8 @@ def main():
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     DATASET_NAME = "trec-covid"
 
-    # Device configuration
-    DEVICE = "cpu"  # Use "cuda" if GPU available
+    # Device configuration (None = auto-detect)
+    DEVICE = None  # Auto-detect: cuda > mps > cpu
 
     # Random seed
     RANDOM_SEED = 42
