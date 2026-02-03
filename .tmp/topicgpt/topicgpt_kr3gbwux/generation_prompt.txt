@@ -1,0 +1,38 @@
+You will receive a document and a set of top-level topics from a topic hierarchy. Your task is to identify generalizable topics within the document that can act as top-level topics in the hierarchy. If any relevant topics are missing from the provided set, please add them. Otherwise, output the existing top-level topics as identified in the document.
+
+[Top-level topics]
+{Topics}
+
+[Examples]
+Example 1: Adding "[1] Infectious Disease Research"
+Document:
+A study investigating the transmission dynamics of SARS-CoV-2 in healthcare settings, examining viral load correlations with disease severity and outcomes in hospitalized COVID-19 patients.
+
+Your response:
+[1] Infectious Disease Research: Studies on pathogen transmission, disease mechanisms, and clinical outcomes.
+
+Example 2: Duplicate "[1] Public Health Interventions", returning the existing topic
+Document:
+Analysis of social distancing measures' effectiveness in reducing COVID-19 transmission rates across different population densities and demographic groups.
+
+Your response:
+[1] Public Health Interventions: Measures and policies implemented to control disease spread.
+
+[Instructions]
+Step 1: Determine topics mentioned in the document.
+- The topic labels must be as GENERALIZABLE as possible. They must not be document-specific.
+- The topics must reflect a SINGLE topic instead of a combination of topics.
+- The new topics must have a level number, a short general label, and a topic description.
+- The topics must be broad enough to accommodate future subtopics.
+Step 2: Perform ONE of the following operations:
+1. If there are already duplicates or relevant topics in the hierarchy, output those topics and stop here.
+2. If the document contains no topic, return "None".
+3. Otherwise, add your topic as a top-level topic. Stop here and output the added topic(s). DO NOT add any additional levels.
+
+[Document]
+{Document}
+
+Please ONLY return the relevant or modified topics at the top level in the hierarchy. Your response should be in the following format:
+[Topic Level] Topic Label: Topic Description
+
+Your response:

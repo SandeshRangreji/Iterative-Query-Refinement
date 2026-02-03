@@ -344,10 +344,171 @@ def visualize_all_results(
     
     return output_paths
 
+def create_comprehensive_comparison_plot(
+    results: List[Dict[str, Any]],
+    relevance_level: str = "highly_relevant",
+    top_k_p: int = 20,
+    top_k_r: int = 1000,
+    output_dir: str = "plots",
+    filename: str = "comprehensive_comparison_highly_relevant.png"
+) -> str:
+    """
+    Create comprehensive comparison plot (Option A) with 3 subplots for P, R, F1
+    All methods shown in each subplot for specified relevance level
+
+    Args:
+        results: List of result dictionaries from evaluation
+        relevance_level: Which relevance level to use
+        top_k_p: k value used for precision
+        top_k_r: k value used for recall
+        output_dir: Directory to save the plot
+        filename: Filename for the saved plot
+
+    Returns:
+        Path to the saved plot
+    """
+    create_output_dir(output_dir)
+
+    # Extract data
+    method_names = [result["config"]["name"] for result in results]
+    precisions = [result["avg_precisions"][relevance_level] for result in results]
+    recalls = [result["avg_recalls"][relevance_level] for result in results]
+    f1_scores = [2 * (p * r) / (p + r) if (p + r) > 0 else 0 for p, r in zip(precisions, recalls)]
+
+    # Create figure with 3 subplots side-by-side
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+
+    # Subplot 1: Precision
+    axes[0].barh(method_names, precisions, color='skyblue')
+    axes[0].set_xlabel(f'Precision@{top_k_p}', fontsize=12)
+    axes[0].set_title(f'Precision@{top_k_p}\n({relevance_level.replace("_", " ").title()} Relevance)', fontsize=13, fontweight='bold')
+    axes[0].set_xlim(0, max(precisions) * 1.15)
+    for i, v in enumerate(precisions):
+        axes[0].text(v + 0.005, i, f'{v:.3f}', va='center', fontsize=10)
+
+    # Subplot 2: Recall
+    axes[1].barh(method_names, recalls, color='salmon')
+    axes[1].set_xlabel(f'Recall@{top_k_r}', fontsize=12)
+    axes[1].set_title(f'Recall@{top_k_r}\n({relevance_level.replace("_", " ").title()} Relevance)', fontsize=13, fontweight='bold')
+    axes[1].set_xlim(0, max(recalls) * 1.15)
+    axes[1].set_yticklabels([])  # Hide y-labels on middle plot
+    for i, v in enumerate(recalls):
+        axes[1].text(v + 0.005, i, f'{v:.3f}', va='center', fontsize=10)
+
+    # Subplot 3: F1 Score
+    axes[2].barh(method_names, f1_scores, color='mediumseagreen')
+    axes[2].set_xlabel('F1 Score', fontsize=12)
+    axes[2].set_title(f'F1 Score\n({relevance_level.replace("_", " ").title()} Relevance)', fontsize=13, fontweight='bold')
+    axes[2].set_xlim(0, max(f1_scores) * 1.15)
+    axes[2].set_yticklabels([])  # Hide y-labels on right plot
+    for i, v in enumerate(f1_scores):
+        axes[2].text(v + 0.005, i, f'{v:.3f}', va='center', fontsize=10)
+
+    plt.tight_layout()
+
+    # Save plot
+    output_path = os.path.join(output_dir, filename)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    logger.info(f"Saved comprehensive comparison plot to {output_path}")
+
+    plt.close()
+    return output_path
+
+
+def create_detailed_grid_plot(
+    results: List[Dict[str, Any]],
+    top_k_p: int = 20,
+    top_k_r: int = 1000,
+    output_dir: str = "plots",
+    filename: str = "detailed_grid_comparison.png"
+) -> str:
+    """
+    Create detailed grid plot (Option C) with 3x3 grid: metrics × relevance levels
+    Rows: Precision@20, Recall@1000, F1
+    Columns: Relevant, Highly Relevant, Overall
+
+    Args:
+        results: List of result dictionaries from evaluation
+        top_k_p: k value used for precision
+        top_k_r: k value used for recall
+        output_dir: Directory to save the plot
+        filename: Filename for the saved plot
+
+    Returns:
+        Path to the saved plot
+    """
+    create_output_dir(output_dir)
+
+    # Extract data
+    method_names = [result["config"]["name"] for result in results]
+    relevance_levels = ["relevant", "highly_relevant", "overall"]
+
+    # Create 3x3 grid
+    fig, axes = plt.subplots(3, 3, figsize=(22, 16))
+
+    metrics_info = [
+        ("Precision", top_k_p, 'skyblue'),
+        ("Recall", top_k_r, 'salmon'),
+        ("F1", None, 'mediumseagreen')
+    ]
+
+    for row_idx, (metric_name, k_val, color) in enumerate(metrics_info):
+        for col_idx, rel_level in enumerate(relevance_levels):
+            ax = axes[row_idx, col_idx]
+
+            # Extract values for this metric and relevance level
+            if metric_name == "Precision":
+                values = [result["avg_precisions"][rel_level] for result in results]
+                ylabel = f'Precision@{k_val}'
+            elif metric_name == "Recall":
+                values = [result["avg_recalls"][rel_level] for result in results]
+                ylabel = f'Recall@{k_val}'
+            else:  # F1
+                precisions = [result["avg_precisions"][rel_level] for result in results]
+                recalls = [result["avg_recalls"][rel_level] for result in results]
+                values = [2 * (p * r) / (p + r) if (p + r) > 0 else 0 for p, r in zip(precisions, recalls)]
+                ylabel = 'F1 Score'
+
+            # Plot horizontal bar chart
+            ax.barh(method_names, values, color=color)
+
+            # Set title (column headers on top row)
+            if row_idx == 0:
+                ax.set_title(rel_level.replace("_", " ").title(), fontsize=14, fontweight='bold')
+
+            # Set y-label (row labels on left column)
+            if col_idx == 0:
+                ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
+
+            # Set x-limits and add value labels
+            ax.set_xlim(0, max(values) * 1.18)
+            for i, v in enumerate(values):
+                ax.text(v + 0.003, i, f'{v:.3f}', va='center', fontsize=9)
+
+            # Hide y-tick labels except for first column
+            if col_idx != 0:
+                ax.set_yticklabels([])
+
+            # Grid for readability
+            ax.grid(axis='x', alpha=0.3, linestyle='--')
+
+    plt.suptitle('Comprehensive Search Method Evaluation - Detailed Grid',
+                 fontsize=16, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+
+    # Save plot
+    output_path = os.path.join(output_dir, filename)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    logger.info(f"Saved detailed grid plot to {output_path}")
+
+    plt.close()
+    return output_path
+
+
 def main():
     """Example usage of visualization functions"""
     import json
-    
+
     # Load example results from a file (if available)
     try:
         with open("evaluation_results.json", "r") as f:
@@ -417,10 +578,10 @@ def main():
                 }
             }
         ]
-    
+
     # Generate all visualizations
     output_paths = visualize_all_results(results)
-    
+
     # Log outputs
     logger.info(f"Generated {len(output_paths)} visualization plots:")
     for path in output_paths:

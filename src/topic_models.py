@@ -457,10 +457,29 @@ class TopicModelWrapper:
 
         import tempfile
         import json
+        import shutil
         import pandas as pd
 
+        # Use project-local temp directory instead of system /tmp
+        # (/tmp on compute nodes may have limited space or be cleaned mid-job)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        local_tmp_base = os.path.join(project_root, ".tmp", "topicgpt")
+        os.makedirs(local_tmp_base, exist_ok=True)
+
+        # Pre-flight check: verify temp directory is writable and log disk space
+        disk_usage = shutil.disk_usage(local_tmp_base)
+        logger.info(f"  Temp base: {local_tmp_base} "
+                     f"(free: {disk_usage.free / (1024**3):.1f} GB)")
+        if disk_usage.free < 1 * 1024**3:  # Warn if less than 1 GB free
+            logger.warning(f"  Low disk space on temp directory: "
+                           f"{disk_usage.free / (1024**3):.1f} GB free")
+
+        # Ensure data/output/ exists (topicgpt_python library writes backup
+        # files to hardcoded "data/output/" relative to the working directory)
+        os.makedirs("data/output", exist_ok=True)
+
         # Create temp directory for TopicGPT files
-        temp_dir = tempfile.mkdtemp(prefix="topicgpt_")
+        temp_dir = tempfile.mkdtemp(prefix="topicgpt_", dir=local_tmp_base)
         logger.info(f"  Temp directory: {temp_dir}")
 
         try:
@@ -726,7 +745,6 @@ Your response:"""
 
         finally:
             # Clean up temp directory
-            import shutil
             try:
                 shutil.rmtree(temp_dir)
                 logger.info(f"  Cleaned up temp directory")

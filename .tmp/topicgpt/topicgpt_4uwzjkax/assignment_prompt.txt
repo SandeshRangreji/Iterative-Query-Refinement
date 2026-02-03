@@ -1,0 +1,32 @@
+You will receive a document and a topic hierarchy. Assign the document to the most relevant topics the hierarchy. Then, output the topic labels, assignment reasoning and supporting quotes from the document. DO NOT make up new topics or quotes.
+
+[Topic Hierarchy]
+{tree}
+
+[Examples]
+Example 1: Assign "[1] Infectious Disease Research" to the document
+Document:
+A study investigating the transmission dynamics of SARS-CoV-2 in healthcare settings, examining viral load correlations with disease severity and outcomes in hospitalized COVID-19 patients.
+
+Assignment:
+[1] Infectious Disease Research: Examines pathogen transmission and clinical outcomes ("...examining viral load correlations with disease severity...")
+
+Example 2: Assigned "[1] Public Health Interventions" to the document
+Document:
+Analysis of social distancing measures' effectiveness in reducing COVID-19 transmission rates across different population densities and demographic groups.
+
+Assignment:
+[1] Public Health Interventions: Evaluates disease control measures ("...social distancing measures' effectiveness in reducing COVID-19 transmission...")
+
+[Instructions]
+1. Topic labels must be present in the provided topic hierarchy. You MUST NOT make up new topics.
+2. The quote must be taken from the document. You MUST NOT make up quotes.
+
+[Document]
+{Document}
+
+Double check that your assignment exists in the hierarchy!
+Your response should be in the following format:
+[Topic Level] Topic Label: Assignment reasoning (Supporting quote)
+
+Your response:

@@ -2635,7 +2635,9 @@ class EndToEndEvaluator:
             try:
                 topic_results[method_name] = self.run_topic_modeling(sample)
             except Exception as e:
+                import traceback
                 logger.error(f"Error in topic modeling for {method_name}: {e}")
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
                 topic_results[method_name] = None
 
         # Remove failed methods
@@ -3878,7 +3880,7 @@ def main():
 
     # ===== DATASET SELECTION =====
     # Options: "trec-covid", "doctor-reviews"
-    DATASET_NAME = "trec-covid"
+    DATASET_NAME = "doctor-reviews"
 
     # ===== DATASET-SPECIFIC CONFIGURATION =====
     DATASET_CONFIGS = {

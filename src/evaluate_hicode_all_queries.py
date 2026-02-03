@@ -141,16 +141,13 @@ def run_all_queries(
             failed_queries.append((query_id, "HiCode directory not found"))
             continue
 
-        if not os.path.exists(samples_dir):
-            logger.error(f"Samples directory not found: {samples_dir}")
-            failed_queries.append((query_id, "Samples directory not found"))
-            continue
+        # Note: samples_dir check removed - samples are now derived from HiCode results
+        # This solves the doc_id mismatch issue when HiCode was run on different samples
 
         try:
             results = run_hicode_evaluation(
                 query_id=query_id,
                 hicode_dir=hicode_dir,
-                samples_dir=samples_dir,
                 output_dir=output_dir,
                 sample_size=sample_size,
                 embedding_model=embedding_model,
