@@ -92,6 +92,11 @@ def _load_doctor_reviews():
         {"_id": "4", "text": "How do doctors manage patients with asthma?"},
         {"_id": "5", "text": "What do patients like about their doctors?"},
         {"_id": "6", "text": "What do patients dislike about their doctors?"},
+        {"_id": "7", "text": "What follow-up care or testing do doctors recommend for people with asthma?"},
+        {"_id": "8", "text": "What do patients like about treatment or management recommendations?"},
+        {"_id": "9", "text": "What do patients dislike about treatment or management recommendations?"},
+        {"_id": "10", "text": "What lifestyle challenges do patients with asthma report?"},
+        {"_id": "11", "text": "What symptoms do patients with asthma report?"},
     ]
 
     # Convert to HuggingFace Dataset for compatibility with existing code

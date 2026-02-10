@@ -40,7 +40,11 @@ These measure topic characteristics independent of other methods.
 
 **Range:** -1 to 1
 **Computation:** Normalized Pointwise Mutual Information of word pairs within each topic, averaged across all topics
+- Word-based models: Uses top words from topic distributions
+- LLM models: Uses TF-IDF words from document clusters (measures **document** vocabulary coherence)
 **Measures:** Semantic coherence of topic words based on document co-occurrence
+
+**Note for LLM models:** Measures whether documents in the cluster use coherent vocabulary, not whether the topic concept itself is coherent. See "Word-Level Metrics for LLM Models" section.
 
 **Interpretation:**
 - Higher values indicate topic words frequently co-occur in documents (coherent)
@@ -60,7 +64,11 @@ These measure topic characteristics independent of other methods.
 
 **Range:** 0 to 1
 **Computation:** Average pairwise cosine similarity of word embeddings within each topic
+- Word-based models: Uses top words from topic distributions
+- LLM models: Uses TF-IDF words from document clusters (measures **document** vocabulary tightness)
 **Measures:** Semantic tightness of topic words in embedding space
+
+**Note for LLM models:** Measures semantic tightness of document vocabulary, not topic concept coherence. See "Word-Level Metrics for LLM Models" section.
 
 **Interpretation:**
 - Higher values indicate topic words are semantically related in embedding space
@@ -79,6 +87,9 @@ These measure topic characteristics independent of other methods.
 
 **Range:** 0 to 1
 **Computation:** Average pairwise distance between topic embeddings (1 - cosine similarity)
+- Uses **model-aware representations** (see "Model-Specific Topic Representations" section)
+- Word-based models: Top 5 words concatenated
+- LLM models: Semantic descriptions/labels directly
 **Measures:** Conceptual distinctness between topics
 
 **Interpretation:**
@@ -99,7 +110,11 @@ These measure topic characteristics independent of other methods.
 
 **Range:** 0 to 1
 **Computation:** Unique words / (num_topics × top_k words per topic)
+- Word-based models: Uses top words from topic distributions
+- LLM models: Uses TF-IDF words from document clusters (measures document vocabulary diversity)
 **Measures:** Vocabulary redundancy across topics
+
+**Note for LLM models:** Measures document vocabulary redundancy, not topic label/concept redundancy.
 
 **Interpretation:**
 - Higher values indicate less word repetition across topics
@@ -202,7 +217,11 @@ These measure topic characteristics independent of other methods.
 
 **Range:** 0 to max(IDF) (typically 2-10 for biomedical corpus)
 **Computation:** Average IDF score of topic words (top-10 per topic), averaged across all topics
+- Word-based models: Uses top words from topic distributions
+- LLM models: Uses TF-IDF words from document clusters (measures **document** vocabulary specificity)
 **Measures:** How specific/technical vs. generic/common the topic words are
+
+**Note for LLM models:** Measures specificity of document vocabulary, not specificity of topic concepts. See "Word-Level Metrics for LLM Models" section.
 
 **Interpretation:**
 - Higher values indicate more specific, technical, domain-specific terms (rare in corpus)
@@ -226,7 +245,10 @@ These measure how well discovered topics align with the query.
 ### 10. Topic-Query Similarity (Average)
 
 **Range:** 0 to 1
-**Computation:** Average cosine similarity between query embedding and each topic embedding (topic = concatenated top-10 words)
+**Computation:** Average cosine similarity between query embedding and each topic embedding
+- Uses **model-aware representations** (see "Model-Specific Topic Representations" section)
+- Word-based models: Top 10 words concatenated
+- LLM models: Semantic descriptions/labels directly
 **Measures:** Overall query alignment across all topics
 
 **Interpretation:**
@@ -247,6 +269,7 @@ These measure how well discovered topics align with the query.
 
 **Range:** 0 to 1
 **Computation:** Highest cosine similarity between query and any single topic
+- Uses **model-aware representations** (same as Topic-Query Similarity)
 **Measures:** Peak query alignment
 
 **Interpretation:**
@@ -266,6 +289,7 @@ These measure how well discovered topics align with the query.
 
 **Range:** 0 to 1
 **Computation:** Fraction of topics with similarity ≥ 0.5 threshold
+- Uses **model-aware representations** (same as Topic-Query Similarity)
 **Measures:** Proportion of query-relevant topics
 
 **Interpretation:**
@@ -310,6 +334,7 @@ These metrics address a key insight: **overall diversity can be inflated by "noi
 
 **Range:** 0 to 1
 **Computation:** Average pairwise distance (1 - cosine similarity) between topic embeddings, computed only on topics with query similarity ≥ 0.5
+- Uses **model-aware representations** (see "Model-Specific Topic Representations" section)
 **Measures:** Semantic diversity among query-relevant topics only
 
 **Interpretation:**
@@ -421,9 +446,94 @@ These metrics address a key insight: **overall diversity can be inflated by "noi
 
 ---
 
+## Model-Specific Topic Representations
+
+Different topic models represent topics in fundamentally different ways. To ensure valid semantic comparisons, we use **model-appropriate representations** when computing pairwise metrics.
+
+### Word-Based Models (BERTopic, LDA)
+
+**Topic Definition:** Topics are defined by word probability distributions
+- **BERTopic:** c-TF-IDF scores determine top words for each topic
+- **LDA:** Word probability distributions from Dirichlet allocation
+
+**Representation for Matching:** Top 10 words concatenated as a string
+- Example: `"domestic violence abuse partner intimate household family assault women protection"`
+
+**Rationale:** For these models, words ARE the topic definition. Comparing word distributions directly compares what the model learned.
+
+### LLM-Based Models (TopicGPT, HiCODE)
+
+**Topic Definition:** Topics are semantic concepts with natural language labels/descriptions
+- **TopicGPT:** LLM generates full descriptions (e.g., "Mental Health and Pandemic Impact: The effects of pandemics on psychological well-being and communication")
+- **HiCODE:** LLM generates hierarchical semantic labels (e.g., "domestic and gender-based violence")
+
+**Representation for Matching:** Direct use of semantic description/label
+- TopicGPT Example: `"Mental Health and Pandemic Impact: The effects of pandemics on psychological well-being and communication"`
+- HiCODE Example: `"domestic and gender-based violence"`
+
+**Rationale:** For LLM models, the semantic concept IS the topic definition. The model's understanding is captured in the natural language description, not in derived word lists. Using TF-IDF words extracted from assigned documents would measure document similarity, not topic similarity.
+
+### Methodological Implications
+
+**Within-Model Consistency:** All comparisons within a single topic model use the same representation method
+- BERTopic experiment: All methods (Random, BM25, Query Expansion, etc.) use top 10 words
+- HiCODE experiment: All methods use semantic labels
+- TopicGPT experiment: All methods use topic descriptions
+
+**Cross-Model Comparisons:** Not recommended
+- Different representations produce different numerical ranges
+- E.g., "domestic violence" (4 chars) vs "domestic violence abuse partner..." (50+ chars)
+- Embedding characteristics differ (short phrase vs long text)
+
+**Metrics Affected:**
+- **Topic Semantic Similarity:** Uses appropriate representation (primary metric)
+- **Topic Word Overlap:** Only applicable to word-based models (reported as 0.0 for LLM models)
+- **Precision/Recall/F1 @ thresholds:** Uses semantic similarity from appropriate representation
+
+**Validity:** Using model-native representations increases construct validity - we measure what each model actually produces rather than forcing all models into a word-distribution framework designed for BERTopic/LDA.
+
+### Word-Level Metrics for LLM Models
+
+Some metrics are inherently **word-level corpus statistics** (NPMI coherence, embedding coherence, lexical diversity, topic specificity). For LLM-based models, these metrics measure different properties than for word-based models:
+
+**For Word-Based Models (BERTopic, LDA):**
+- Use top words from topic distributions (c-TF-IDF scores, probability distributions)
+- These words ARE the topic definition
+- Metrics measure properties of the **topic itself**
+
+**For LLM-Based Models (TopicGPT, HiCODE):**
+- Topics are semantic concepts, not word distributions
+- Use TF-IDF words extracted from documents assigned to each topic
+- Metrics measure properties of the **document collection**, not the topic concept
+- This is a fundamentally different measurement
+
+**Affected Metrics:**
+1. **NPMI Coherence:** For LLM models, measures if documents in the cluster use coherent vocabulary (not if the topic concept is coherent)
+2. **Embedding Coherence:** For LLM models, measures semantic tightness of document vocabulary (not concept coherence)
+3. **Lexical Diversity:** For LLM models, measures vocabulary redundancy across document clusters (not across topic labels)
+4. **Topic Specificity (IDF):** For LLM models, measures specificity of document vocabulary (not concept specificity)
+
+**HiCODE-Specific:** For hierarchical word lists, we use the **first hierarchical level** (most specific/fine-grained) as it best represents the document cluster's core vocabulary.
+
+**Interpretation:**
+- These metrics remain useful for LLM models but answer different questions
+- Document-level coherence and specificity provide insights into cluster quality
+- Should not be directly compared across model types (different constructs)
+- Within a single LLM-based topic model, comparisons across methods remain valid
+
+**Example:**
+- **Topic concept (HiCODE):** "domestic and gender-based violence"
+- **Document words (TF-IDF):** ["domestic", "violence", "assault", "abuse", "intimate", "partner", "household", "family", "women", "protection"]
+- **NPMI coherence** measures: Do these document words co-occur frequently? (High = documents are coherent)
+- **Does NOT measure:** Is the concept "domestic and gender-based violence" coherent? (That's inherently clear from the semantic label)
+
+---
+
 ## Pairwise Comparison Metrics (Between Methods)
 
 These compare two methods to quantify differences and similarities.
+
+**Note:** Pairwise metrics use model-appropriate topic representations (see above). Within each experiment using a single topic model, all comparisons are consistent and directly comparable.
 
 ### 19. Topic Word Overlap (Jaccard)
 
@@ -431,17 +541,22 @@ These compare two methods to quantify differences and similarities.
 **Computation:** Jaccard similarity of top-10 words for Hungarian-matched topic pairs
 **Measures:** Lexical overlap between matched topics
 
-**Interpretation:**
+**Applicability:** **Word-based models only** (BERTopic, LDA)
+- For LLM-based models (TopicGPT, HiCODE), reported as 0.0
+- Reason: LLM models use semantic descriptions/labels, not word lists
+- Word overlap is not meaningful for comparing phrases like "domestic and gender-based violence" vs "intimate partner violence"
+
+**Interpretation (for word-based models):**
 - Higher values indicate methods use similar vocabulary for topics
 - Lower values indicate methods use different words (may still be semantically similar)
 - Sensitive to synonym differences (use Topic Semantic Similarity for robustness)
 
-**Method comparisons:**
+**Method comparisons (for word-based models):**
 - High overlap = methods discover similar topics lexically
 - Low overlap + high semantic similarity = synonymous topics
 - Low overlap + low semantic similarity = different topics entirely
 
-**Related metrics:** Topic Semantic Similarity (robust to synonyms)
+**Related metrics:** Topic Semantic Similarity (robust to synonyms and applicable to all model types)
 
 ---
 
@@ -449,11 +564,14 @@ These compare two methods to quantify differences and similarities.
 
 **Range:** 0 to 1
 **Computation:**
-1. Compute topic embeddings for all topics in both methods (concatenate top-10 words, encode with sentence transformer)
-2. Compute cosine similarity matrix between all topic pairs
-3. **Hungarian algorithm** finds optimal 1-to-1 matching that maximizes total similarity
-4. Report mean similarity of matched pairs
-5. Creates `min(n_topics_A, n_topics_B)` matched pairs
+1. Get model-appropriate topic representations:
+   - **Word-based models:** Concatenate top-10 words
+   - **LLM models:** Use semantic descriptions/labels directly
+2. Encode representations using sentence transformer (all-mpnet-base-v2)
+3. Compute cosine similarity matrix between all topic pairs
+4. **Hungarian algorithm** finds optimal 1-to-1 matching that maximizes total similarity
+5. Report mean similarity of matched pairs
+6. Creates `min(n_topics_A, n_topics_B)` matched pairs
 
 **Measures:** Semantic similarity between optimally-matched topics
 
@@ -462,11 +580,13 @@ These compare two methods to quantify differences and similarities.
 - More robust than word overlap (captures synonyms and paraphrases)
 - Used for thresholding in F1/Precision/Recall metrics
 - **Hungarian matching ensures fairness**: Each topic matched to its best counterpart (1-to-1 constraint)
+- **Model-aware representation ensures validity**: Compares what each model actually outputs
 
 **Method comparisons:**
 - High similarity = methods produce similar topic structures
 - Low similarity = methods produce different topic structures
 - Compare retrieval methods to each other (stability) vs. random (difference)
+- **Within-model only**: Only compare methods using the same topic model (e.g., all HiCODE or all BERTopic)
 
 **Important constraint:**
 - **1-to-1 matching only**: If method A has 50 topics and method B has 30, only 30 pairs are created
@@ -560,7 +680,157 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
-### 30. NPMI Coherence Difference
+### 30-32. Relevant Coverage A→B @ Thresholds (0.5, 0.6, 0.7)
+
+**Range:** 0 to 1
+**Computation:**
+1. Filter topics by query-relevance: topics with query-topic similarity ≥ 0.5
+2. Match only query-relevant topics using Hungarian algorithm
+3. Count matched pairs with topic-topic similarity ≥ threshold (0.5, 0.6, or 0.7)
+4. `relevant_coverage_a_to_b = matched_count / n_relevant_topics_B`
+
+**Measures:** What fraction of method B's **query-relevant** topics are covered by method A's **query-relevant** topics
+
+**Key difference from precision_b:**
+- **Precision_B**: Matches ALL topics (including off-topic/generic topics)
+- **Relevant Coverage**: Matches ONLY query-relevant topics (similarity to query ≥ 0.5)
+
+**Interpretation:**
+- Higher values indicate A's relevant topics cover most of B's relevant topic space
+- Lower values indicate B discovers many relevant topics not covered by A (complementarity)
+- **Asymmetric**: `relevant_coverage_a_to_b(A,B) ≠ relevant_coverage_b_to_a(A,B)`
+
+**Use cases:**
+- **Coverage analysis**: "What % of Keyword Search's relevant topics are covered by Direct Retrieval's relevant topics?"
+- **Complementarity**: Low coverage = methods discover different query-relevant aspects
+- **Redundancy**: High coverage = methods discover similar query-relevant topics
+
+**Example:**
+- Direct Retrieval: 5 relevant topics (out of 8 total)
+- Keyword Search: 5 relevant topics (out of 59 total)
+- Matched relevant topics @0.7: 1
+- `relevant_coverage_a_to_b = 1/5 = 0.20` (20% of KS's relevant topics covered by DR)
+- `relevant_coverage_b_to_a = 1/5 = 0.20` (20% of DR's relevant topics covered by KS)
+- → 80% complementarity: each method discovers unique relevant topics!
+
+**Mathematical relationship:**
+- `relevant_coverage_a_to_b(A, B) = relevant_coverage_b_to_a(B, A)` (complementary perspectives)
+
+**Related metrics:**
+- Unique Relevant Topics A/B @ thresholds (count of non-overlapping relevant topics)
+- Shared Relevant Topics @ thresholds (count of overlapping relevant topics)
+- Relevant Coverage B→A @ thresholds (reverse direction)
+
+---
+
+### 33-35. Unique Relevant Topics A @ Thresholds (0.5, 0.6, 0.7)
+
+**Range:** 0 to n_relevant_topics_A
+**Computation:**
+1. Filter topics by query-relevance (query-topic similarity ≥ 0.5)
+2. Match only relevant topics using Hungarian algorithm
+3. Count relevant topics in A with NO match in B at the threshold
+4. `unique_relevant_a = count(A_relevant topics with max_similarity_to_B < threshold)`
+
+**Measures:** How many of method A's query-relevant topics are NOT covered by method B's query-relevant topics
+
+**Interpretation:**
+- Higher values indicate A discovers many unique relevant aspects
+- Lower values indicate most of A's relevant topics are also in B
+- **Complementarity indicator**: High unique counts = methods discover different things
+
+**Use cases:**
+- **Unique contribution**: "Direct Retrieval discovers 3 unique relevant topics not in Keyword Search"
+- **Method diversity**: Comparing unique counts across method pairs
+- **Ensemble potential**: High unique counts suggest combining methods would increase coverage
+
+**Example:**
+- Direct Retrieval: 5 relevant topics @0.7
+  - 3 topics have NO match in Keyword Search (similarity < 0.7)
+  - `unique_relevant_a = 3`
+  - Unique topics: "Victimization", "Social Compliance", "Public Health Interventions (youth violence)"
+
+**Related metrics:**
+- Unique Relevant Topics B (symmetric metric for method B)
+- Shared Relevant Topics (topics covered by both methods)
+- Unique Relevant Ratio A (fraction of A's relevant topics that are unique)
+
+---
+
+### 36-38. Shared Relevant Topics @ Thresholds (0.5, 0.6, 0.7)
+
+**Range:** 0 to min(n_relevant_topics_A, n_relevant_topics_B)
+**Computation:**
+1. Filter topics by query-relevance (query-topic similarity ≥ 0.5)
+2. Match only relevant topics using Hungarian algorithm
+3. Count matched pairs with similarity ≥ threshold
+4. `shared_relevant = matched_count`
+
+**Measures:** How many query-relevant topics appear in BOTH methods (matched at threshold)
+
+**Interpretation:**
+- Higher values indicate significant overlap in what methods discover
+- Lower values indicate methods discover mostly different things (complementary)
+- **Redundancy indicator**: High shared counts = methods are redundant
+
+**Use cases:**
+- **Core topics**: "2 topics appear in both Direct Retrieval and Keyword Search"
+- **Stability**: Topics consistently discovered across methods
+- **Ensemble efficiency**: Low shared counts suggest combining methods adds unique value
+
+**Example:**
+- Direct Retrieval vs Keyword Search @0.7:
+  - Shared: 2 topics ("Crime and Public Safety", "Criminal Justice Policy")
+  - These are core topics discovered by both methods
+  - Unique to DR: 3 topics (violence-specific)
+  - Unique to KS: 3 topics (mental health, race, environment)
+
+**Visualization:**
+```
+DR (5 relevant)  KS (5 relevant)
+[3 unique] + [2 shared] + [3 unique]
+   60%         40%          60%
+```
+
+**Related metrics:**
+- Unique Relevant Topics A/B (non-overlapping topics)
+- Relevant Coverage metrics (same numerator, different denominators)
+
+---
+
+### 39-41. Unique Relevant Ratio A @ Thresholds (0.5, 0.6, 0.7)
+
+**Range:** 0 to 1
+**Computation:** `unique_relevant_ratio_a = unique_relevant_a / n_relevant_topics_A`
+
+**Measures:** Fraction of method A's query-relevant topics that are unique (not covered by B)
+
+**Interpretation:**
+- 1.0 = All of A's relevant topics are unique (complete complementarity)
+- 0.0 = None of A's relevant topics are unique (complete coverage by B)
+- 0.6 = 60% of A's relevant topics are unique (high complementarity)
+
+**Use cases:**
+- **Complementarity score**: Quantify how much unique value each method provides
+- **Ensemble selection**: High ratios indicate method should be included in ensemble
+- **Method comparison**: Compare uniqueness across different method pairs
+
+**Example:**
+- Direct Retrieval: 5 relevant topics, 3 unique @0.7
+  - `unique_relevant_ratio_a = 3/5 = 0.60`
+  - 60% of DR's relevant topics are unique contributions
+- Keyword Search: 5 relevant topics, 3 unique @0.7
+  - `unique_relevant_ratio_b = 3/5 = 0.60`
+  - 60% of KS's relevant topics are unique contributions
+- **High complementarity**: Both methods contribute substantial unique value!
+
+**Related metrics:**
+- Unique Relevant Ratio B (symmetric metric for method B)
+- Complementarity Score: average of unique_ratio_a and unique_ratio_b
+
+---
+
+### 42. NPMI Coherence Difference
 
 **Range:** -1 to 1
 **Computation:** NPMI_A - NPMI_B
@@ -776,6 +1046,85 @@ These compare two methods to quantify differences and similarities.
 
 ---
 
+### 18-20. Relevant Coverage Heatmaps (NEW - 2026-02)
+
+**Type:** Method × Method heatmap at thresholds 0.5, 0.6, 0.7
+**Files:** `pairwise_relevant-coverage-a-to-b--at-05_heatmap.png`, etc.
+
+**How to Read:**
+- **Row = Method A, Column = Method B**
+- **Value = fraction of B's query-relevant topics covered by A's query-relevant topics**
+- Read as: "A covers X% of B's relevant topics"
+
+**Example:**
+- Row: `direct_retrieval`, Col: `sbert`, Value: `0.470`
+- Interpretation: direct_retrieval covers 47% of sbert's relevant topics
+
+**Key Difference from Precision Heatmap:**
+- **Precision_B**: Matches ALL topics (including off-topic/generic topics)
+- **Relevant Coverage**: Matches ONLY query-relevant topics (similarity to query ≥ 0.5)
+
+**Usage:**
+- Identify complementary methods (low coverage = discover different relevant topics)
+- Identify redundant methods (high coverage = discover same relevant topics)
+- Compare across thresholds to see matching strictness sensitivity
+
+---
+
+### 21. Relevant vs All Coverage Comparison (NEW - 2026-02)
+
+**Type:** Scatter plot
+**File:** `aggregate_relevant_vs_all_coverage_comparison.png`
+
+**Axes:**
+- **X-axis:** All Topics Coverage (precision_b @0.7)
+- **Y-axis:** Relevant Topics Only Coverage (relevant_coverage_a_to_b @0.7)
+
+**Interpretation:**
+- **Diagonal line:** Equal coverage for all vs relevant topics
+- **Points ABOVE diagonal:** Relevant topics are more focused (A covers B's relevant topics better than overall)
+- **Points BELOW diagonal:** Relevant topics are more distinctive (coverage drops when filtering to relevant only)
+
+**Key Insight:**
+- Most points fall BELOW the diagonal
+- This means query-relevant topics are MORE distinctive between methods than general topics
+- Methods share generic topics but discover DIFFERENT relevant topics
+
+---
+
+### 22. Unique/Shared Relevant Topics Distribution (NEW - 2026-02)
+
+**Type:** Stacked bar chart
+**File:** `aggregate_unique_shared_distribution.png`
+
+**Shows:** For each method pair, the breakdown of:
+- **Unique to A:** Relevant topics only in method A
+- **Shared:** Relevant topics in both methods
+- **Unique to B:** Relevant topics only in method B
+
+**Usage:**
+- Visualize complementarity at a glance
+- Tall "unique" bars = high complementarity (methods discover different things)
+- Tall "shared" bars = high redundancy (methods discover same things)
+
+---
+
+### 23. Cross-Query Coverage Analysis (NEW - 2026-02)
+
+**Type:** Multi-panel plot showing coverage metrics across all queries
+**File:** `cross_query_coverage_analysis.png`
+
+**Shows:**
+- Per-query breakdown of relevant coverage metrics
+- Variance in coverage across different queries
+- Query-specific complementarity patterns
+
+**Usage:**
+- Identify queries where methods are more/less complementary
+- Understand query-dependent effects on topic discovery
+
+---
+
 ## Trade-off Analysis Framework
 
 ### Expected Trade-offs
@@ -856,6 +1205,14 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for detailed plans on:
 - ✅ **Top-K Relevant Diversity** - Now metric #16 (diversity among top-K most relevant topics)
 - ✅ **Number of Relevant Topics** - Now metric #17 (count of topics above relevance threshold)
 - ✅ **Relevant Diversity Ratio** - Now metric #18 (key metric for detecting "fake diversity" from noise)
+
+**Recently Implemented (2026-02):**
+- ✅ **Relevant Coverage A→B @ Thresholds** - Now metrics #30-32 (pairwise: fraction of B's relevant topics covered by A)
+- ✅ **Relevant Coverage B→A @ Thresholds** - Symmetric metric (fraction of A's relevant topics covered by B)
+- ✅ **Unique Relevant Topics A/B @ Thresholds** - Now metrics #33-35 (count of unique relevant topics per method)
+- ✅ **Shared Relevant Topics @ Thresholds** - Now metrics #36-38 (count of relevant topics in both methods)
+- ✅ **Unique Relevant Ratio A/B @ Thresholds** - Now metrics #39-41 (fraction of relevant topics that are unique)
+- ✅ **New Visualizations** - Relevant coverage heatmaps, unique/shared distribution plots, coverage comparison scatter
 
 ---
 

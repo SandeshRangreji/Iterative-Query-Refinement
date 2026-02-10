@@ -97,6 +97,115 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
 
+# ============================================================================
+# Sampling Method Configuration
+# ============================================================================
+
+# Display names for plots (abbreviated for readability in publication figures)
+METHOD_DISPLAY_NAMES = {
+    'random_uniform': 'Random',
+    'keyword_search': 'BM25',
+    'sbert': 'SBERT',
+    'direct_retrieval': 'Hybrid',
+    'direct_retrieval_mmr': 'Hybrid+MMR',
+    'query_expansion': 'Query Exp',
+    'retrieval_random': 'Retr-Random'
+}
+
+# Canonical ordering (from simple to complex sampling strategies)
+METHOD_ORDER = [
+    'random_uniform',       # 1. Pure random baseline
+    'keyword_search',       # 2. Lexical only (BM25)
+    'sbert',               # 3. Semantic only (SBERT)
+    'direct_retrieval',    # 4. Hybrid (BM25 + SBERT)
+    'direct_retrieval_mmr', # 5. Hybrid + diversity reranking
+    'query_expansion',     # 6. Keyword extraction + weighted fusion
+    'retrieval_random'     # 7. Hybrid pool + random selection
+]
+
+# Color palette for consistent visualization (method type-based)
+METHOD_COLORS = {
+    'random_uniform': '#808080',      # Gray - baseline
+    'keyword_search': '#4472C4',      # Blue - lexical
+    'sbert': '#70AD47',               # Green - semantic
+    'direct_retrieval': '#ED7D31',    # Orange - hybrid
+    'direct_retrieval_mmr': '#C55A11', # Dark orange - hybrid + diversity
+    'query_expansion': '#7030A0',     # Purple - advanced
+    'retrieval_random': '#A5682A'     # Brown - pool sampling
+}
+
+# Font sizes for publication-quality figures
+FONT_SIZES = {
+    'figure_title': 20,      # Main plot title
+    'subplot_title': 16,     # Individual subplot titles
+    'axis_label': 15,        # X/Y axis labels
+    'tick_label': 13,        # Axis tick labels
+    'legend': 13,            # Legend text
+    'annotation': 12,        # Heatmap cell annotations
+    'suptitle': 22          # Figure suptitle
+}
+
+
+# ============================================================================
+# Helper Functions for Consistent Plotting
+# ============================================================================
+
+def _get_display_name(method: str) -> str:
+    """
+    Get abbreviated display name for a sampling method.
+
+    Args:
+        method: Internal method name (e.g., 'random_uniform')
+
+    Returns:
+        Display name for plots (e.g., 'Random')
+    """
+    return METHOD_DISPLAY_NAMES.get(method, method)
+
+
+def _sort_methods_canonical(methods: List[str]) -> List[str]:
+    """
+    Sort methods in canonical order (simple to complex).
+
+    Args:
+        methods: List of method names (internal names)
+
+    Returns:
+        Sorted list following METHOD_ORDER
+    """
+    order_dict = {m: i for i, m in enumerate(METHOD_ORDER)}
+    # Methods not in METHOD_ORDER appear at the end
+    return sorted(methods, key=lambda x: order_dict.get(x, 999))
+
+
+def _apply_font_sizes(ax, element_types: List[str] = None):
+    """
+    Apply consistent font sizes to matplotlib axes.
+
+    Args:
+        ax: Matplotlib axis object
+        element_types: List of elements to update. If None, updates all.
+                      Options: ['title', 'xlabel', 'ylabel', 'tick', 'legend']
+    """
+    if element_types is None:
+        element_types = ['title', 'xlabel', 'ylabel', 'tick', 'legend']
+
+    if 'title' in element_types and ax.get_title():
+        ax.title.set_fontsize(FONT_SIZES['subplot_title'])
+
+    if 'xlabel' in element_types:
+        ax.xaxis.label.set_fontsize(FONT_SIZES['axis_label'])
+
+    if 'ylabel' in element_types:
+        ax.yaxis.label.set_fontsize(FONT_SIZES['axis_label'])
+
+    if 'tick' in element_types:
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+
+    if 'legend' in element_types and ax.get_legend():
+        ax.get_legend().set_fontsize(FONT_SIZES['legend'])
+
+
 class TimingTracker:
     """
     Track timing for pipeline steps and write to JSONL file.
@@ -332,7 +441,7 @@ def run_pairwise_statistical_tests(
         - effect_size: Interpretation of Cohen's d
         - significant: Whether difference is significant after correction
     """
-    methods = sorted(data[method_col].unique())
+    methods = _sort_methods_canonical(list(data[method_col].unique()))
     results = []
 
     for i, method_a in enumerate(methods):
@@ -408,7 +517,9 @@ def plot_statistical_heatmaps(
         logger.warning(f"No statistical results to plot for {metric_name}")
         return
 
-    methods = sorted(set(stats_df['method_a'].tolist() + stats_df['method_b'].tolist()))
+    # Sort methods in canonical order and get display names
+    methods = _sort_methods_canonical(list(set(stats_df['method_a'].tolist() + stats_df['method_b'].tolist())))
+    display_names = [_get_display_name(m) for m in methods]
     n_methods = len(methods)
     method_to_idx = {m: i for i, m in enumerate(methods)}
 
@@ -438,7 +549,7 @@ def plot_statistical_heatmaps(
     np.fill_diagonal(d_matrix, np.nan)
 
     # ===== Plot 1: P-value Heatmap =====
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(12, 10))
 
     # Use log scale for p-values for better visualization
     p_display = p_matrix.copy()
@@ -473,16 +584,18 @@ def plot_statistical_heatmaps(
         vmin=0,
         vmax=0.1,
         mask=mask,
-        xticklabels=methods,
-        yticklabels=methods,
+        xticklabels=display_names,
+        yticklabels=display_names,
         ax=ax,
-        cbar_kws={'label': 'Adjusted p-value'}
+        cbar_kws={'label': 'Adjusted p-value'},
+        annot_kws={'fontsize': FONT_SIZES['annotation']}
     )
 
     ax.set_title(f'{metric_name}\nPairwise Significance (Paired t-test, BH-corrected)\n* p<0.05, ** p<0.01, *** p<0.001',
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Method', fontsize=11)
-    ax.set_ylabel('Method', fontsize=11)
+                 fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+    ax.set_ylabel('Method', fontsize=FONT_SIZES['axis_label'])
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{filename_prefix}_pvalues.png"), dpi=300, bbox_inches='tight')
@@ -490,7 +603,7 @@ def plot_statistical_heatmaps(
     logger.info(f"✓ Saved {filename_prefix}_pvalues.png")
 
     # ===== Plot 2: Cohen's d Heatmap =====
-    fig, ax = plt.subplots(figsize=(10, 8))
+    fig, ax = plt.subplots(figsize=(12, 10))
 
     # Create annotation with effect size labels
     annot_d = np.empty((n_methods, n_methods), dtype=object)
@@ -517,16 +630,18 @@ def plot_statistical_heatmaps(
         vmax=vmax,
         center=0,
         mask=mask,
-        xticklabels=methods,
-        yticklabels=methods,
+        xticklabels=display_names,
+        yticklabels=display_names,
         ax=ax,
-        cbar_kws={'label': "Cohen's d (row - column)"}
+        cbar_kws={'label': "Cohen's d (row - column)"},
+        annot_kws={'fontsize': FONT_SIZES['annotation']}
     )
 
     ax.set_title(f"{metric_name}\nEffect Size (Cohen's d)\nN=negligible, S=small, M=medium, L=large",
-                 fontsize=12, fontweight='bold')
-    ax.set_xlabel('Method', fontsize=11)
-    ax.set_ylabel('Method', fontsize=11)
+                 fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+    ax.set_ylabel('Method', fontsize=FONT_SIZES['axis_label'])
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{filename_prefix}_cohens_d.png"), dpi=300, bbox_inches='tight')
@@ -1100,6 +1215,36 @@ class EndToEndEvaluator:
 
         return self._load_or_compute_sample("keyword_search", compute, self.force_regenerate_samples)
 
+    def sample_sbert(self) -> Dict[str, Any]:
+        """Method 3: Pure semantic search (SBERT only)"""
+        logger.info(f"Method 3: Pure semantic search - SBERT ({self.sample_size} docs)")
+
+        def compute():
+            # Perform SBERT-only search (pure dense vector retrieval)
+            results = self.search_engine.search(
+                query=self.query_text,
+                top_k=self.sample_size,
+                method=RetrievalMethod.SBERT,
+                use_mmr=False,
+                use_cross_encoder=False
+            )
+
+            doc_ids = [doc_id for doc_id, _ in results]
+            doc_texts = []
+
+            for doc_id in tqdm(doc_ids, desc="Extracting SBERT docs"):
+                doc_text = self.search_engine.get_document_by_id(doc_id)
+                doc_texts.append(doc_text)
+
+            return {
+                "method": "sbert",
+                "doc_ids": doc_ids,
+                "doc_texts": doc_texts,
+                "sample_size": len(doc_ids)
+            }
+
+        return self._load_or_compute_sample("sbert", compute, self.force_regenerate_samples)
+
     def sample_direct_retrieval_mmr(self) -> Dict[str, Any]:
         """Method 5: Direct Retrieval + MMR (High Diversity)
 
@@ -1353,29 +1498,29 @@ class EndToEndEvaluator:
         metrics["topic_count_ratio"] = len(topics_a) / len(topics_b) if len(topics_b) > 0 else 0.0
 
         # Topic diversity comparison (semantic and lexical)
-        diversity_semantic_a = self._compute_topic_diversity_semantic(topics_a)
-        diversity_semantic_b = self._compute_topic_diversity_semantic(topics_b)
+        diversity_semantic_a = self._compute_topic_diversity_semantic(results_a)
+        diversity_semantic_b = self._compute_topic_diversity_semantic(results_b)
         metrics["diversity_semantic_a"] = diversity_semantic_a
         metrics["diversity_semantic_b"] = diversity_semantic_b
         metrics["diversity_semantic_diff"] = diversity_semantic_a - diversity_semantic_b
 
-        diversity_lexical_a = self._compute_topic_diversity_lexical(topics_a)
-        diversity_lexical_b = self._compute_topic_diversity_lexical(topics_b)
+        diversity_lexical_a = self._compute_topic_diversity_lexical(results_a)
+        diversity_lexical_b = self._compute_topic_diversity_lexical(results_b)
         metrics["diversity_lexical_a"] = diversity_lexical_a
         metrics["diversity_lexical_b"] = diversity_lexical_b
         metrics["diversity_lexical_diff"] = diversity_lexical_a - diversity_lexical_b
 
         # Intrinsic quality metrics
         # NPMI Coherence
-        npmi_a = self._compute_npmi_coherence(topics_a, sample_a["doc_texts"])
-        npmi_b = self._compute_npmi_coherence(topics_b, sample_b["doc_texts"])
+        npmi_a = self._compute_npmi_coherence(results_a, sample_a["doc_texts"])
+        npmi_b = self._compute_npmi_coherence(results_b, sample_b["doc_texts"])
         metrics["npmi_coherence_a"] = npmi_a
         metrics["npmi_coherence_b"] = npmi_b
         metrics["npmi_coherence_diff"] = npmi_a - npmi_b
 
         # Embedding Coherence
-        emb_coh_a = self._compute_embedding_coherence(topics_a)
-        emb_coh_b = self._compute_embedding_coherence(topics_b)
+        emb_coh_a = self._compute_embedding_coherence(results_a)
+        emb_coh_b = self._compute_embedding_coherence(results_b)
         metrics["embedding_coherence_a"] = emb_coh_a
         metrics["embedding_coherence_b"] = emb_coh_b
         metrics["embedding_coherence_diff"] = emb_coh_a - emb_coh_b
@@ -1388,8 +1533,8 @@ class EndToEndEvaluator:
         metrics["relevant_concentration_diff"] = relevant_conc_a - relevant_conc_b
 
         # Topic Specificity (IDF-based) (NEW)
-        topic_spec_a = self._compute_topic_specificity(topics_a)
-        topic_spec_b = self._compute_topic_specificity(topics_b)
+        topic_spec_a = self._compute_topic_specificity(results_a)
+        topic_spec_b = self._compute_topic_specificity(results_b)
         metrics["topic_specificity_a"] = topic_spec_a
         metrics["topic_specificity_b"] = topic_spec_b
         metrics["topic_specificity_diff"] = topic_spec_a - topic_spec_b
@@ -1418,8 +1563,8 @@ class EndToEndEvaluator:
         metrics["relevant_diversity_ratio_b"] = rel_div_b["relevant_diversity_ratio"]
         metrics["top3_avg_similarity_b"] = alignment_b["top3_avg_similarity"]
 
-        # Topic matching using Hungarian algorithm
-        word_overlaps, semantic_sims = self._match_topics(topics_a, topics_b)
+        # Topic matching using Hungarian algorithm (model-aware)
+        word_overlaps, semantic_sims = self._match_topics(results_a, results_b)
 
         if word_overlaps and semantic_sims:
             metrics["topic_word_overlap_mean"] = float(np.mean(word_overlaps))
@@ -1453,6 +1598,10 @@ class EndToEndEvaluator:
                 metrics[f"precision_b_@{threshold_str}"] = 0.0
                 metrics[f"recall_a_@{threshold_str}"] = 0.0
                 metrics[f"f1_@{threshold_str}"] = 0.0
+
+        # Relevant topic matching (query-relevant topics only)
+        relevant_matching_metrics = self._match_relevant_topics(results_a, results_b)
+        metrics.update(relevant_matching_metrics)
 
         # Topic-Query similarity for both methods
         metrics["topic_query_similarity_a"] = self._compute_topic_query_similarity(results_a)
@@ -1514,30 +1663,40 @@ class EndToEndEvaluator:
 
         return metrics
 
-    def _compute_topic_diversity_semantic(self, topic_words: Dict[int, List[str]]) -> float:
+    def _compute_topic_diversity_semantic(self, results: Dict[str, Any]) -> float:
         """
         Compute semantic diversity: average pairwise distance between topics in embedding space
 
         Higher values indicate topics are more semantically distinct from each other.
 
+        Uses model-aware representations:
+        - BERTopic/LDA: Top words from topic distribution
+        - TopicGPT: LLM-generated topic descriptions
+        - HiCODE: Semantic topic labels
+
         Args:
-            topic_words: Dictionary mapping topic IDs to lists of words
+            results: Topic modeling results dictionary
 
         Returns:
             Average pairwise semantic distance (0-1, higher = more diverse)
         """
+        topic_words = results.get("topic_words", {})
         if len(topic_words) < 2:
             return 0.0
 
         # Use shared embedding model (loaded once in __init__)
         model = self.metrics_embedding_model
 
-        # Get embeddings for topics
+        # Get embeddings for topics using model-aware representations
         topic_embeddings = []
-        for topic_id, words in topic_words.items():
-            top_words = " ".join(words[:5])
-            embedding = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
-            topic_embeddings.append(embedding)
+        for topic_id in topic_words.keys():
+            topic_text = self._get_topic_representation_text(results, topic_id, top_n=5)
+            if topic_text:
+                embedding = model.encode(topic_text, convert_to_tensor=False, show_progress_bar=False)
+                topic_embeddings.append(embedding)
+
+        if len(topic_embeddings) < 2:
+            return 0.0
 
         topic_embeddings = np.array(topic_embeddings)
 
@@ -1549,60 +1708,226 @@ class EndToEndEvaluator:
 
         return float(np.mean(upper_triangle))
 
-    def _compute_topic_diversity_lexical(self, topic_words: Dict[int, List[str]], top_k: int = 10) -> float:
+    def _compute_topic_diversity_lexical(self, results: Dict[str, Any], top_k: int = 10) -> float:
         """
         Compute lexical diversity: unique word fraction across all topics
 
         Measures vocabulary redundancy. Higher values indicate less word overlap across topics.
 
+        Note: For LLM-based models (TopicGPT, HiCODE), this uses TF-IDF or hierarchical
+        words extracted from documents, measuring document vocabulary diversity rather
+        than topic concept diversity.
+
         Args:
-            topic_words: Dictionary mapping topic IDs to lists of words
+            results: Topic modeling results dictionary
             top_k: Number of top words to consider per topic
 
         Returns:
             Ratio of unique words to total words (0-1, higher = less redundancy)
         """
+        topic_words = results.get("topic_words", {})
         if not topic_words:
             return 0.0
 
         unique_words = set()
         total_words = 0
 
-        for topic_id, words in topic_words.items():
-            unique_words.update(words[:top_k])
-            total_words += min(len(words), top_k)
+        for topic_id in topic_words.keys():
+            words = self._get_topic_words_for_metrics(results, topic_id, top_k=top_k)
+            unique_words.update(words)
+            total_words += len(words)
 
         return len(unique_words) / total_words if total_words > 0 else 0.0
 
+    def _get_topic_representation_text(
+        self,
+        results: Dict[str, Any],
+        topic_id: int,
+        top_n: int = 10
+    ) -> str:
+        """
+        Get appropriate text representation for a topic based on model type.
+
+        For word-based models (BERTopic, LDA):
+            Returns top-N words joined as string
+
+        For LLM-based models (TopicGPT, HiCODE):
+            Returns semantic description/label
+
+        Args:
+            results: Full topic modeling results dictionary
+            topic_id: Topic ID to get representation for
+            top_n: Number of words to use (only for word-based models)
+
+        Returns:
+            String representation suitable for embedding
+        """
+        # Check for TopicGPT (has topic_descriptions)
+        if 'topic_descriptions' in results:
+            descriptions = results['topic_descriptions']
+            if isinstance(descriptions, list) and topic_id < len(descriptions):
+                return descriptions[topic_id]
+            elif isinstance(descriptions, dict) and topic_id in descriptions:
+                return descriptions[topic_id]
+
+        # Check for HiCODE by topic_model_type
+        if results.get('topic_model_type') == 'hicode':
+            topic_words = results.get('topic_words', {})
+            if topic_id in topic_words:
+                phrases = topic_words[topic_id]
+                if isinstance(phrases, list) and len(phrases) > 0:
+                    # Handle old hierarchical format (list of lists) for backward compatibility
+                    if isinstance(phrases[0], list):
+                        topic_names = results.get('topic_names', {})
+                        if topic_id in topic_names:
+                            return topic_names[topic_id]
+                    # Handle new format: list of generation label strings
+                    elif isinstance(phrases[0], str):
+                        # Join first 5 generation labels for rich semantic representation
+                        return " ".join(phrases[:5])
+            # Fallback to topic_names if topic_words not available for this topic
+            topic_names = results.get('topic_names', {})
+            if topic_id in topic_names:
+                return topic_names[topic_id]
+
+        # Legacy check for HiCODE without topic_model_type (old cached results)
+        if 'topic_names' in results:
+            topic_words = results.get('topic_words', {})
+            if topic_id in topic_words:
+                words = topic_words[topic_id]
+                # Check if hierarchical (list of lists) - old HiCODE format
+                if isinstance(words, list) and len(words) > 0 and isinstance(words[0], list):
+                    topic_names = results['topic_names']
+                    if topic_id in topic_names:
+                        return topic_names[topic_id]
+
+        # Default: BERTopic/LDA (flat word list)
+        topic_words = results.get('topic_words', {})
+        if topic_id in topic_words:
+            words = topic_words[topic_id]
+            if isinstance(words, list) and len(words) > 0:
+                # Handle flat list of strings
+                if isinstance(words[0], str):
+                    return " ".join(words[:top_n])
+                # Handle list of tuples (word, score) - sometimes from BERTopic
+                elif isinstance(words[0], tuple) and len(words[0]) >= 1:
+                    return " ".join(str(w[0]) for w in words[:top_n])
+
+        # Fallback: return empty string
+        logger.warning(f"Could not get topic representation for topic_id={topic_id}")
+        return ""
+
+    def _get_topic_words_for_metrics(
+        self,
+        results: Dict[str, Any],
+        topic_id: int,
+        top_k: int = 10
+    ) -> List[str]:
+        """
+        Extract word list for word-level metrics (NPMI, embedding coherence, etc.).
+
+        For word-based models (BERTopic, LDA):
+            Returns top-K words from the topic distribution
+
+        For TopicGPT:
+            Returns TF-IDF words extracted from documents (measures document vocabulary)
+
+        For HiCODE:
+            Returns first hierarchical level words (measures document vocabulary)
+
+        Note: For LLM-based models, this extracts words from DOCUMENTS assigned to topics,
+        not from the topic definitions themselves. These metrics measure properties of
+        document collections, not properties of semantic topic concepts.
+
+        Args:
+            results: Full topic modeling results dictionary
+            topic_id: Topic ID to get words for
+            top_k: Number of words to extract
+
+        Returns:
+            List of words (up to top_k)
+        """
+        topic_words = results.get('topic_words', {})
+        if topic_id not in topic_words:
+            return []
+
+        words = topic_words[topic_id]
+
+        # Handle hierarchical structure (HiCODE)
+        if isinstance(words, list) and len(words) > 0 and isinstance(words[0], list):
+            # Take first hierarchical level (most specific)
+            return words[0][:top_k] if len(words) > 0 else []
+
+        # Handle flat list of strings (BERTopic/LDA/TopicGPT)
+        if isinstance(words, list) and len(words) > 0:
+            if isinstance(words[0], str):
+                return words[:top_k]
+            # Handle tuples (word, score)
+            elif isinstance(words[0], tuple) and len(words[0]) >= 1:
+                return [str(w[0]) for w in words[:top_k]]
+
+        return []
+
     def _match_topics(
         self,
-        topics_a: Dict[int, List[str]],
-        topics_b: Dict[int, List[str]],
+        results_a: Dict[str, Any],
+        results_b: Dict[str, Any],
         top_n: int = 10
     ) -> Tuple[List[float], List[float]]:
-        """Match topics using Hungarian algorithm"""
+        """
+        Match topics using Hungarian algorithm with model-aware representations.
+
+        Args:
+            results_a: Full topic modeling results for method A
+            results_b: Full topic modeling results for method B
+            top_n: Number of words to use (only for word-based models)
+
+        Returns:
+            Tuple of (word_overlaps, semantic_similarities) for matched pairs
+        """
+        # Get topic_words dictionaries to check if topics exist
+        topics_a = results_a.get('topic_words', {})
+        topics_b = results_b.get('topic_words', {})
+
         if not topics_a or not topics_b:
             return [], []
 
         # Use shared embedding model (loaded once in __init__)
         model = self.metrics_embedding_model
 
-        # Get topic IDs
-        topic_ids_a = list(topics_a.keys())
-        topic_ids_b = list(topics_b.keys())
+        # Get topic IDs (exclude outliers)
+        topic_ids_a = [tid for tid in topics_a.keys() if tid != -1]
+        topic_ids_b = [tid for tid in topics_b.keys() if tid != -1]
 
-        # Compute embeddings
+        if not topic_ids_a or not topic_ids_b:
+            return [], []
+
+        # Compute embeddings using model-appropriate representations
         embeddings_a = []
         for topic_id in topic_ids_a:
-            words = " ".join(topics_a[topic_id][:top_n])
-            emb = model.encode(words, convert_to_tensor=False, show_progress_bar=False)
-            embeddings_a.append(emb)
+            text = self._get_topic_representation_text(results_a, topic_id, top_n)
+            # DEBUG: Log first topic to verify representation
+            if topic_id == topic_ids_a[0]:
+                logger.info(f"DEBUG: Topic {topic_id} representation (first 100 chars): '{text[:100]}'")
+            if text:
+                emb = model.encode(text, convert_to_tensor=False, show_progress_bar=False)
+                embeddings_a.append(emb)
+            else:
+                # Fallback to zero vector if representation fails
+                embeddings_a.append(np.zeros(model.get_sentence_embedding_dimension()))
 
         embeddings_b = []
         for topic_id in topic_ids_b:
-            words = " ".join(topics_b[topic_id][:top_n])
-            emb = model.encode(words, convert_to_tensor=False, show_progress_bar=False)
-            embeddings_b.append(emb)
+            text = self._get_topic_representation_text(results_b, topic_id, top_n)
+            # DEBUG: Log first topic to verify representation
+            if topic_id == topic_ids_b[0]:
+                logger.info(f"DEBUG: Topic {topic_id} representation (first 100 chars): '{text[:100]}'")
+            if text:
+                emb = model.encode(text, convert_to_tensor=False, show_progress_bar=False)
+                embeddings_b.append(emb)
+            else:
+                # Fallback to zero vector if representation fails
+                embeddings_b.append(np.zeros(model.get_sentence_embedding_dimension()))
 
         embeddings_a = np.array(embeddings_a)
         embeddings_b = np.array(embeddings_b)
@@ -1617,6 +1942,19 @@ class EndToEndEvaluator:
         semantic_sims = []
         word_overlaps = []
 
+        # Check if we're using LLM-based representations (where word overlap doesn't apply)
+        is_llm_a = 'topic_descriptions' in results_a or (
+            'topic_names' in results_a and
+            any(isinstance(words, list) and len(words) > 0 and isinstance(words[0], list)
+                for words in topics_a.values())
+        )
+        is_llm_b = 'topic_descriptions' in results_b or (
+            'topic_names' in results_b and
+            any(isinstance(words, list) and len(words) > 0 and isinstance(words[0], list)
+                for words in topics_b.values())
+        )
+        use_word_overlap = not (is_llm_a or is_llm_b)
+
         for i, j in zip(row_ind, col_ind):
             topic_id_a = topic_ids_a[i]
             topic_id_b = topic_ids_b[j]
@@ -1624,21 +1962,221 @@ class EndToEndEvaluator:
             # Semantic similarity
             semantic_sims.append(similarity_matrix[i, j])
 
-            # Word overlap (Jaccard)
-            words_a = set(topics_a[topic_id_a][:top_n])
-            words_b = set(topics_b[topic_id_b][:top_n])
+            # Word overlap (Jaccard) - only for word-based models
+            if use_word_overlap:
+                words_a = topics_a[topic_id_a]
+                words_b = topics_b[topic_id_b]
 
-            intersection = len(words_a & words_b)
-            union = len(words_a | words_b)
-            jaccard = intersection / union if union > 0 else 0.0
+                # Extract strings from various formats
+                if isinstance(words_a, list):
+                    if len(words_a) > 0 and isinstance(words_a[0], tuple):
+                        words_a = [str(w[0]) for w in words_a[:top_n]]
+                    else:
+                        words_a = [str(w) for w in words_a[:top_n]]
+
+                if isinstance(words_b, list):
+                    if len(words_b) > 0 and isinstance(words_b[0], tuple):
+                        words_b = [str(w[0]) for w in words_b[:top_n]]
+                    else:
+                        words_b = [str(w) for w in words_b[:top_n]]
+
+                words_a_set = set(words_a)
+                words_b_set = set(words_b)
+
+                intersection = len(words_a_set & words_b_set)
+                union = len(words_a_set | words_b_set)
+                jaccard = intersection / union if union > 0 else 0.0
+            else:
+                # For LLM-based models, word overlap is not applicable
+                jaccard = 0.0
 
             word_overlaps.append(jaccard)
 
         return word_overlaps, semantic_sims
 
+    def _match_relevant_topics(
+        self,
+        results_a: Dict[str, Any],
+        results_b: Dict[str, Any],
+        relevance_threshold: float = 0.5,
+        top_n: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Match only query-relevant topics between two methods using Hungarian algorithm.
+
+        This function filters topics by query-relevance first, then matches only those
+        relevant topics to measure coverage and complementarity between methods.
+
+        Args:
+            results_a: Full topic modeling results for method A
+            results_b: Full topic modeling results for method B
+            relevance_threshold: Query-topic similarity threshold for relevance (default: 0.5)
+            top_n: Number of words to use for word-based models (default: 10)
+
+        Returns:
+            Dictionary containing:
+                - n_relevant_topics_a: Number of relevant topics in A
+                - n_relevant_topics_b: Number of relevant topics in B
+                - relevant_coverage_a_to_b_@XX: % of B's relevant topics covered by A (at thresholds 0.5, 0.6, 0.7)
+                - relevant_coverage_b_to_a_@XX: % of A's relevant topics covered by B (at thresholds 0.5, 0.6, 0.7)
+                - unique_relevant_a_@XX: Count of A's relevant topics not covered by B
+                - unique_relevant_b_@XX: Count of B's relevant topics not covered by A
+                - shared_relevant_@XX: Count of relevant topics appearing in both A and B
+                - unique_relevant_ratio_a_@XX: Fraction of A's relevant topics that are unique
+                - unique_relevant_ratio_b_@XX: Fraction of B's relevant topics that are unique
+        """
+        # Get topic_words dictionaries
+        topics_a = results_a.get('topic_words', {})
+        topics_b = results_b.get('topic_words', {})
+
+        if not topics_a or not topics_b:
+            return self._empty_relevant_matching_metrics()
+
+        # Use shared embedding model
+        model = self.metrics_embedding_model
+
+        # Encode query
+        query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
+
+        # Get all topic IDs (exclude outliers)
+        topic_ids_a = [tid for tid in topics_a.keys() if tid != -1]
+        topic_ids_b = [tid for tid in topics_b.keys() if tid != -1]
+
+        if not topic_ids_a or not topic_ids_b:
+            return self._empty_relevant_matching_metrics()
+
+        # === STEP 1: Compute query-relevance for all topics ===
+
+        # Get embeddings and query-similarities for all topics in A
+        query_sims_a = []
+        embeddings_a_all = []
+        for topic_id in topic_ids_a:
+            text = self._get_topic_representation_text(results_a, topic_id, top_n)
+            if text:
+                emb = model.encode(text, convert_to_tensor=False, show_progress_bar=False)
+                embeddings_a_all.append(emb)
+                # Compute similarity to query
+                query_sim = cosine_similarity([query_embedding], [emb])[0][0]
+                query_sims_a.append(query_sim)
+            else:
+                embeddings_a_all.append(np.zeros(model.get_sentence_embedding_dimension()))
+                query_sims_a.append(0.0)
+
+        # Get embeddings and query-similarities for all topics in B
+        query_sims_b = []
+        embeddings_b_all = []
+        for topic_id in topic_ids_b:
+            text = self._get_topic_representation_text(results_b, topic_id, top_n)
+            if text:
+                emb = model.encode(text, convert_to_tensor=False, show_progress_bar=False)
+                embeddings_b_all.append(emb)
+                # Compute similarity to query
+                query_sim = cosine_similarity([query_embedding], [emb])[0][0]
+                query_sims_b.append(query_sim)
+            else:
+                embeddings_b_all.append(np.zeros(model.get_sentence_embedding_dimension()))
+                query_sims_b.append(0.0)
+
+        # === STEP 2: Filter to only query-relevant topics ===
+
+        relevant_indices_a = [i for i, sim in enumerate(query_sims_a) if sim >= relevance_threshold]
+        relevant_indices_b = [i for i, sim in enumerate(query_sims_b) if sim >= relevance_threshold]
+
+        n_relevant_a = len(relevant_indices_a)
+        n_relevant_b = len(relevant_indices_b)
+
+        # If either method has no relevant topics, return zeros
+        if n_relevant_a == 0 or n_relevant_b == 0:
+            return self._empty_relevant_matching_metrics(n_relevant_a, n_relevant_b)
+
+        # Get embeddings for only relevant topics
+        embeddings_a = np.array([embeddings_a_all[i] for i in relevant_indices_a])
+        embeddings_b = np.array([embeddings_b_all[i] for i in relevant_indices_b])
+
+        # === STEP 3: Match relevant topics using Hungarian algorithm ===
+
+        similarity_matrix = cosine_similarity(embeddings_a, embeddings_b)
+
+        # Hungarian algorithm for optimal 1-to-1 matching
+        row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
+
+        # Get matched similarities
+        matched_sims = [similarity_matrix[i, j] for i, j in zip(row_ind, col_ind)]
+
+        # === STEP 4: Compute coverage and unique/shared metrics at different thresholds ===
+
+        metrics = {
+            'n_relevant_topics_a': n_relevant_a,
+            'n_relevant_topics_b': n_relevant_b
+        }
+
+        for threshold in [0.5, 0.6, 0.7]:
+            threshold_str = str(threshold).replace('.', '')
+
+            # Count matches at this threshold
+            matched_at_threshold = [s >= threshold for s in matched_sims]
+            n_matched = sum(matched_at_threshold)
+
+            # Coverage: what fraction of each method's relevant topics are matched
+            # relevant_coverage_a_to_b = fraction of B's relevant topics covered by A's relevant topics
+            coverage_a_to_b = n_matched / n_relevant_b if n_relevant_b > 0 else 0.0
+            # relevant_coverage_b_to_a = fraction of A's relevant topics covered by B's relevant topics
+            coverage_b_to_a = n_matched / n_relevant_a if n_relevant_a > 0 else 0.0
+
+            # Unique topics: topics that don't have a match at this threshold
+            # For A: how many of A's relevant topics don't match any of B's relevant topics
+            a_matched_mask = np.array([similarity_matrix[i, :].max() >= threshold for i in range(len(embeddings_a))])
+            unique_a = int((~a_matched_mask).sum())
+
+            # For B: how many of B's relevant topics don't match any of A's relevant topics
+            b_matched_mask = np.array([similarity_matrix[:, j].max() >= threshold for j in range(len(embeddings_b))])
+            unique_b = int((~b_matched_mask).sum())
+
+            # Shared: topics that are matched (appear in both)
+            shared = n_matched
+
+            # Unique ratios
+            unique_ratio_a = unique_a / n_relevant_a if n_relevant_a > 0 else 0.0
+            unique_ratio_b = unique_b / n_relevant_b if n_relevant_b > 0 else 0.0
+
+            # Store metrics
+            metrics[f'relevant_coverage_a_to_b_@{threshold_str}'] = float(coverage_a_to_b)
+            metrics[f'relevant_coverage_b_to_a_@{threshold_str}'] = float(coverage_b_to_a)
+            metrics[f'unique_relevant_a_@{threshold_str}'] = unique_a
+            metrics[f'unique_relevant_b_@{threshold_str}'] = unique_b
+            metrics[f'shared_relevant_@{threshold_str}'] = shared
+            metrics[f'unique_relevant_ratio_a_@{threshold_str}'] = float(unique_ratio_a)
+            metrics[f'unique_relevant_ratio_b_@{threshold_str}'] = float(unique_ratio_b)
+
+        return metrics
+
+    def _empty_relevant_matching_metrics(self, n_relevant_a: int = 0, n_relevant_b: int = 0) -> Dict[str, Any]:
+        """Return empty/zero metrics when relevant topic matching cannot be performed"""
+        metrics = {
+            'n_relevant_topics_a': n_relevant_a,
+            'n_relevant_topics_b': n_relevant_b
+        }
+
+        for threshold in [0.5, 0.6, 0.7]:
+            threshold_str = str(threshold).replace('.', '')
+            metrics[f'relevant_coverage_a_to_b_@{threshold_str}'] = 0.0
+            metrics[f'relevant_coverage_b_to_a_@{threshold_str}'] = 0.0
+            metrics[f'unique_relevant_a_@{threshold_str}'] = n_relevant_a
+            metrics[f'unique_relevant_b_@{threshold_str}'] = n_relevant_b
+            metrics[f'shared_relevant_@{threshold_str}'] = 0
+            metrics[f'unique_relevant_ratio_a_@{threshold_str}'] = 1.0 if n_relevant_a > 0 else 0.0
+            metrics[f'unique_relevant_ratio_b_@{threshold_str}'] = 1.0 if n_relevant_b > 0 else 0.0
+
+        return metrics
+
     def _compute_topic_query_similarity(self, results: Dict[str, Any]) -> float:
         """
         Compute average similarity between topics and the query
+
+        Uses model-aware representations:
+        - BERTopic/LDA: Top words from topic distribution
+        - TopicGPT: LLM-generated topic descriptions
+        - HiCODE: Semantic topic labels
 
         Args:
             results: Topic modeling results
@@ -1646,7 +2184,7 @@ class EndToEndEvaluator:
         Returns:
             Average cosine similarity between all topics and the query
         """
-        topic_words = results["topic_words"]
+        topic_words = results.get("topic_words", {})
 
         if not topic_words:
             return 0.0
@@ -1657,12 +2195,13 @@ class EndToEndEvaluator:
         # Encode query
         query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
 
-        # Encode all topics (top 10 words each)
+        # Encode all topics using model-aware representations
         topic_embeddings = []
-        for topic_id, words in topic_words.items():
-            top_words = " ".join(words[:10])
-            emb = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
-            topic_embeddings.append(emb)
+        for topic_id in topic_words.keys():
+            topic_text = self._get_topic_representation_text(results, topic_id, top_n=10)
+            if topic_text:
+                emb = model.encode(topic_text, convert_to_tensor=False, show_progress_bar=False)
+                topic_embeddings.append(emb)
 
         if not topic_embeddings:
             return 0.0
@@ -1682,6 +2221,11 @@ class EndToEndEvaluator:
 
         Returns detailed metrics about how individual topics align with the query.
 
+        Uses model-aware representations:
+        - BERTopic/LDA: Top words from topic distribution
+        - TopicGPT: LLM-generated topic descriptions
+        - HiCODE: Semantic topic labels
+
         Args:
             results: Topic modeling results
 
@@ -1692,7 +2236,7 @@ class EndToEndEvaluator:
             - top3_avg_similarity: Average similarity of top-3 most query-relevant topics
             - per_topic_similarities: List of (topic_id, similarity) tuples
         """
-        topic_words = results["topic_words"]
+        topic_words = results.get("topic_words", {})
 
         if not topic_words:
             return {
@@ -1708,13 +2252,14 @@ class EndToEndEvaluator:
         # Encode query
         query_embedding = model.encode(self.query_text, convert_to_tensor=False, show_progress_bar=False)
 
-        # Encode all topics and compute similarities
+        # Encode all topics using model-aware representations and compute similarities
         similarities = []
-        for topic_id, words in topic_words.items():
-            top_words = " ".join(words[:10])
-            topic_emb = model.encode(top_words, convert_to_tensor=False, show_progress_bar=False)
-            sim = float(cosine_similarity([query_embedding], [topic_emb])[0][0])
-            similarities.append((topic_id, sim))
+        for topic_id in topic_words.keys():
+            topic_text = self._get_topic_representation_text(results, topic_id, top_n=10)
+            if topic_text:
+                topic_emb = model.encode(topic_text, convert_to_tensor=False, show_progress_bar=False)
+                sim = float(cosine_similarity([query_embedding], [topic_emb])[0][0])
+                similarities.append((topic_id, sim))
 
         # Sort by similarity (descending)
         similarities_sorted = sorted(similarities, key=lambda x: x[1], reverse=True)
@@ -1756,6 +2301,11 @@ class EndToEndEvaluator:
         2. Top-K: Diversity among top-K most query-relevant topics
         3. Relevance-Weighted: Diversity weighted by query relevance (no threshold)
 
+        Uses model-aware representations:
+        - BERTopic/LDA: Top words from topic distribution
+        - TopicGPT: LLM-generated topic descriptions
+        - HiCODE: Semantic topic labels
+
         Args:
             results: Topic modeling results containing topic_words
             relevance_threshold: Threshold for "relevant" topics (default 0.5)
@@ -1792,21 +2342,22 @@ class EndToEndEvaluator:
             show_progress_bar=False
         )
 
-        # Compute embeddings and query similarities for all topics
+        # Compute embeddings and query similarities for all topics using model-aware representations
         topic_data = []
-        for topic_id, words in topic_words.items():
-            topic_text = " ".join(words[:10])
-            topic_embedding = model.encode(
-                topic_text,
-                convert_to_tensor=False,
-                show_progress_bar=False
-            )
-            similarity = float(cosine_similarity([query_embedding], [topic_embedding])[0][0])
-            topic_data.append({
-                "topic_id": topic_id,
-                "embedding": topic_embedding,
-                "query_similarity": similarity
-            })
+        for topic_id in topic_words.keys():
+            topic_text = self._get_topic_representation_text(results, topic_id, top_n=10)
+            if topic_text:
+                topic_embedding = model.encode(
+                    topic_text,
+                    convert_to_tensor=False,
+                    show_progress_bar=False
+                )
+                similarity = float(cosine_similarity([query_embedding], [topic_embedding])[0][0])
+                topic_data.append({
+                    "topic_id": topic_id,
+                    "embedding": topic_embedding,
+                    "query_similarity": similarity
+                })
 
         # Helper to compute diversity from embeddings
         def compute_diversity(embeddings):
@@ -1874,21 +2425,26 @@ class EndToEndEvaluator:
             "relevant_diversity_ratio": relevant_ratio
         }
 
-    def _compute_npmi_coherence(self, topic_words: Dict[int, List[str]], doc_texts: List[str], top_k: int = 10) -> float:
+    def _compute_npmi_coherence(self, results: Dict[str, Any], doc_texts: List[str], top_k: int = 10) -> float:
         """
         Compute average NPMI (Normalized Pointwise Mutual Information) coherence across topics
 
         NPMI measures semantic coherence of topic words based on co-occurrence in documents.
         Higher values indicate more interpretable/coherent topics.
 
+        Note: For LLM-based models (TopicGPT, HiCODE), this uses TF-IDF or hierarchical
+        words extracted from documents. This measures coherence of document vocabulary,
+        not coherence of the semantic topic concepts themselves.
+
         Args:
-            topic_words: Dictionary mapping topic IDs to lists of words
+            results: Topic modeling results dictionary
             doc_texts: List of document texts for computing co-occurrences
             top_k: Number of top words to consider per topic
 
         Returns:
             Average NPMI coherence across all topics (range: -1 to 1, higher = more coherent)
         """
+        topic_words = results.get("topic_words", {})
         if not topic_words or not doc_texts:
             return 0.0
 
@@ -1912,8 +2468,8 @@ class EndToEndEvaluator:
         # Compute NPMI for each topic
         topic_npmis = []
 
-        for topic_id, words in topic_words.items():
-            top_words = words[:top_k]
+        for topic_id in topic_words.keys():
+            top_words = self._get_topic_words_for_metrics(results, topic_id, top_k=top_k)
 
             # Compute NPMI for all word pairs
             pair_npmis = []
@@ -1944,20 +2500,25 @@ class EndToEndEvaluator:
         # Average across all topics
         return float(np.mean(topic_npmis)) if topic_npmis else 0.0
 
-    def _compute_embedding_coherence(self, topic_words: Dict[int, List[str]], top_k: int = 10) -> float:
+    def _compute_embedding_coherence(self, results: Dict[str, Any], top_k: int = 10) -> float:
         """
         Compute average embedding coherence across topics
 
         Measures how semantically tight topic words are by computing average pairwise
         cosine similarity of word embeddings within each topic.
 
+        Note: For LLM-based models (TopicGPT, HiCODE), this uses TF-IDF or hierarchical
+        words extracted from documents. This measures semantic tightness of document
+        vocabulary, not the semantic concept coherence.
+
         Args:
-            topic_words: Dictionary mapping topic IDs to lists of words
+            results: Topic modeling results dictionary
             top_k: Number of top words to consider per topic
 
         Returns:
             Average embedding coherence across all topics (0-1, higher = tighter topics)
         """
+        topic_words = results.get("topic_words", {})
         if not topic_words:
             return 0.0
 
@@ -1966,8 +2527,8 @@ class EndToEndEvaluator:
 
         topic_coherences = []
 
-        for topic_id, words in topic_words.items():
-            top_words = words[:top_k]
+        for topic_id in topic_words.keys():
+            top_words = self._get_topic_words_for_metrics(results, topic_id, top_k=top_k)
 
             if len(top_words) < 2:
                 continue
@@ -2016,30 +2577,38 @@ class EndToEndEvaluator:
         logger.debug(f"Relevant concentration: {concentration:.3f} ({len(relevant_in_sample)}/{len(sample_doc_ids)})")
         return concentration
 
-    def _compute_topic_specificity(self, topic_words: Dict[int, List[str]]) -> float:
+    def _compute_topic_specificity(self, results: Dict[str, Any]) -> float:
         """
         Compute average IDF (specificity) of topic words
 
         Operationalizes "less generic" observation - higher IDF means more specific/technical terms.
 
+        Note: For LLM-based models (TopicGPT, HiCODE), this uses TF-IDF or hierarchical
+        words extracted from documents. This measures specificity of document vocabulary,
+        not specificity of the semantic topic concepts.
+
         Args:
-            topic_words: Dictionary mapping topic IDs to lists of words
+            results: Topic modeling results dictionary
 
         Returns:
             Average IDF across all topic words (higher = more specific)
         """
+        topic_words = results.get("topic_words", {})
         if not topic_words or not self.idf_scores:
             return 0.0
 
         topic_specificities = []
 
-        for topic_id, words in topic_words.items():
+        for topic_id in topic_words.keys():
             if topic_id == -1:  # Skip outlier topic
                 continue
 
+            # Get words for this topic
+            words = self._get_topic_words_for_metrics(results, topic_id, top_k=10)
+
             # Get IDF scores for topic words (top 10)
             topic_idf_scores = []
-            for word in words[:10]:
+            for word in words:
                 # Normalize word (lowercase, remove special chars)
                 normalized_word = word.lower().strip()
                 if normalized_word in self.idf_scores:
@@ -2087,18 +2656,46 @@ class EndToEndEvaluator:
                 # Sort topics by size (largest first)
                 sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
 
+                # Check if this is HiCode (has topic_model_type == 'hicode')
+                is_hicode = results.get('topic_model_type') == 'hicode'
+                topic_words_raw = results.get('topic_words', {})
+
                 for topic_id, count in sorted_topics:
                     f.write(f"\n{'='*80}\n")
-                    f.write(f"TOPIC {topic_id}: {topic_labels.get(topic_id, 'N/A')}\n")
-                    f.write(f"Name: {topic_names.get(topic_id, 'N/A')}\n")
-                    f.write(f"Document Count: {count}\n")
-                    f.write(f"-"*80 + "\n")
 
-                    # Top words with scores
-                    if topic_id in topic_words_with_scores:
-                        f.write("Top Words (with c-TF-IDF scores):\n")
-                        for i, (word, score) in enumerate(topic_words_with_scores[topic_id][:10], 1):
-                            f.write(f"  {i:2d}. {word:20s} {score:.4f}\n")
+                    if is_hicode:
+                        # HiCode: use topic_names as the label (no topic_labels available)
+                        label = topic_names.get(topic_id, topic_names.get(int(topic_id), 'N/A'))
+                        f.write(f"TOPIC {topic_id}: {label}\n")
+                        f.write(f"Document Count: {count}\n")
+                        f.write(f"-"*80 + "\n")
+
+                        # Show generation labels as the word list
+                        words = topic_words_raw.get(topic_id, topic_words_raw.get(int(topic_id), []))
+                        if words and isinstance(words, list):
+                            f.write("Generation Labels:\n")
+                            for i, phrase in enumerate(words, 1):
+                                f.write(f"  {i:2d}. {phrase}\n")
+                    else:
+                        # BERTopic/LDA/TopicGPT: original format
+                        f.write(f"TOPIC {topic_id}: {topic_labels.get(topic_id, 'N/A')}\n")
+                        f.write(f"Name: {topic_names.get(topic_id, 'N/A')}\n")
+
+                        # TopicGPT: show LLM-generated topic description
+                        topic_descriptions = results.get('topic_descriptions', [])
+                        if topic_descriptions and isinstance(topic_descriptions, list):
+                            tid = int(topic_id)
+                            if 0 <= tid < len(topic_descriptions):
+                                f.write(f"Description: {topic_descriptions[tid]}\n")
+
+                        f.write(f"Document Count: {count}\n")
+                        f.write(f"-"*80 + "\n")
+
+                        # Top words with scores
+                        if topic_id in topic_words_with_scores:
+                            f.write("Top Words (with c-TF-IDF scores):\n")
+                            for i, (word, score) in enumerate(topic_words_with_scores[topic_id][:10], 1):
+                                f.write(f"  {i:2d}. {word:20s} {score:.4f}\n")
                     f.write("\n")
 
                 # Outliers
@@ -2130,14 +2727,34 @@ class EndToEndEvaluator:
             topic_counts = dict(zip(unique_topics, counts))
             sorted_topics = sorted(topic_counts.items(), key=lambda x: x[1], reverse=True)
 
+            is_hicode = results.get('topic_model_type') == 'hicode'
+            topic_words_raw = results.get('topic_words', {})
+
             for topic_id, count in sorted_topics:
-                topic_data = {
-                    "topic_id": int(topic_id),
-                    "label": topic_labels.get(topic_id, f"Topic_{topic_id}"),
-                    "name": topic_names.get(topic_id, f"Topic_{topic_id}"),
-                    "doc_count": int(count),
-                    "top_words": topic_words_with_scores.get(topic_id, [])[:10]
-                }
+                if is_hicode:
+                    label = topic_names.get(topic_id, topic_names.get(int(topic_id), f"Topic_{topic_id}"))
+                    words = topic_words_raw.get(topic_id, topic_words_raw.get(int(topic_id), []))
+                    topic_data = {
+                        "topic_id": int(topic_id),
+                        "label": label,
+                        "name": label,
+                        "doc_count": int(count),
+                        "generation_labels": words if isinstance(words, list) else []
+                    }
+                else:
+                    topic_data = {
+                        "topic_id": int(topic_id),
+                        "label": topic_labels.get(topic_id, f"Topic_{topic_id}"),
+                        "name": topic_names.get(topic_id, f"Topic_{topic_id}"),
+                        "doc_count": int(count),
+                        "top_words": topic_words_with_scores.get(topic_id, [])[:10]
+                    }
+                    # Add TopicGPT description if available
+                    topic_descriptions = results.get('topic_descriptions', [])
+                    if topic_descriptions and isinstance(topic_descriptions, list):
+                        tid = int(topic_id)
+                        if 0 <= tid < len(topic_descriptions):
+                            topic_data["description"] = topic_descriptions[tid]
                 json_summary["topics"].append(topic_data)
 
             # Add outlier info
@@ -2202,6 +2819,12 @@ class EndToEndEvaluator:
         # Convert to DataFrame
         df = pd.DataFrame(all_metrics)
 
+        # Sort by canonical method order for readability (method_a first, then method_b)
+        method_order_map = {m: i for i, m in enumerate(METHOD_ORDER)}
+        df['_sort_a'] = df['method_a'].map(method_order_map)
+        df['_sort_b'] = df['method_b'].map(method_order_map)
+        df = df.sort_values(['_sort_a', '_sort_b']).drop(['_sort_a', '_sort_b'], axis=1).reset_index(drop=True)
+
         # Save results
         csv_path = os.path.join(self.results_dir, "pairwise_metrics.csv")
         json_path = os.path.join(self.results_dir, "pairwise_metrics.json")
@@ -2209,8 +2832,26 @@ class EndToEndEvaluator:
         df.to_csv(csv_path, index=False)
         logger.info(f"\n✓ Saved pairwise metrics to {csv_path}")
 
+        # Convert numpy types to native Python types for JSON serialization
+        def convert_numpy_types(obj):
+            """Recursively convert numpy types to Python native types"""
+            if isinstance(obj, dict):
+                return {k: convert_numpy_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+
+        all_metrics_serializable = convert_numpy_types(all_metrics)
+
         with open(json_path, 'w') as f:
-            json.dump(all_metrics, f, indent=2)
+            json.dump(all_metrics_serializable, f, indent=2)
         logger.info(f"✓ Saved pairwise metrics to {json_path}")
 
         return df
@@ -2331,12 +2972,154 @@ class EndToEndEvaluator:
 
         summary_df = pd.DataFrame(summary_data)
 
+        # Sort by canonical method order for readability
+        summary_df['_sort_order'] = summary_df['method'].map({m: i for i, m in enumerate(METHOD_ORDER)})
+        summary_df = summary_df.sort_values('_sort_order').drop('_sort_order', axis=1).reset_index(drop=True)
+
         # Save summary
         summary_path = os.path.join(self.results_dir, "per_method_summary.csv")
         summary_df.to_csv(summary_path, index=False)
         logger.info(f"✓ Saved per-method summary to {summary_path}")
 
         return summary_df
+
+    def _create_unique_shared_bar_chart(
+        self,
+        pairwise_df: pd.DataFrame,
+        methods: List[str],
+        display_names: List[str]
+    ):
+        """
+        Create stacked bar chart showing unique vs shared relevant topics for key method pairs.
+
+        Shows complementarity: how many relevant topics are unique to each method vs shared.
+        Uses threshold @0.7 for meaningful overlap detection.
+
+        Args:
+            pairwise_df: DataFrame with pairwise metrics
+            methods: List of method names in canonical order
+            display_names: List of display names for methods
+        """
+        # Select key method pairs to visualize (avoid showing all 21 pairs)
+        key_pairs = [
+            ('direct_retrieval', 'keyword_search'),
+            ('direct_retrieval', 'sbert'),
+            ('direct_retrieval', 'query_expansion'),
+            ('keyword_search', 'sbert'),
+            ('sbert', 'query_expansion'),
+            ('random_uniform', 'direct_retrieval')
+        ]
+
+        # Filter to pairs that exist in the data
+        pair_data = []
+        for method_a, method_b in key_pairs:
+            if method_a not in methods or method_b not in methods:
+                continue
+
+            # Find the row
+            row = pairwise_df[(pairwise_df['method_a'] == method_a) & (pairwise_df['method_b'] == method_b)]
+            if row.empty:
+                # Try reverse order
+                row = pairwise_df[(pairwise_df['method_a'] == method_b) & (pairwise_df['method_b'] == method_a)]
+                if row.empty:
+                    continue
+                # Swap A and B
+                method_a, method_b = method_b, method_a
+
+            row = row.iloc[0]
+
+            # Get metrics at threshold 0.7
+            unique_a = row.get('unique_relevant_a_@07', 0)
+            unique_b = row.get('unique_relevant_b_@07', 0)
+            shared = row.get('shared_relevant_@07', 0)
+
+            display_a = _get_display_name(method_a)
+            display_b = _get_display_name(method_b)
+
+            pair_data.append({
+                'pair_label': f"{display_a}\nvs\n{display_b}",
+                'unique_a': unique_a,
+                'unique_b': unique_b,
+                'shared': shared,
+                'method_a': method_a,
+                'method_b': method_b,
+                'display_a': display_a,
+                'display_b': display_b
+            })
+
+        if not pair_data:
+            logger.warning("No pairwise data available for unique/shared bar chart")
+            return
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        # Prepare data for stacked bar chart
+        pair_labels = [d['pair_label'] for d in pair_data]
+        unique_a_vals = [d['unique_a'] for d in pair_data]
+        shared_vals = [d['shared'] for d in pair_data]
+        unique_b_vals = [d['unique_b'] for d in pair_data]
+
+        x = np.arange(len(pair_labels))
+        width = 0.6
+
+        # Create stacked bars
+        # Colors: use method colors for unique, neutral for shared
+        colors_a = [METHOD_COLORS[d['method_a']] for d in pair_data]
+        colors_b = [METHOD_COLORS[d['method_b']] for d in pair_data]
+        color_shared = '#95a5a6'  # Neutral gray for shared
+
+        # Stack: unique_a (bottom), shared (middle), unique_b (top)
+        bars_a = ax.bar(x, unique_a_vals, width, label='Unique to Method A',
+                       color=colors_a, edgecolor='black', linewidth=1.5)
+        bars_shared = ax.bar(x, shared_vals, width, bottom=unique_a_vals,
+                           label='Shared', color=color_shared, edgecolor='black', linewidth=1.5)
+        bars_b = ax.bar(x, unique_b_vals, width,
+                       bottom=np.array(unique_a_vals) + np.array(shared_vals),
+                       label='Unique to Method B', color=colors_b, edgecolor='black', linewidth=1.5)
+
+        # Add value labels on bars
+        for i, (d, bar_a, bar_shared, bar_b) in enumerate(zip(pair_data, bars_a, bars_shared, bars_b)):
+            # Label unique_a
+            if d['unique_a'] > 0:
+                height_a = bar_a.get_height() / 2
+                ax.text(bar_a.get_x() + bar_a.get_width()/2, height_a,
+                       f"{int(d['unique_a'])}\n{d['display_a'][:6]}",
+                       ha='center', va='center', fontsize=FONT_SIZES['annotation']-2,
+                       fontweight='bold', color='white')
+
+            # Label shared
+            if d['shared'] > 0:
+                height_shared = bar_a.get_height() + bar_shared.get_height() / 2
+                ax.text(bar_shared.get_x() + bar_shared.get_width()/2, height_shared,
+                       f"{int(d['shared'])}",
+                       ha='center', va='center', fontsize=FONT_SIZES['annotation'],
+                       fontweight='bold', color='white')
+
+            # Label unique_b
+            if d['unique_b'] > 0:
+                height_b = bar_a.get_height() + bar_shared.get_height() + bar_b.get_height() / 2
+                ax.text(bar_b.get_x() + bar_b.get_width()/2, height_b,
+                       f"{int(d['unique_b'])}\n{d['display_b'][:6]}",
+                       ha='center', va='center', fontsize=FONT_SIZES['annotation']-2,
+                       fontweight='bold', color='white')
+
+        ax.set_ylabel('Number of Relevant Topics', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+        ax.set_xlabel('Method Pairs', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+        ax.set_title(f'Unique vs Shared Query-Relevant Topics @0.7\n(Query {self.query_id})',
+                    fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(pair_labels, fontsize=FONT_SIZES['tick_label'])
+        ax.tick_params(axis='y', labelsize=FONT_SIZES['tick_label'])
+        ax.legend(loc='upper right', fontsize=FONT_SIZES['legend'])
+        ax.grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = os.path.join(self.plots_dir, "relevant_topics_unique_shared_comparison.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"✓ Saved unique vs shared relevant topics bar chart")
 
     def create_comprehensive_plots(
         self,
@@ -2356,34 +3139,42 @@ class EndToEndEvaluator:
 
         # Set style
         sns.set_style("whitegrid")
-        methods = per_method_df['method'].tolist()
+
+        # Sort methods in canonical order and get display names
+        methods = _sort_methods_canonical(per_method_df['method'].tolist())
+        display_names = [_get_display_name(m) for m in methods]
         n_methods = len(methods)
+
+        # Reorder DataFrame to match canonical order
+        per_method_df = per_method_df.set_index('method').loc[methods].reset_index()
 
         # Plot 1: Intrinsic Quality Metrics (4x2 grid)
         fig, axes = plt.subplots(4, 2, figsize=(14, 20))
-        fig.suptitle(f'Intrinsic Topic Quality Metrics - Query {self.query_id}', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Intrinsic Topic Quality Metrics - Query {self.query_id}',
+                    fontsize=FONT_SIZES['suptitle'], fontweight='bold')
 
         quality_metrics = [
-            ('npmi_coherence', 'NPMI Coherence', 'Blues_d'),
-            ('embedding_coherence', 'Embedding Coherence', 'Greens_d'),
-            ('diversity_semantic', 'Semantic Diversity', 'Purples_d'),
-            ('diversity_lexical', 'Lexical Diversity', 'Oranges_d'),
-            ('document_coverage', 'Document Coverage', 'YlGn'),
-            ('topic_specificity', 'Topic Specificity (IDF)', 'Reds_d'),
-            ('n_topics', 'Number of Topics', 'Greys_d'),
-            ('relevant_concentration', 'Relevant Doc Concentration', 'plasma')
+            ('npmi_coherence', 'NPMI Coherence'),
+            ('embedding_coherence', 'Embedding Coherence'),
+            ('diversity_semantic', 'Semantic Diversity'),
+            ('diversity_lexical', 'Lexical Diversity'),
+            ('document_coverage', 'Document Coverage'),
+            ('topic_specificity', 'Topic Specificity (IDF)'),
+            ('n_topics', 'Number of Topics'),
+            ('relevant_concentration', 'Relevant Doc Concentration')
         ]
 
-        for idx, (metric, title, color) in enumerate(quality_metrics):
+        for idx, (metric, title) in enumerate(quality_metrics):
             ax = axes[idx // 2, idx % 2]
             values = per_method_df[metric].values
-            colors_list = sns.color_palette(color, n_methods)
+            colors_list = [METHOD_COLORS[m] for m in methods]
 
-            bars = ax.bar(methods, values, color=colors_list, edgecolor='black', linewidth=1.5)
-            ax.set_title(title, fontsize=12, fontweight='bold')
-            ax.set_ylabel('Value', fontsize=10)
-            ax.set_xlabel('Method', fontsize=10)
-            ax.tick_params(axis='x', rotation=45)
+            bars = ax.bar(display_names, values, color=colors_list, edgecolor='black', linewidth=1.5)
+            ax.set_title(title, fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+            ax.set_ylabel('Value', fontsize=FONT_SIZES['axis_label'])
+            ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+            ax.tick_params(axis='x', rotation=45, labelsize=FONT_SIZES['tick_label'])
+            ax.tick_params(axis='y', labelsize=FONT_SIZES['tick_label'])
             ax.grid(axis='y', alpha=0.3)
 
             # Add value labels
@@ -2391,7 +3182,7 @@ class EndToEndEvaluator:
                 height = bar.get_height()
                 ax.text(bar.get_x() + bar.get_width()/2., height,
                        f'{value:.3f}' if isinstance(value, float) and value < 10 else f'{value:.0f}',
-                       ha='center', va='bottom', fontsize=9)
+                       ha='center', va='bottom', fontsize=FONT_SIZES['annotation'])
 
         plt.tight_layout()
         plot_path = os.path.join(self.plots_dir, "intrinsic_quality_metrics.png")
@@ -2401,31 +3192,33 @@ class EndToEndEvaluator:
 
         # Plot 2: Query Alignment Metrics (1x3 grid)
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-        fig.suptitle(f'Query Alignment Metrics - Query {self.query_id}', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Query Alignment Metrics - Query {self.query_id}',
+                    fontsize=FONT_SIZES['suptitle'], fontweight='bold')
 
         query_metrics = [
-            ('topic_query_similarity', 'Avg Topic-Query Similarity', 'viridis'),
-            ('max_query_similarity', 'Max Topic-Query Similarity', 'plasma'),
-            ('query_relevant_ratio', 'Query-Relevant Topic Ratio', 'cividis')
+            ('topic_query_similarity', 'Avg Topic-Query Similarity'),
+            ('max_query_similarity', 'Max Topic-Query Similarity'),
+            ('query_relevant_ratio', 'Query-Relevant Topic Ratio')
         ]
 
-        for idx, (metric, title, cmap) in enumerate(query_metrics):
+        for idx, (metric, title) in enumerate(query_metrics):
             ax = axes[idx]
             values = per_method_df[metric].values
-            colors_list = sns.color_palette(cmap, n_methods)
+            colors_list = [METHOD_COLORS[m] for m in methods]
 
-            bars = ax.bar(methods, values, color=colors_list, edgecolor='black', linewidth=1.5)
-            ax.set_title(title, fontsize=11, fontweight='bold')
-            ax.set_ylabel('Value', fontsize=10)
-            ax.set_xlabel('Method', fontsize=10)
-            ax.tick_params(axis='x', rotation=45)
+            bars = ax.bar(display_names, values, color=colors_list, edgecolor='black', linewidth=1.5)
+            ax.set_title(title, fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+            ax.set_ylabel('Value', fontsize=FONT_SIZES['axis_label'])
+            ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+            ax.tick_params(axis='x', rotation=45, labelsize=FONT_SIZES['tick_label'])
+            ax.tick_params(axis='y', labelsize=FONT_SIZES['tick_label'])
             ax.grid(axis='y', alpha=0.3)
             ax.set_ylim(0, 1.0)
 
             for bar, value in zip(bars, values):
                 height = bar.get_height()
                 ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{value:.3f}', ha='center', va='bottom', fontsize=9)
+                       f'{value:.3f}', ha='center', va='bottom', fontsize=FONT_SIZES['annotation'])
 
         plt.tight_layout()
         plot_path = os.path.join(self.plots_dir, "query_alignment_metrics.png")
@@ -2435,22 +3228,25 @@ class EndToEndEvaluator:
 
         # Plot 3: Diversity Scatter (Semantic vs Lexical)
         fig, ax = plt.subplots(figsize=(10, 8))
-        colors_list = sns.color_palette("husl", n_methods)
 
         for idx, method in enumerate(methods):
+            display_name = display_names[idx]
             semantic = per_method_df[per_method_df['method'] == method]['diversity_semantic'].values[0]
             lexical = per_method_df[per_method_df['method'] == method]['diversity_lexical'].values[0]
-            ax.scatter(semantic, lexical, s=200, color=colors_list[idx],
-                      edgecolor='black', linewidth=2, label=method, alpha=0.7)
-            ax.annotate(method, (semantic, lexical),
-                       xytext=(5, 5), textcoords='offset points', fontsize=10)
+            ax.scatter(semantic, lexical, s=200, color=METHOD_COLORS[method],
+                      edgecolor='black', linewidth=2, label=display_name, alpha=0.7)
+            ax.annotate(display_name, (semantic, lexical),
+                       xytext=(5, 5), textcoords='offset points', fontsize=FONT_SIZES['annotation'])
 
-        ax.set_xlabel('Semantic Diversity (higher = more distinct concepts)', fontsize=12)
-        ax.set_ylabel('Lexical Diversity (higher = less word overlap)', fontsize=12)
+        ax.set_xlabel('Semantic Diversity (higher = more distinct concepts)',
+                     fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Lexical Diversity (higher = less word overlap)',
+                     fontsize=FONT_SIZES['axis_label'])
         ax.set_title(f'Topic Diversity: Semantic vs Lexical - Query {self.query_id}',
-                    fontsize=14, fontweight='bold')
+                    fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', fontsize=10)
+        ax.legend(loc='best', fontsize=FONT_SIZES['legend'])
 
         # Add quadrant lines (optional interpretation guides)
         ax.axhline(0.8, color='gray', linestyle='--', alpha=0.3, linewidth=1)
@@ -2468,15 +3264,13 @@ class EndToEndEvaluator:
         relevancy = per_method_df['topic_query_similarity'].values
         diversity = per_method_df['diversity_semantic'].values
 
-        # Color map for methods
-        colors_list = sns.color_palette("tab10", n_methods)
-
         for i, method in enumerate(methods):
-            ax.scatter(relevancy[i], diversity[i], s=300, color=colors_list[i],
-                      label=method, alpha=0.7, edgecolors='black', linewidths=2)
-            ax.annotate(method, (relevancy[i], diversity[i]),
+            display_name = display_names[i]
+            ax.scatter(relevancy[i], diversity[i], s=300, color=METHOD_COLORS[method],
+                      label=display_name, alpha=0.7, edgecolors='black', linewidths=2)
+            ax.annotate(display_name, (relevancy[i], diversity[i]),
                        xytext=(8, 8), textcoords='offset points',
-                       fontsize=10, fontweight='bold')
+                       fontsize=FONT_SIZES['annotation'], fontweight='bold')
 
         # Add median lines for quadrants
         if len(relevancy) > 0 and len(diversity) > 0:
@@ -2488,19 +3282,22 @@ class EndToEndEvaluator:
 
             # Quadrant labels
             ax.text(relevancy_median + 0.01, diversity_median + 0.01,
-                   "High Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+                   "High Rel.\nHigh Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
             ax.text(relevancy_median - 0.15, diversity_median + 0.01,
-                   "Low Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+                   "Low Rel.\nHigh Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
             ax.text(relevancy_median + 0.01, diversity_median - 0.05,
-                   "High Rel.\nLow Div.", fontsize=9, alpha=0.6)
+                   "High Rel.\nLow Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
             ax.text(relevancy_median - 0.15, diversity_median - 0.05,
-                   "Low Rel.\nLow Div.", fontsize=9, alpha=0.6)
+                   "Low Rel.\nLow Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
 
-        ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
-        ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+        ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)',
+                     fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+        ax.set_ylabel('Semantic Diversity',
+                     fontsize=FONT_SIZES['axis_label'], fontweight='bold')
         ax.set_title(f'Relevancy vs. Diversity Trade-off - Query {self.query_id}',
-                    fontsize=15, fontweight='bold')
-        ax.legend(loc='best', fontsize=10)
+                    fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+        ax.legend(loc='best', fontsize=FONT_SIZES['legend'])
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -2522,6 +3319,9 @@ class EndToEndEvaluator:
             ("recall_a_@05", "Topic Recall (A) @0.5", "Oranges", (0, 1)),
             ("recall_a_@06", "Topic Recall (A) @0.6", "Oranges", (0, 1)),
             ("recall_a_@07", "Topic Recall (A) @0.7", "Oranges", (0, 1)),
+            ("relevant_coverage_a_to_b_@05", "Relevant Topic Coverage (A→B) @0.5", "BuGn", (0, 1)),
+            ("relevant_coverage_a_to_b_@06", "Relevant Topic Coverage (A→B) @0.6", "BuGn", (0, 1)),
+            ("relevant_coverage_a_to_b_@07", "Relevant Topic Coverage (A→B) @0.7", "BuGn", (0, 1)),
             ("npmi_coherence_diff", "NPMI Coherence Difference (A-B)", "RdBu_r", (-0.5, 0.5)),
             ("embedding_coherence_diff", "Embedding Coherence Difference (A-B)", "RdBu_r", (-0.2, 0.2)),
             ("ari", "Adjusted Rand Index (ARI)", "YlGn", (-0.5, 1)),
@@ -2551,6 +3351,7 @@ class EndToEndEvaluator:
                                 # Determine which metric to use from the reverse row
                                 # For precision_b metrics, use recall_a from reverse (and vice versa)
                                 # because precision_b(A,B) = recall_a(B,A)
+                                # Same logic for relevant_coverage_a_to_b and relevant_coverage_b_to_a
                                 reverse_metric_key = metric_key
                                 if 'precision_b' in metric_key:
                                     # precision_b(A=i,B=j) should use recall_a(A=j,B=i)
@@ -2558,6 +3359,12 @@ class EndToEndEvaluator:
                                 elif 'recall_a' in metric_key:
                                     # recall_a(A=i,B=j) should use precision_b(A=j,B=i)
                                     reverse_metric_key = metric_key.replace('recall_a', 'precision_b')
+                                elif 'relevant_coverage_a_to_b' in metric_key:
+                                    # relevant_coverage_a_to_b(A=i,B=j) should use relevant_coverage_b_to_a(A=j,B=i)
+                                    reverse_metric_key = metric_key.replace('relevant_coverage_a_to_b', 'relevant_coverage_b_to_a')
+                                elif 'relevant_coverage_b_to_a' in metric_key:
+                                    # relevant_coverage_b_to_a(A=i,B=j) should use relevant_coverage_a_to_b(A=j,B=i)
+                                    reverse_metric_key = metric_key.replace('relevant_coverage_b_to_a', 'relevant_coverage_a_to_b')
 
                                 if reverse_metric_key in row.columns:
                                     value = row[reverse_metric_key].values[0]
@@ -2570,28 +3377,30 @@ class EndToEndEvaluator:
                             value = row[metric_key].values[0]
                             matrix[i, j] = value if value is not None and not np.isnan(value) else 0.0
 
-            # Create heatmap
-            plt.figure(figsize=(10, 8))
+            # Create heatmap with larger figure for 7x7 matrix
+            plt.figure(figsize=(12, 10))
 
             sns.heatmap(
                 matrix,
                 annot=True,
                 fmt='.3f',
                 cmap=cmap,
-                xticklabels=methods,
-                yticklabels=methods,
+                xticklabels=display_names,
+                yticklabels=display_names,
                 vmin=vrange[0],
                 vmax=vrange[1],
                 cbar_kws={'label': title},
                 square=True,
-                linewidths=0.5
+                linewidths=0.5,
+                annot_kws={'fontsize': FONT_SIZES['annotation']}
             )
 
-            plt.title(f"{title}\n(Method A vs Method B) - Query {self.query_id}", fontsize=14, fontweight='bold')
-            plt.xlabel("Method B", fontsize=12)
-            plt.ylabel("Method A", fontsize=12)
-            plt.xticks(rotation=45, ha='right')
-            plt.yticks(rotation=0)
+            plt.title(f"{title}\n(Method A vs Method B) - Query {self.query_id}",
+                     fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+            plt.xlabel("Method B", fontsize=FONT_SIZES['axis_label'])
+            plt.ylabel("Method A", fontsize=FONT_SIZES['axis_label'])
+            plt.xticks(rotation=45, ha='right', fontsize=FONT_SIZES['tick_label'])
+            plt.yticks(rotation=0, fontsize=FONT_SIZES['tick_label'])
             plt.tight_layout()
 
             # Save plot
@@ -2601,6 +3410,9 @@ class EndToEndEvaluator:
             plt.close()
 
             logger.info(f"✓ Saved {title} heatmap")
+
+        # Plot 5: Unique vs Shared Relevant Topics (Stacked Bar Chart)
+        self._create_unique_shared_bar_chart(pairwise_df, methods, display_names)
 
         logger.info(f"\n✓ All plots saved to {self.plots_dir}")
 
@@ -2619,10 +3431,11 @@ class EndToEndEvaluator:
 
         samples = {}
         samples["random_uniform"] = self.sample_random_uniform()
+        samples["keyword_search"] = self.sample_keyword_search()
+        samples["sbert"] = self.sample_sbert()
         samples["direct_retrieval"] = self.sample_direct_retrieval()
         samples["direct_retrieval_mmr"] = self.sample_direct_retrieval_mmr()
         samples["query_expansion"] = self.sample_query_expansion()
-        samples["keyword_search"] = self.sample_keyword_search()
         samples["retrieval_random"] = self.sample_retrieval_random()
 
         # Step 2: Run topic modeling
@@ -2722,72 +3535,87 @@ def create_cross_query_intrinsic_plots(
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    # Define method colors for consistency
-    method_colors = {
-        "random_uniform": "#e74c3c",      # Red
-        "direct_retrieval": "#3498db",    # Blue
-        "query_expansion": "#2ecc71",     # Green
-        "keyword_search": "#f39c12"       # Orange
-    }
-
-    # Get available methods
-    methods = sorted(all_per_method['method'].unique())
+    # Get available methods and sort canonically
+    methods = _sort_methods_canonical(list(all_per_method['method'].unique()))
+    display_names = [_get_display_name(m) for m in methods]
     queries = sorted(all_per_method['query_id'].unique())
 
     # 1. DIVERSITY ANALYSIS
     if 'diversity_semantic' in all_per_method.columns:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('Topic Diversity Across Methods and Queries', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Topic Diversity Across Methods and Queries',
+                    fontsize=FONT_SIZES['suptitle'], fontweight='bold')
 
         # Plot 1: Bar chart by query
         ax = axes[0, 0]
         pivot = all_per_method.pivot(index='query_id', columns='method', values='diversity_semantic')
-        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
-        ax.set_title('Semantic Diversity by Query', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Query', fontsize=12)
-        ax.set_ylabel('Diversity (higher = more diverse)', fontsize=12)
-        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        # Reorder columns to canonical order
+        pivot = pivot[[m for m in methods if m in pivot.columns]]
+        # Get colors before renaming columns
+        colors_for_plot = [METHOD_COLORS[m] for m in pivot.columns]
+        # Rename columns to display names
+        pivot.columns = [_get_display_name(m) for m in pivot.columns]
+        pivot.plot(kind='bar', ax=ax, color=colors_for_plot, width=0.8)
+        ax.set_title('Semantic Diversity by Query', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_xlabel('Query', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Diversity (higher = more diverse)', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=FONT_SIZES['legend'])
         ax.grid(axis='y', alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
-        # Plot 2: Method comparison (averaged across queries)
+        # Plot 2: Method comparison (averaged across queries, canonical order)
         ax = axes[0, 1]
         method_avg = all_per_method.groupby('method')['diversity_semantic'].agg(['mean', 'std']).reset_index()
-        method_avg = method_avg.sort_values('mean', ascending=False)
+        # Sort by canonical order instead of mean
+        method_avg['order'] = method_avg['method'].map({m: i for i, m in enumerate(methods)})
+        method_avg = method_avg.sort_values('order')
         x_pos = np.arange(len(method_avg))
         bars = ax.bar(x_pos, method_avg['mean'], yerr=method_avg['std'],
-                      color=[method_colors.get(m, '#95a5a6') for m in method_avg['method']],
+                      color=[METHOD_COLORS[m] for m in method_avg['method']],
                       capsize=5, alpha=0.8, edgecolor='black', linewidth=1.5)
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(method_avg['method'], fontsize=11)
-        ax.set_title('Average Diversity by Method', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Diversity (mean ± std)', fontsize=12)
+        ax.set_xticklabels([_get_display_name(m) for m in method_avg['method']],
+                          fontsize=FONT_SIZES['tick_label'])
+        ax.set_title('Average Diversity by Method', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_ylabel('Diversity (mean ± std)', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='y', labelsize=FONT_SIZES['tick_label'])
         ax.grid(axis='y', alpha=0.3)
 
         for i, (bar, mean_val) in enumerate(zip(bars, method_avg['mean'])):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                    f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                    f'{mean_val:.3f}', ha='center', va='bottom',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold')
 
         # Plot 3: Heatmap
         ax = axes[1, 0]
         heatmap_data = all_per_method.pivot(index='query_id', columns='method', values='diversity_semantic')
+        # Reorder columns to canonical order
+        heatmap_data = heatmap_data[[m for m in methods if m in heatmap_data.columns]]
+        # Rename columns to display names
+        heatmap_data.columns = [_get_display_name(m) for m in heatmap_data.columns]
         sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax,
-                    cbar_kws={'label': 'Diversity'})
-        ax.set_title('Diversity Heatmap', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Method', fontsize=12)
-        ax.set_ylabel('Query', fontsize=12)
+                    cbar_kws={'label': 'Diversity'},
+                    annot_kws={'fontsize': FONT_SIZES['annotation']})
+        ax.set_title('Diversity Heatmap', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Query', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
         # Plot 4: Line plot (trend across queries)
         ax = axes[1, 1]
         for method in methods:
+            display_name = _get_display_name(method)
             method_data = all_per_method[all_per_method['method'] == method].sort_values('query_id')
-            ax.plot(method_data['query_id'], method_data['diversity_semantic'],
-                    marker='o', linewidth=2, markersize=8, label=method,
-                    color=method_colors.get(method, '#95a5a6'))
-        ax.set_title('Diversity Trend Across Queries', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Query', fontsize=12)
-        ax.set_ylabel('Diversity', fontsize=12)
-        ax.legend(title='Method', loc='best')
+            if not method_data.empty:
+                ax.plot(method_data['query_id'], method_data['diversity_semantic'],
+                        marker='o', linewidth=2, markersize=8, label=display_name,
+                        color=METHOD_COLORS[method])
+        ax.set_title('Diversity Trend Across Queries', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_xlabel('Query', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Diversity', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+        ax.legend(title='Method', loc='best', fontsize=FONT_SIZES['legend'])
         ax.grid(True, alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
@@ -2798,54 +3626,70 @@ def create_cross_query_intrinsic_plots(
 
     # 2. DOCUMENT COVERAGE (1 - outlier_ratio)
     if 'document_coverage' in all_per_method.columns:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('Document Coverage Across Methods and Queries', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Document Coverage Across Methods and Queries',
+                    fontsize=FONT_SIZES['suptitle'], fontweight='bold')
 
         # Plot 1: Bar chart by query
         ax = axes[0, 0]
         pivot = all_per_method.pivot(index='query_id', columns='method', values='document_coverage')
-        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
-        ax.set_title('Document Coverage by Query', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Query', fontsize=12)
-        ax.set_ylabel('Coverage (higher = better)', fontsize=12)
-        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        # Reorder and rename columns
+        pivot = pivot[[m for m in methods if m in pivot.columns]]
+        # Get colors before renaming columns
+        colors_for_plot = [METHOD_COLORS[m] for m in pivot.columns]
+        pivot.columns = [_get_display_name(m) for m in pivot.columns]
+        pivot.plot(kind='bar', ax=ax, color=colors_for_plot, width=0.8)
+        ax.set_title('Document Coverage by Query', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_xlabel('Query', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Coverage (higher = better)', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=FONT_SIZES['legend'])
         ax.grid(axis='y', alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
-        # Plot 2: Method comparison
+        # Plot 2: Method comparison (canonical order)
         ax = axes[0, 1]
         method_avg = all_per_method.groupby('method')['document_coverage'].agg(['mean', 'std']).reset_index()
-        method_avg = method_avg.sort_values('mean', ascending=False)
+        method_avg['order'] = method_avg['method'].map({m: i for i, m in enumerate(methods)})
+        method_avg = method_avg.sort_values('order')
         x_pos = np.arange(len(method_avg))
         bars = ax.bar(x_pos, method_avg['mean'], yerr=method_avg['std'],
-                      color=[method_colors.get(m, '#95a5a6') for m in method_avg['method']],
+                      color=[METHOD_COLORS[m] for m in method_avg['method']],
                       capsize=5, alpha=0.8, edgecolor='black', linewidth=1.5)
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(method_avg['method'], fontsize=11)
-        ax.set_title('Average Coverage by Method', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Coverage (mean ± std)', fontsize=12)
+        ax.set_xticklabels([_get_display_name(m) for m in method_avg['method']],
+                          fontsize=FONT_SIZES['tick_label'])
+        ax.set_title('Average Coverage by Method', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_ylabel('Coverage (mean ± std)', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='y', labelsize=FONT_SIZES['tick_label'])
         ax.grid(axis='y', alpha=0.3)
 
         for i, (bar, mean_val) in enumerate(zip(bars, method_avg['mean'])):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                    f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+                    f'{mean_val:.3f}', ha='center', va='bottom',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold')
 
         # Plot 3: Heatmap
         ax = axes[1, 0]
         heatmap_data = all_per_method.pivot(index='query_id', columns='method', values='document_coverage')
+        heatmap_data = heatmap_data[[m for m in methods if m in heatmap_data.columns]]
+        heatmap_data.columns = [_get_display_name(m) for m in heatmap_data.columns]
         sns.heatmap(heatmap_data, annot=True, fmt='.3f', cmap='YlGn', ax=ax,
-                    cbar_kws={'label': 'Coverage'})
-        ax.set_title('Coverage Heatmap', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Method', fontsize=12)
+                    cbar_kws={'label': 'Coverage'},
+                    annot_kws={'fontsize': FONT_SIZES['annotation']})
+        ax.set_title('Coverage Heatmap', fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
         ax.set_ylabel('Query', fontsize=12)
 
         # Plot 4: Line plot
         ax = axes[1, 1]
         for method in methods:
+            display_name = _get_display_name(method)
             method_data = all_per_method[all_per_method['method'] == method].sort_values('query_id')
             ax.plot(method_data['query_id'], method_data['document_coverage'],
-                    marker='o', linewidth=2, markersize=8, label=method,
-                    color=method_colors.get(method, '#95a5a6'))
+                    marker='o', linewidth=2, markersize=8, label=display_name,
+                    color=METHOD_COLORS.get(method, '#95a5a6'))
         ax.set_title('Coverage Trend Across Queries', fontsize=14, fontweight='bold')
         ax.set_xlabel('Query', fontsize=12)
         ax.set_ylabel('Coverage', fontsize=12)
@@ -2866,11 +3710,16 @@ def create_cross_query_intrinsic_plots(
         # Plot 1: Bar chart by query
         ax = axes[0]
         pivot = all_per_method.pivot(index='query_id', columns='method', values='n_topics')
-        pivot.plot(kind='bar', ax=ax, color=[method_colors.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
+        # Reorder columns to canonical order
+        pivot = pivot[[m for m in methods if m in pivot.columns]]
+        # Plot with METHOD_COLORS
+        pivot.plot(kind='bar', ax=ax, color=[METHOD_COLORS.get(m, '#95a5a6') for m in pivot.columns], width=0.8)
         ax.set_title('Topic Count by Query', fontsize=14, fontweight='bold')
         ax.set_xlabel('Query', fontsize=12)
         ax.set_ylabel('Number of Topics', fontsize=12)
-        ax.legend(title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
+        # Update legend with display names
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles, [_get_display_name(m) for m in pivot.columns], title='Method', bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(axis='y', alpha=0.3)
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
 
@@ -3007,11 +3856,38 @@ def aggregate_cross_query_results(
         logger.error("No per-method data found!")
         return None
 
-    # Combine all data
-    all_per_method = pd.concat(per_method_data, ignore_index=True)
-    all_pairwise = pd.DataFrame(pairwise_data)
+    # Filter to only include queries with all 7 methods (ensures consistent comparison)
+    REQUIRED_METHODS = set(METHOD_ORDER)
+    valid_queries = []
+    filtered_per_method_data = []
+    filtered_pairwise_data = []
 
-    logger.info(f"Loaded data from {len(per_method_data)} queries")
+    for i, df in enumerate(per_method_data):
+        query_id = df['query_id'].iloc[0]
+        methods_in_query = set(df['method'].unique())
+
+        if methods_in_query >= REQUIRED_METHODS:  # Has all required methods (may have more)
+            valid_queries.append(query_id)
+            filtered_per_method_data.append(df)
+        else:
+            missing = REQUIRED_METHODS - methods_in_query
+            logger.warning(f"Query {query_id} excluded: missing methods {missing}")
+
+    # Filter pairwise data to match valid queries
+    for item in pairwise_data:
+        if item['query_id'] in valid_queries:
+            filtered_pairwise_data.append(item)
+
+    if not filtered_per_method_data:
+        logger.error(f"No queries have all {len(REQUIRED_METHODS)} required methods!")
+        return None
+
+    logger.info(f"Filtered to {len(valid_queries)}/{len(per_method_data)} queries with all 7 methods")
+
+    # Combine all data
+    all_per_method = pd.concat(filtered_per_method_data, ignore_index=True)
+    all_pairwise = pd.DataFrame(filtered_pairwise_data)
+
     logger.info(f"Total per-method records: {len(all_per_method)}")
     logger.info(f"Total pairwise records: {len(all_pairwise)}")
 
@@ -3072,6 +3948,10 @@ def aggregate_cross_query_results(
 
     per_method_agg_df = pd.DataFrame(per_method_aggregates)
 
+    # Sort by canonical method order for readability
+    per_method_agg_df['_sort_order'] = per_method_agg_df['method'].map({m: i for i, m in enumerate(METHOD_ORDER)})
+    per_method_agg_df = per_method_agg_df.sort_values('_sort_order').drop('_sort_order', axis=1).reset_index(drop=True)
+
     # Save per-method aggregates
     per_method_csv_path = os.path.join(output_dir, "per_method_aggregates.csv")
     per_method_json_path = os.path.join(output_dir, "per_method_aggregates.json")
@@ -3104,7 +3984,31 @@ def aggregate_cross_query_results(
         'recall_a_@07',
         'f1_@07',
         'ari',
-        'nmi'
+        'nmi',
+        # Relevant topic coverage metrics
+        'n_relevant_topics_a',
+        'n_relevant_topics_b',
+        'relevant_coverage_a_to_b_@05',
+        'relevant_coverage_b_to_a_@05',
+        'unique_relevant_a_@05',
+        'unique_relevant_b_@05',
+        'shared_relevant_@05',
+        'unique_relevant_ratio_a_@05',
+        'unique_relevant_ratio_b_@05',
+        'relevant_coverage_a_to_b_@06',
+        'relevant_coverage_b_to_a_@06',
+        'unique_relevant_a_@06',
+        'unique_relevant_b_@06',
+        'shared_relevant_@06',
+        'unique_relevant_ratio_a_@06',
+        'unique_relevant_ratio_b_@06',
+        'relevant_coverage_a_to_b_@07',
+        'relevant_coverage_b_to_a_@07',
+        'unique_relevant_a_@07',
+        'unique_relevant_b_@07',
+        'shared_relevant_@07',
+        'unique_relevant_ratio_a_@07',
+        'unique_relevant_ratio_b_@07'
     ]
 
     pairwise_aggregates = []
@@ -3256,6 +4160,10 @@ def _generate_aggregate_visualizations(
         ('f1_@05_mean', 'Topic Match F1 @ 0.5', 'YlGnBu'),
         ('f1_@06_mean', 'Topic Match F1 @ 0.6', 'YlGnBu'),
         ('f1_@07_mean', 'Topic Match F1 @ 0.7', 'YlGnBu'),
+        # Relevant coverage metrics (% of B's RELEVANT topics covered by A's RELEVANT topics)
+        ('relevant_coverage_a_to_b_@05_mean', 'Relevant Topic Coverage (A→B) @ 0.5', 'BuGn'),
+        ('relevant_coverage_a_to_b_@06_mean', 'Relevant Topic Coverage (A→B) @ 0.6', 'BuGn'),
+        ('relevant_coverage_a_to_b_@07_mean', 'Relevant Topic Coverage (A→B) @ 0.7', 'BuGn'),
     ]
 
     # Build a lookup dict for quick access to pairwise rows: (method_a, method_b) -> row
@@ -3267,7 +4175,7 @@ def _generate_aggregate_visualizations(
     for metric, title, cmap in pairwise_heatmap_metrics:
         if metric in pairwise_agg.columns:
             # Create pivot table
-            methods = sorted(set(pairwise_agg['method_a'].tolist() + pairwise_agg['method_b'].tolist()))
+            methods = _sort_methods_canonical(list(set(pairwise_agg['method_a'].tolist() + pairwise_agg['method_b'].tolist())))
             pivot_data = np.zeros((len(methods), len(methods)))
             pivot_data[:] = np.nan
 
@@ -3277,8 +4185,10 @@ def _generate_aggregate_visualizations(
             is_diff_metric = 'diff' in metric
             is_precision_metric = 'precision_b' in metric
             is_recall_metric = 'recall_a' in metric
+            is_coverage_a_to_b = 'relevant_coverage_a_to_b' in metric
+            is_coverage_b_to_a = 'relevant_coverage_b_to_a' in metric
             is_f1_metric = 'f1_@' in metric
-            is_symmetric = not is_diff_metric and not is_precision_metric and not is_recall_metric
+            is_symmetric = not is_diff_metric and not is_precision_metric and not is_recall_metric and not is_coverage_a_to_b and not is_coverage_b_to_a
 
             # Fill the matrix
             for _, row in pairwise_agg.iterrows():
@@ -3307,6 +4217,22 @@ def _generate_aggregate_visualizations(
                         # For recall_a(A,B), the reverse recall_a(B,A) = precision_b(A,B)
                         # So lower triangle [j,i] gets precision_b from the same row
                         complementary_metric = metric.replace('recall_a', 'precision_b')
+                        if complementary_metric in row:
+                            complementary_value = row[complementary_metric]
+                            if pd.notna(complementary_value):
+                                pivot_data[j, i] = complementary_value
+                    elif is_coverage_a_to_b:
+                        # For relevant_coverage_a_to_b(A,B), the reverse is relevant_coverage_b_to_a(A,B)
+                        # So lower triangle [j,i] gets relevant_coverage_b_to_a from the same row
+                        complementary_metric = metric.replace('relevant_coverage_a_to_b', 'relevant_coverage_b_to_a')
+                        if complementary_metric in row:
+                            complementary_value = row[complementary_metric]
+                            if pd.notna(complementary_value):
+                                pivot_data[j, i] = complementary_value
+                    elif is_coverage_b_to_a:
+                        # For relevant_coverage_b_to_a(A,B), the reverse is relevant_coverage_a_to_b(A,B)
+                        # So lower triangle [j,i] gets relevant_coverage_a_to_b from the same row
+                        complementary_metric = metric.replace('relevant_coverage_b_to_a', 'relevant_coverage_a_to_b')
                         if complementary_metric in row:
                             complementary_value = row[complementary_metric]
                             if pd.notna(complementary_value):
@@ -3368,6 +4294,14 @@ def _generate_aggregate_visualizations(
     # Create standalone aggregate bar charts for key metrics
     logger.info("\nCreating standalone aggregate bar charts...")
     plot_aggregate_bar_charts(all_per_method, plots_dir)
+
+    # Create aggregate unique/shared distribution plots
+    logger.info("\nCreating aggregate unique/shared distribution plots...")
+    plot_aggregate_unique_shared_distribution(pairwise_agg, plots_dir)
+
+    # Create relevant vs all topics coverage comparison
+    logger.info("\nCreating relevant vs all topics coverage comparison...")
+    plot_relevant_vs_all_topics_coverage_comparison(pairwise_agg, plots_dir)
 
     # Run statistical significance tests
     logger.info("\nRunning statistical significance tests...")
@@ -3460,8 +4394,9 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
     """
     logger.info("Generating aggregate scatter plots...")
 
-    # Compute aggregated statistics per method
-    methods = sorted(all_per_method['method'].unique())
+    # Compute aggregated statistics per method (canonical order)
+    methods = _sort_methods_canonical(list(all_per_method['method'].unique()))
+    display_names = [_get_display_name(m) for m in methods]
     n_methods = len(methods)
 
     # Aggregate stats
@@ -3474,16 +4409,13 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
     # Flatten column names
     agg_stats.columns = ['_'.join(col).strip('_') for col in agg_stats.columns.values]
 
-    # Color palette
-    colors_list = sns.color_palette("tab10", n_methods)
-    method_colors = {method: colors_list[i] for i, method in enumerate(methods)}
-
     # ===== Plot 1: Relevancy vs Diversity - Mean with Error Ellipses =====
     logger.info("Creating relevancy vs diversity (mean + ellipses)...")
 
     fig, ax = plt.subplots(figsize=(12, 10))
 
     for i, method in enumerate(methods):
+        display_name = display_names[i]
         stats = agg_stats[agg_stats['method'] == method].iloc[0]
 
         x_mean = stats['topic_query_similarity_mean']
@@ -3491,19 +4423,19 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         y_mean = stats['diversity_semantic_mean']
         y_std = stats['diversity_semantic_std']
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
 
         # Draw error ellipse first (background)
         draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.2)
 
         # Draw mean point on top
-        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=display_name,
                   alpha=0.8, edgecolors='black', linewidths=2, zorder=10)
 
         # Annotate
-        ax.annotate(method, (x_mean, y_mean),
+        ax.annotate(display_name, (x_mean, y_mean),
                    xytext=(8, 8), textcoords='offset points',
-                   fontsize=10, fontweight='bold', zorder=11)
+                   fontsize=FONT_SIZES['annotation'], fontweight='bold', zorder=11)
 
     # Add median lines for quadrants
     all_x_means = agg_stats['topic_query_similarity_mean'].values
@@ -3517,19 +4449,22 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
 
     # Quadrant labels
     ax.text(x_median + 0.01, y_median + 0.01,
-           "High Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+           "High Rel.\nHigh Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
     ax.text(x_median - 0.08, y_median + 0.01,
-           "Low Rel.\nHigh Div.", fontsize=9, alpha=0.6)
+           "Low Rel.\nHigh Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
     ax.text(x_median + 0.01, y_median - 0.02,
-           "High Rel.\nLow Div.", fontsize=9, alpha=0.6)
+           "High Rel.\nLow Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
     ax.text(x_median - 0.08, y_median - 0.02,
-           "Low Rel.\nLow Div.", fontsize=9, alpha=0.6)
+           "Low Rel.\nLow Div.", fontsize=FONT_SIZES['annotation'], alpha=0.6)
 
-    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+    ax.set_ylabel('Semantic Diversity',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
     ax.set_title('Relevancy vs. Diversity Trade-off - Aggregated Across Queries\n(Mean ± 1 Std)',
-                fontsize=15, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
+                fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+    ax.legend(loc='best', fontsize=FONT_SIZES['legend'])
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -3548,19 +4483,20 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         method_data = all_per_method[all_per_method['method'] == method]
         points = method_data[['topic_query_similarity', 'diversity_semantic']].values
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
         draw_convex_hull(ax, points, color, alpha=0.15, linewidth=2)
 
     # Plot all individual points
     for i, method in enumerate(methods):
+        display_name = display_names[i]
         method_data = all_per_method[all_per_method['method'] == method]
 
         x_vals = method_data['topic_query_similarity'].values
         y_vals = method_data['diversity_semantic'].values
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
 
-        ax.scatter(x_vals, y_vals, s=100, color=color, label=method,
+        ax.scatter(x_vals, y_vals, s=100, color=color, label=display_name,
                   alpha=0.5, edgecolors='white', linewidths=0.5)
 
     # Add median lines
@@ -3573,11 +4509,14 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
     ax.axvline(x=x_median_all, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
     ax.axhline(y=y_median_all, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
 
-    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+    ax.set_ylabel('Semantic Diversity',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
     ax.set_title('Relevancy vs. Diversity Trade-off - All Queries\n(Individual Points + Convex Hulls)',
-                fontsize=15, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
+                fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+    ax.legend(loc='best', fontsize=FONT_SIZES['legend'])
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -3598,7 +4537,7 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         x_vals = method_data['topic_query_similarity'].values
         y_vals = method_data['diversity_semantic'].values
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
 
         ax.scatter(x_vals, y_vals, s=60, color=color,
                   alpha=0.25, edgecolors='none', zorder=1)
@@ -3608,7 +4547,7 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         method_data = all_per_method[all_per_method['method'] == method]
         points = method_data[['topic_query_similarity', 'diversity_semantic']].values
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
         draw_convex_hull(ax, points, color, alpha=0.1, linewidth=1.5)
 
     # 3. Plot error ellipses
@@ -3620,34 +4559,38 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         y_mean = stats['diversity_semantic_mean']
         y_std = stats['diversity_semantic_std']
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
         draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.25)
 
     # 4. Plot mean points on top
     for i, method in enumerate(methods):
+        display_name = display_names[i]
         stats = agg_stats[agg_stats['method'] == method].iloc[0]
 
         x_mean = stats['topic_query_similarity_mean']
         y_mean = stats['diversity_semantic_mean']
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
 
-        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=display_name,
                   alpha=0.9, edgecolors='black', linewidths=2.5, zorder=10)
 
-        ax.annotate(method, (x_mean, y_mean),
+        ax.annotate(display_name, (x_mean, y_mean),
                    xytext=(8, 8), textcoords='offset points',
-                   fontsize=10, fontweight='bold', zorder=11)
+                   fontsize=FONT_SIZES['annotation'], fontweight='bold', zorder=11)
 
     # Add median lines
     ax.axvline(x=x_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
     ax.axhline(y=y_median, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
 
-    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)', fontsize=13, fontweight='bold')
-    ax.set_ylabel('Semantic Diversity', fontsize=13, fontweight='bold')
+    ax.set_xlabel('Query Alignment (Avg Topic-Query Similarity)',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+    ax.set_ylabel('Semantic Diversity',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
     ax.set_title('Relevancy vs. Diversity Trade-off - Combined View\n(All Points + Mean ± 1 Std + Convex Hulls)',
-                fontsize=15, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
+                fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+    ax.legend(loc='best', fontsize=FONT_SIZES['legend'])
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -3662,6 +4605,7 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
     fig, ax = plt.subplots(figsize=(12, 10))
 
     for i, method in enumerate(methods):
+        display_name = display_names[i]
         stats = agg_stats[agg_stats['method'] == method].iloc[0]
 
         x_mean = stats['diversity_lexical_mean']
@@ -3669,19 +4613,19 @@ def plot_aggregate_scatter_plots(all_per_method: pd.DataFrame, plots_dir: str):
         y_mean = stats['diversity_semantic_mean']
         y_std = stats['diversity_semantic_std']
 
-        color = method_colors[method]
+        color = METHOD_COLORS[method]
 
         # Draw error ellipse
         draw_error_ellipse(ax, x_mean, x_std, y_mean, y_std, color, alpha=0.2)
 
         # Draw mean point
-        ax.scatter(x_mean, y_mean, s=400, color=color, label=method,
+        ax.scatter(x_mean, y_mean, s=400, color=color, label=display_name,
                   alpha=0.8, edgecolors='black', linewidths=2, zorder=10)
 
         # Annotate
-        ax.annotate(method, (x_mean, y_mean),
+        ax.annotate(display_name, (x_mean, y_mean),
                    xytext=(8, 8), textcoords='offset points',
-                   fontsize=10, fontweight='bold', zorder=11)
+                   fontsize=FONT_SIZES['annotation'], fontweight='bold', zorder=11)
 
     # Add median lines
     all_x_lex = agg_stats['diversity_lexical_mean'].values
@@ -3724,8 +4668,9 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
     """
     logger.info("Generating standalone aggregate bar charts...")
 
-    # Compute aggregated statistics per method
-    methods = sorted(all_per_method['method'].unique())
+    # Compute aggregated statistics per method (canonical order)
+    methods = _sort_methods_canonical(list(all_per_method['method'].unique()))
+    display_names = [_get_display_name(m) for m in methods]
     n_methods = len(methods)
 
     # Define metrics to plot
@@ -3762,10 +4707,6 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         }
     ]
 
-    # Color palette
-    colors_list = sns.color_palette("tab10", n_methods)
-    method_colors = {method: colors_list[i] for i, method in enumerate(methods)}
-
     for metric_info in metrics_config:
         column = metric_info['column']
         title_base = metric_info['title']
@@ -3784,8 +4725,10 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         stats['sem'] = stats['std'] / np.sqrt(stats['count'])
         stats['ci_95'] = 1.96 * stats['sem']
 
-        # Sort by method name for consistency
-        stats = stats.sort_values('method').reset_index(drop=True)
+        # Sort by canonical order and add display names
+        stats['_sort_order'] = stats['method'].map({m: i for i, m in enumerate(methods)})
+        stats = stats.sort_values('_sort_order').drop('_sort_order', axis=1).reset_index(drop=True)
+        stats['display_name'] = stats['method'].map({m: _get_display_name(m) for m in methods})
 
         # ===== Plot 1: Bar chart with ±1 Std Error Bars =====
         fig, ax = plt.subplots(figsize=(12, 7))
@@ -3795,7 +4738,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
             x_pos,
             stats['mean'],
             yerr=stats['std'],
-            color=[method_colors[m] for m in stats['method']],
+            color=[METHOD_COLORS[m] for m in stats['method']],
             capsize=6,
             alpha=0.8,
             edgecolor='black',
@@ -3804,7 +4747,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         )
 
         # Add value labels on top of bars
-        for i, (bar, mean_val, std_val) in enumerate(zip(bars, stats['mean'], stats['std'])):
+        for bar, mean_val, std_val in zip(bars, stats['mean'], stats['std']):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + std_val + 0.01,
@@ -3814,7 +4757,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
             )
 
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(stats['method'], fontsize=11)
+        ax.set_xticklabels(stats['display_name'], fontsize=11)
         ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
         ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
         ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 1 Std)', fontsize=14, fontweight='bold')
@@ -3837,7 +4780,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
             x_pos,
             stats['mean'],
             yerr=stats['ci_95'],
-            color=[method_colors[m] for m in stats['method']],
+            color=[METHOD_COLORS[m] for m in stats['method']],
             capsize=6,
             alpha=0.8,
             edgecolor='black',
@@ -3846,7 +4789,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         )
 
         # Add value labels on top of bars
-        for i, (bar, mean_val, ci_val) in enumerate(zip(bars, stats['mean'], stats['ci_95'])):
+        for bar, mean_val, ci_val in zip(bars, stats['mean'], stats['ci_95']):
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + ci_val + 0.01,
@@ -3856,7 +4799,7 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
             )
 
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(stats['method'], fontsize=11)
+        ax.set_xticklabels(stats['display_name'], fontsize=11)
         ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
         ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
         ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 95% CI)', fontsize=14, fontweight='bold')
@@ -3875,12 +4818,154 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
     logger.info("✓ All standalone aggregate bar charts created successfully")
 
 
+def plot_aggregate_unique_shared_distribution(pairwise_agg: pd.DataFrame, plots_dir: str):
+    """
+    Create box plots showing distribution of unique vs shared relevant topics across queries.
+
+    Shows complementarity distribution for key method pairs.
+    """
+    logger.info("Creating aggregate unique/shared distribution plots...")
+
+    # Key method pairs to visualize
+    key_pairs = [
+        ('direct_retrieval', 'keyword_search', 'DR vs KS'),
+        ('direct_retrieval', 'sbert', 'DR vs SBERT'),
+        ('direct_retrieval', 'query_expansion', 'DR vs QE'),
+        ('keyword_search', 'sbert', 'KS vs SBERT'),
+        ('sbert', 'query_expansion', 'SBERT vs QE'),
+        ('random_uniform', 'direct_retrieval', 'Random vs DR')
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+
+    for idx, (method_a, method_b, label) in enumerate(key_pairs):
+        ax = axes[idx]
+
+        # Get data for this pair (check both orders)
+        pair_df = pairwise_agg[
+            ((pairwise_agg['method_a'] == method_a) & (pairwise_agg['method_b'] == method_b)) |
+            ((pairwise_agg['method_a'] == method_b) & (pairwise_agg['method_b'] == method_a))
+        ]
+
+        if pair_df.empty:
+            ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
+            ax.set_title(label, fontsize=FONT_SIZES['subplot_title'])
+            continue
+
+        # Use the first row (there should only be one after aggregation)
+        row = pair_df.iloc[0]
+
+        # Get mean values for unique/shared @0.7
+        unique_a_mean = row.get('unique_relevant_a_@07_mean', 0)
+        unique_b_mean = row.get('unique_relevant_b_@07_mean', 0)
+        shared_mean = row.get('shared_relevant_@07_mean', 0)
+
+        # Get std values
+        unique_a_std = row.get('unique_relevant_a_@07_std', 0)
+        unique_b_std = row.get('unique_relevant_b_@07_std', 0)
+        shared_std = row.get('shared_relevant_@07_std', 0)
+
+        # Create bar chart with error bars
+        categories = ['Unique A', 'Shared', 'Unique B']
+        means = [unique_a_mean, shared_mean, unique_b_mean]
+        stds = [unique_a_std, shared_std, unique_b_std]
+
+        display_a = _get_display_name(method_a)
+        display_b = _get_display_name(method_b)
+
+        colors = [METHOD_COLORS[method_a], '#95a5a6', METHOD_COLORS[method_b]]
+
+        bars = ax.bar(categories, means, yerr=stds, capsize=5, color=colors,
+                     edgecolor='black', linewidth=1.5, alpha=0.8)
+
+        ax.set_ylabel('Count', fontsize=FONT_SIZES['axis_label'])
+        ax.set_title(f'{label}\n({display_a} vs {display_b})',
+                    fontsize=FONT_SIZES['subplot_title'], fontweight='bold')
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+        ax.grid(axis='y', alpha=0.3)
+
+        # Add value labels
+        for bar, mean, std in zip(bars, means, stds):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + std,
+                   f'{mean:.1f}±{std:.1f}',
+                   ha='center', va='bottom', fontsize=FONT_SIZES['annotation']-1)
+
+    plt.suptitle('Distribution of Unique vs Shared Relevant Topics @0.7\n(Averaged Across Queries)',
+                fontsize=FONT_SIZES['suptitle'], fontweight='bold')
+    plt.tight_layout()
+
+    plot_path = os.path.join(plots_dir, 'aggregate_unique_shared_distribution.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"✓ Saved aggregate unique/shared distribution plot")
+
+
+def plot_relevant_vs_all_topics_coverage_comparison(pairwise_agg: pd.DataFrame, plots_dir: str):
+    """
+    Create scatter plot comparing relevant-only topic coverage vs all-topics coverage.
+
+    Shows difference between matching all topics vs only query-relevant topics.
+    """
+    logger.info("Creating relevant vs all topics coverage comparison...")
+
+    # Extract methods
+    methods = _sort_methods_canonical(list(set(pairwise_agg['method_a'].tolist() + pairwise_agg['method_b'].tolist())))
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # For each method pair, plot: x=precision_b_@07_mean, y=relevant_coverage_a_to_b_@07_mean
+    for _, row in pairwise_agg.iterrows():
+        method_a = row['method_a']
+        method_b = row['method_b']
+
+        all_topics_coverage = row.get('precision_b_@07_mean', np.nan)
+        relevant_only_coverage = row.get('relevant_coverage_a_to_b_@07_mean', np.nan)
+
+        if pd.notna(all_topics_coverage) and pd.notna(relevant_only_coverage):
+            # Color by method A
+            color = METHOD_COLORS.get(method_a, '#808080')
+            ax.scatter(all_topics_coverage, relevant_only_coverage,
+                      s=100, color=color, alpha=0.6, edgecolors='black', linewidths=1)
+
+    # Add diagonal line (x=y)
+    ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, linewidth=2, label='Equal Coverage')
+
+    # Add quadrant interpretation text
+    ax.text(0.25, 0.75, 'Relevant topics\nmore focused',
+           fontsize=FONT_SIZES['annotation'], alpha=0.5, ha='center')
+    ax.text(0.75, 0.25, 'Relevant topics\nless distinctive',
+           fontsize=FONT_SIZES['annotation'], alpha=0.5, ha='center')
+
+    ax.set_xlabel('All Topics Coverage (precision_b @0.7)',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+    ax.set_ylabel('Relevant Topics Only Coverage (relevant_coverage_a_to_b @0.7)',
+                 fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+    ax.set_title('Coverage Comparison: All Topics vs Query-Relevant Topics Only\n(Averaged Across Queries)',
+                fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=FONT_SIZES['legend'])
+
+    plt.tight_layout()
+
+    plot_path = os.path.join(plots_dir, 'aggregate_relevant_vs_all_coverage_comparison.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"✓ Saved relevant vs all topics coverage comparison plot")
+
+
 def main():
     """Main function"""
 
     # ===== DATASET SELECTION =====
     # Options: "trec-covid", "doctor-reviews"
-    DATASET_NAME = "doctor-reviews"
+    DATASET_NAME = "trec-covid"
 
     # ===== DATASET-SPECIFIC CONFIGURATION =====
     DATASET_CONFIGS = {
@@ -3889,7 +4974,7 @@ def main():
             "keyword_cache_path": "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json",
         },
         "doctor-reviews": {
-            "query_ids": ["1", "2", "3", "4", "5", "6"],
+            "query_ids": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
             "keyword_cache_path": "/home/srangre1/cache/keywords/doctor_reviews_keybert.json",
         }
     }
@@ -3935,27 +5020,23 @@ def main():
         "verbose": True
     }
 
-    # BERTopic parameters (currently commented out)
-    # TOPIC_MODEL_PARAMS = {}
-
-    # TopicGPT parameters (currently commented out)
-    # Requires OPENAI_API_KEY environment variable
+    # LDA parameters (currently commented out)
     # TOPIC_MODEL_PARAMS = {
-    #     # Model selection (use gpt-4o-mini for cost efficiency)
-    #     "generation_model": "gpt-4o-mini",    # Model for topic generation
-    #     "assignment_model": "gpt-4o-mini",    # Model for topic assignment
-    #
-    #     # Sampling for topic generation (use subset of documents)
-    #     "generation_sample_size": 500,        # Use 500 docs for topic discovery (out of 1000 sampled)
-    #
-    #     # Vocabulary params (match BERTopic/LDA for fair comparison)
+    #     "n_topics": "auto",       # "auto" matches BERTopic results, or specify int (e.g., 20)
+    #     "alpha": "symmetric",     # Document-topic prior (standard default)
+    #     "eta": 0.01,              # Topic-word prior (0.01 = sparse, focused topics for biomedical text)
+    #     "passes": 15,             # Training passes (higher for technical corpus)
+    #     "iterations": 100,        # Iterations per pass (ensure convergence)
+    #     "random_state": 42,
+    #     "workers": 12,            # Multi-core training (use ~80% of available cores)
+    #     # Vocabulary params (match BERTopic for fair comparison)
     #     "min_df": 2,
     #     "ngram_range": (1, 2),
-    #     "max_features": 10000,
-    #
-    #     # Output
-    #     "verbose": True
+    #     "max_features": 10000
     # }
+
+    # BERTopic parameters (currently commented out)
+    # TOPIC_MODEL_PARAMS = {}
 
     # BERTopic parameters (when TOPIC_MODEL_TYPE = "bertopic") - COMMENTED OUT
     # TOPIC_MODEL_PARAMS = {
@@ -4073,10 +5154,10 @@ def main():
     # This regenerates metrics/plots in ~2-5 min per query (vs. ~8-12 min full pipeline).
     # Useful for: (1) Fixing visualization bugs, (2) Adding new aggregate scatter plots
     #
-    # CURRENT MODE: Evaluation-only (recompute metrics from cached topic models)
+    # CURRENT MODE: trec-covid dataset with TopicGPT - FULL RUN
     FORCE_REGENERATE_SAMPLES = False      # Use cached samples
-    FORCE_REGENERATE_TOPICS = False       # Use cached topic models
-    FORCE_REGENERATE_EVALUATION = False   # Use cached metrics, just regenerate plots
+    FORCE_REGENERATE_TOPICS = False       # Use cached TopicGPT topics (will generate if not cached)
+    FORCE_REGENERATE_EVALUATION = False   # Use cached evaluation if available
 
     # Random seed
     RANDOM_SEED = 42

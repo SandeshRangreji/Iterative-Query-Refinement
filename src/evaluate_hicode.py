@@ -9,9 +9,9 @@ with the existing evaluation metrics pipeline.
 
 Key conversions:
 - topics: List[List[int]] → List[int] (flatten multi-label by taking first topic)
-- topic_words: Add stopword filtering for lexical metrics
-- topic_words_with_scores: Generate dummy scores (HiCode doesn't provide c-TF-IDF)
-- topic_labels: Generate from topic_names
+- topic_words: Preserved as hierarchical structure (List[List[str]])
+  NOTE: end_to_end_evaluation.py uses topic_names for semantic matching, not topic_words
+- topic_names: Preserved as-is (used for model-aware topic matching)
 
 Usage:
     python src/evaluate_hicode.py
@@ -257,19 +257,15 @@ def convert_hicode_to_standard_format(
             f"({100*multi_label_count/len(hicode_data['topics']):.1f}%) - taking first topic"
         )
 
-    # 2. Flatten topic_words from HiCode
-    # HiCode stores topic_words as Dict[int, List[List[str]]] (multiple word lists per topic)
-    # We need Dict[int, List[str]] (one word list per topic) for evaluation
-    # Strategy: Take the first word list (assumed to be most important/primary)
-    topic_words = {}
-    for topic_id, word_lists in hicode_data['topic_words'].items():
-        if isinstance(word_lists[0], list):
-            # Nested structure: take first list
-            topic_words[topic_id] = word_lists[0]
-        else:
-            # Already flat: keep as-is
-            topic_words[topic_id] = word_lists
-    logger.info(f"  Flattened topic_words (taking first word list from HiCode's nested structure)")
+    # 2. Use HiCode's topic_words (raw generation labels) for semantic matching
+    # New format: Dict[int, List[str]] where each value is a list of generation label phrases
+    # These rich phrases are used for semantic similarity (joined, then embedded)
+    # topic_words_processed contains individual words as fallback if needed
+    topic_words = hicode_data['topic_words']
+    topic_words_processed = hicode_data.get('topic_words_processed')
+    logger.info(f"  Using topic_words (generation labels) for semantic matching")
+    if topic_words_processed:
+        logger.info(f"  Storing topic_words_processed as fallback ({len(topic_words_processed)} topics)")
 
     # 3. Construct standard format
     standard_format = {
@@ -277,10 +273,10 @@ def convert_hicode_to_standard_format(
         'method': hicode_data['method'],
         'doc_ids': hicode_data['doc_ids'],
         'n_topics': hicode_data['n_topics'],
-        'topic_words': topic_words,  # Original words, no global stopword filtering
+        'topic_words': topic_words,  # Generation labels for semantic matching
 
-        # Natural language topic names (e.g., "domestic and intimate partner violence")
-        # Summaries will use these directly instead of generated labels
+        # Natural language topic names (e.g., "domestic violence")
+        # Used as headers in summaries and as fallback for semantic matching
         'topic_names': hicode_data['topic_names'],
 
         # ===== TRANSFORMED FIELDS =====
@@ -298,12 +294,13 @@ def convert_hicode_to_standard_format(
 
         # ===== PRESERVED FOR REFERENCE =====
         '_hicode_original_multi_label_topics': hicode_data['topics'],
+        '_topic_words_processed': topic_words_processed,  # Fallback: individual words if needed
     }
 
     logger.info(f"  ✓ Converted to standard format")
     logger.info(f"    - Flattened topics: {len(topics_flat)} assignments")
-    logger.info(f"    - Topics with words: {len(topic_words)}")
-    logger.info(f"    - Using natural language topic_names (no label generation)")
+    logger.info(f"    - Topics with generation labels: {len(topic_words)}")
+    logger.info(f"    - Using generation labels for semantic matching (first 5 per topic)")
 
     return standard_format
 
@@ -530,9 +527,10 @@ def save_config(
         },
         "limitations": [
             "Multi-label topics flattened to single-label (affects 2-3% of documents)",
+            "Hierarchical topic_words preserved but not used for matching (topic_names used instead)",
+            "Topic Word Overlap metric reports 0.0 (not applicable for semantic labels)",
             "No c-TF-IDF scores (HiCode doesn't provide them)",
-            "No probabilities (HiCode doesn't compute topic probabilities)",
-            "Natural language topic names used directly (not converted to labels)"
+            "No probabilities (HiCode doesn't compute topic probabilities)"
         ],
         **config_params
     }
@@ -603,10 +601,11 @@ def run_hicode_evaluation(
     # Define sampling methods
     methods = [
         'random_uniform',
+        'keyword_search',
+        'sbert',
         'direct_retrieval',
         'direct_retrieval_mmr',
         'query_expansion',
-        'keyword_search',
         'retrieval_random'
     ]
 
