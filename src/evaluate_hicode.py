@@ -309,26 +309,36 @@ def convert_hicode_to_standard_format(
 # SECTION 2: EVALUATION PIPELINE
 # =============================================================================
 
-def load_datasets():
+def load_datasets(dataset_name: str = "trec-covid"):
     """
-    Load TREC-COVID datasets needed for evaluation.
+    Load datasets needed for evaluation.
+
+    Args:
+        dataset_name: Name of dataset to load ('trec-covid', 'doctor-reviews', etc.)
 
     Returns:
         Tuple of (corpus_dataset, queries_dataset, qrels_dataset)
+        Note: qrels_dataset may be None for datasets without relevance judgments
     """
-    logger.info("Loading TREC-COVID datasets...")
+    logger.info(f"Loading {dataset_name} dataset...")
 
-    from datasets import load_dataset
+    from dataset_loaders import load_dataset as load_dataset_flexible
 
-    corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
-    queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
-    qrels_dataset = load_dataset("BeIR/trec-covid-qrels", split="test")
+    corpus_dataset, queries_dataset, qrels_dataset = load_dataset_flexible(dataset_name)
 
-    logger.info(
-        f"✓ Loaded {len(corpus_dataset)} documents, "
-        f"{len(queries_dataset)} queries, "
-        f"{len(qrels_dataset)} qrels"
-    )
+    # Handle datasets without qrels (e.g., doctor-reviews)
+    if qrels_dataset is not None:
+        logger.info(
+            f"✓ Loaded {len(corpus_dataset)} documents, "
+            f"{len(queries_dataset)} queries, "
+            f"{len(qrels_dataset)} qrels"
+        )
+    else:
+        logger.info(
+            f"✓ Loaded {len(corpus_dataset)} documents, "
+            f"{len(queries_dataset)} queries "
+            f"(no qrels available for {dataset_name})"
+        )
 
     return corpus_dataset, queries_dataset, qrels_dataset
 
@@ -610,7 +620,7 @@ def run_hicode_evaluation(
     ]
 
     # Load datasets
-    corpus_dataset, queries_dataset, qrels_dataset = load_datasets()
+    corpus_dataset, queries_dataset, qrels_dataset = load_datasets(dataset_name)
 
     # Get query text
     query_text = None
@@ -688,15 +698,22 @@ def run_hicode_evaluation(
     logger.info("  ✓ Embedding model loaded")
 
     # Build qrels_dict (needed for relevant_concentration metric)
+    # Note: qrels_dataset may be None for datasets without relevance judgments
     from collections import defaultdict
     evaluator.qrels_dict = defaultdict(dict)
-    for qid, cid, score in zip(qrels_dataset["query-id"],
-                                qrels_dataset["corpus-id"],
-                                qrels_dataset["score"]):
-        evaluator.qrels_dict[qid][cid] = score
+    if qrels_dataset is not None:
+        for qid, cid, score in zip(qrels_dataset["query-id"],
+                                    qrels_dataset["corpus-id"],
+                                    qrels_dataset["score"]):
+            evaluator.qrels_dict[qid][cid] = score
+        logger.info(f"  ✓ Built qrels_dict for {len(evaluator.qrels_dict)} queries")
+    else:
+        logger.info(f"  ⚠ No qrels available for {dataset_name} - relevant_concentration metric will be 0")
 
     # Load IDF scores (needed for topic_specificity metric)
-    idf_cache_path = "cache/corpus_171332/idf_scores.pkl"
+    # IDF cache path is based on corpus size
+    corpus_size = len(corpus_dataset)
+    idf_cache_path = f"cache/corpus_{corpus_size}/idf_scores.pkl"
     if os.path.exists(idf_cache_path):
         import pickle
         with open(idf_cache_path, 'rb') as f:

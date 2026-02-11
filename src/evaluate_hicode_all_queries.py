@@ -232,6 +232,12 @@ def main():
         default="/home/srangre1/results",
         help="Output directory for evaluation results"
     )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="trec-covid",
+        help="Dataset name: 'trec-covid' or 'doctor-reviews' (default: trec-covid)"
+    )
 
     args = parser.parse_args()
 
@@ -245,7 +251,7 @@ def main():
     # Model configuration
     SAMPLE_SIZE = 1000
     EMBEDDING_MODEL = "all-mpnet-base-v2"
-    DATASET_NAME = "trec-covid"
+    DATASET_NAME = args.dataset_name
 
     # Device configuration - auto-detect if not specified
     DEVICE = args.device if args.device else get_available_device()
