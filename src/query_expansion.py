@@ -846,7 +846,7 @@ def main():
     HYBRID_STRATEGY = HybridStrategy.SIMPLE_SUM
     USE_MMR = False
     USE_CROSS_ENCODER_BASELINE = False
-    MMR_LAMBDA = 0.5
+    MMR_LAMBDA = 0.3  # Higher diversity (70% diversity, 30% relevance)
     HYBRID_WEIGHT = 0.5
     
     # ===== MODEL PARAMETERS =====
@@ -990,6 +990,7 @@ def main():
             method=config["retrieval_method"],
             hybrid_strategy=config["hybrid_strategy"],
             use_mmr=config["use_mmr"],
+            mmr_lambda=MMR_LAMBDA,
             use_cross_encoder=config["use_cross_encoder"]
         )
 
