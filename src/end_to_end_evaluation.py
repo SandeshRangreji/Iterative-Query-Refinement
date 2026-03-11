@@ -136,13 +136,13 @@ METHOD_COLORS = {
 
 # Font sizes for publication-quality figures
 FONT_SIZES = {
-    'figure_title': 20,      # Main plot title
-    'subplot_title': 16,     # Individual subplot titles
-    'axis_label': 15,        # X/Y axis labels
-    'tick_label': 13,        # Axis tick labels
-    'legend': 13,            # Legend text
-    'annotation': 12,        # Heatmap cell annotations
-    'suptitle': 22          # Figure suptitle
+    'figure_title': 24,      # Main plot title
+    'subplot_title': 20,     # Individual subplot titles
+    'axis_label': 20,        # X/Y axis labels
+    'tick_label': 17,        # Axis tick labels
+    'legend': 16,            # Legend text
+    'annotation': 15,        # Heatmap cell annotations
+    'suptitle': 26          # Figure suptitle
 }
 
 
@@ -4244,7 +4244,7 @@ def _generate_aggregate_visualizations(
                     pivot_data[i, i] = 1.0
 
             # Create heatmap
-            fig, ax = plt.subplots(figsize=(10, 8))
+            fig, ax = plt.subplots(figsize=(12, 10))
 
             # Determine color scale
             if is_diff_metric:
@@ -4267,12 +4267,15 @@ def _generate_aggregate_visualizations(
                 xticklabels=methods,
                 yticklabels=methods,
                 ax=ax,
+                annot_kws={'size': FONT_SIZES['annotation']},
                 cbar_kws={'label': title}
             )
 
-            ax.set_title(f'{title}\n(Averaged Across Queries)', fontsize=14, fontweight='bold')
-            ax.set_xlabel('Method B', fontsize=11)
-            ax.set_ylabel('Method A', fontsize=11)
+            ax.set_title(f'{title}\n(Averaged Across Queries)',
+                         fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+            ax.set_xlabel('Method B', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.set_ylabel('Method A', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
             plt.tight_layout()
 
@@ -4691,13 +4694,15 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
             'column': 'diversity_semantic',
             'title': 'Semantic Diversity',
             'ylabel': 'Diversity (higher = more distinct topics)',
-            'filename': 'aggregate_semantic_diversity'
+            'filename': 'aggregate_semantic_diversity',
+            'horizontal': True
         },
         {
             'column': 'relevant_topic_diversity',
             'title': 'Relevant Topic Diversity',
             'ylabel': 'Diversity among query-relevant topics (similarity ≥ 0.5)',
-            'filename': 'aggregate_relevant_topic_diversity'
+            'filename': 'aggregate_relevant_topic_diversity',
+            'horizontal': True
         },
         {
             'column': 'n_relevant_topics',
@@ -4731,41 +4736,71 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         stats['display_name'] = stats['method'].map({m: _get_display_name(m) for m in methods})
 
         # ===== Plot 1: Bar chart with ±1 Std Error Bars =====
-        fig, ax = plt.subplots(figsize=(12, 7))
-
+        is_horizontal = metric_info.get('horizontal', False)
         x_pos = np.arange(len(stats))
-        bars = ax.bar(
-            x_pos,
-            stats['mean'],
-            yerr=stats['std'],
-            color=[METHOD_COLORS[m] for m in stats['method']],
-            capsize=6,
-            alpha=0.8,
-            edgecolor='black',
-            linewidth=1.5,
-            error_kw={'elinewidth': 2, 'capthick': 2}
-        )
+        bar_colors = [METHOD_COLORS[m] for m in stats['method']]
 
-        # Add value labels on top of bars
-        for bar, mean_val, std_val in zip(bars, stats['mean'], stats['std']):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + std_val + 0.01,
-                f'{mean_val:.3f}',
-                ha='center', va='bottom',
-                fontsize=11, fontweight='bold'
+        if is_horizontal:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            bars = ax.barh(
+                x_pos,
+                stats['mean'],
+                xerr=stats['std'],
+                color=bar_colors,
+                capsize=6,
+                alpha=0.8,
+                edgecolor='black',
+                linewidth=1.5,
+                error_kw={'elinewidth': 2, 'capthick': 2}
             )
+            for bar, mean_val, std_val in zip(bars, stats['mean'], stats['std']):
+                ax.text(
+                    mean_val + std_val + 0.005,
+                    bar.get_y() + bar.get_height() / 2,
+                    f'{mean_val:.3f}',
+                    ha='left', va='center',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold'
+                )
+            ax.set_yticks(x_pos)
+            ax.set_yticklabels(stats['display_name'], fontsize=FONT_SIZES['tick_label'])
+            ax.set_ylabel('Sampling Method', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.set_xlabel(ylabel, fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.grid(axis='x', alpha=0.3)
+            ax.invert_yaxis()
+            if stats['mean'].min() >= 0:
+                ax.set_xlim(left=0)
+        else:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            bars = ax.bar(
+                x_pos,
+                stats['mean'],
+                yerr=stats['std'],
+                color=bar_colors,
+                capsize=6,
+                alpha=0.8,
+                edgecolor='black',
+                linewidth=1.5,
+                error_kw={'elinewidth': 2, 'capthick': 2}
+            )
+            for bar, mean_val, std_val in zip(bars, stats['mean'], stats['std']):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + std_val + 0.01,
+                    f'{mean_val:.3f}',
+                    ha='center', va='bottom',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold'
+                )
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(stats['display_name'], fontsize=FONT_SIZES['tick_label'])
+            ax.set_xlabel('Sampling Method', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.set_ylabel(ylabel, fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.grid(axis='y', alpha=0.3)
+            if stats['mean'].min() >= 0:
+                ax.set_ylim(bottom=0)
 
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(stats['display_name'], fontsize=11)
-        ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
-        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
-        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 1 Std)', fontsize=14, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
-
-        # Set y-axis to start from 0 if all values are positive
-        if stats['mean'].min() >= 0:
-            ax.set_ylim(bottom=0)
+        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 1 Std)',
+                     fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
         plt.tight_layout()
         plot_path = os.path.join(plots_dir, f'{filename_base}.png')
@@ -4774,40 +4809,67 @@ def plot_aggregate_bar_charts(all_per_method: pd.DataFrame, plots_dir: str):
         logger.info(f"✓ Saved {plot_path}")
 
         # ===== Plot 2: Bar chart with 95% CI Error Bars =====
-        fig, ax = plt.subplots(figsize=(12, 7))
-
-        bars = ax.bar(
-            x_pos,
-            stats['mean'],
-            yerr=stats['ci_95'],
-            color=[METHOD_COLORS[m] for m in stats['method']],
-            capsize=6,
-            alpha=0.8,
-            edgecolor='black',
-            linewidth=1.5,
-            error_kw={'elinewidth': 2, 'capthick': 2}
-        )
-
-        # Add value labels on top of bars
-        for bar, mean_val, ci_val in zip(bars, stats['mean'], stats['ci_95']):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + ci_val + 0.01,
-                f'{mean_val:.3f}',
-                ha='center', va='bottom',
-                fontsize=11, fontweight='bold'
+        if is_horizontal:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            bars = ax.barh(
+                x_pos,
+                stats['mean'],
+                xerr=stats['ci_95'],
+                color=bar_colors,
+                capsize=6,
+                alpha=0.8,
+                edgecolor='black',
+                linewidth=1.5,
+                error_kw={'elinewidth': 2, 'capthick': 2}
             )
+            for bar, mean_val, ci_val in zip(bars, stats['mean'], stats['ci_95']):
+                ax.text(
+                    mean_val + ci_val + 0.005,
+                    bar.get_y() + bar.get_height() / 2,
+                    f'{mean_val:.3f}',
+                    ha='left', va='center',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold'
+                )
+            ax.set_yticks(x_pos)
+            ax.set_yticklabels(stats['display_name'], fontsize=FONT_SIZES['tick_label'])
+            ax.set_ylabel('Sampling Method', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.set_xlabel(ylabel, fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.grid(axis='x', alpha=0.3)
+            ax.invert_yaxis()
+            if stats['mean'].min() >= 0:
+                ax.set_xlim(left=0)
+        else:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            bars = ax.bar(
+                x_pos,
+                stats['mean'],
+                yerr=stats['ci_95'],
+                color=bar_colors,
+                capsize=6,
+                alpha=0.8,
+                edgecolor='black',
+                linewidth=1.5,
+                error_kw={'elinewidth': 2, 'capthick': 2}
+            )
+            for bar, mean_val, ci_val in zip(bars, stats['mean'], stats['ci_95']):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + ci_val + 0.01,
+                    f'{mean_val:.3f}',
+                    ha='center', va='bottom',
+                    fontsize=FONT_SIZES['annotation'], fontweight='bold'
+                )
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(stats['display_name'], fontsize=FONT_SIZES['tick_label'])
+            ax.set_xlabel('Sampling Method', fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.set_ylabel(ylabel, fontsize=FONT_SIZES['axis_label'], fontweight='bold')
+            ax.grid(axis='y', alpha=0.3)
+            if stats['mean'].min() >= 0:
+                ax.set_ylim(bottom=0)
 
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels(stats['display_name'], fontsize=11)
-        ax.set_xlabel('Sampling Method', fontsize=12, fontweight='bold')
-        ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
-        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 95% CI)', fontsize=14, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
-
-        # Set y-axis to start from 0 if all values are positive
-        if stats['mean'].min() >= 0:
-            ax.set_ylim(bottom=0)
+        ax.set_title(f'{title_base}\nAggregated Across Queries (Mean ± 95% CI)',
+                     fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
 
         plt.tight_layout()
         plot_path = os.path.join(plots_dir, f'{filename_base}_95ci.png')
@@ -4964,8 +5026,8 @@ def main():
     """Main function"""
 
     # ===== DATASET SELECTION =====
-    # Options: "trec-covid", "doctor-reviews"
-    DATASET_NAME = "trec-covid"
+    # Options: "trec-covid", "doctor-reviews" (can be overridden via DATASET env var)
+    DATASET_NAME = os.environ.get("DATASET", "trec-covid")
 
     # ===== DATASET-SPECIFIC CONFIGURATION =====
     DATASET_CONFIGS = {
@@ -4998,8 +5060,8 @@ def main():
     EMBEDDING_MODEL = "all-mpnet-base-v2"
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-    # Topic modeling configuration
-    TOPIC_MODEL_TYPE = "topicgpt"  # Options: "bertopic", "lda", "topicgpt"
+    # Topic modeling configuration (can be overridden via MODEL env var)
+    TOPIC_MODEL_TYPE = os.environ.get("MODEL", "bertopic")  # Options: "bertopic", "lda", "topicgpt"
 
     # TopicGPT parameters - ACTIVE CONFIGURATION
     # Requires OPENAI_API_KEY environment variable
@@ -5157,7 +5219,7 @@ def main():
     # CURRENT MODE: trec-covid dataset with TopicGPT - FULL RUN
     FORCE_REGENERATE_SAMPLES = False      # Use cached samples
     FORCE_REGENERATE_TOPICS = False       # Use cached TopicGPT topics (will generate if not cached)
-    FORCE_REGENERATE_EVALUATION = False   # Use cached evaluation if available
+    FORCE_REGENERATE_EVALUATION = True    # Regenerate evaluation/plots from cached topics
 
     # Random seed
     RANDOM_SEED = 42
