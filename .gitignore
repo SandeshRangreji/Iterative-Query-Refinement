@@ -193,5 +193,5 @@ results/*
 *.err
 *.out
 
-# CLSP Grid experiment results
-clsp_grid_files/
+# HPC experiment results
+hpc_results/

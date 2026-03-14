@@ -223,13 +223,13 @@ def main():
     parser.add_argument(
         "--samples-dir",
         type=str,
-        default="/home/srangre1/results/trec-covid/bertopic",
+        default="results/trec-covid/bertopic",
         help="Base directory containing samples"
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/home/srangre1/results",
+        default="results",
         help="Output directory for evaluation results"
     )
     parser.add_argument(

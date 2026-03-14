@@ -824,8 +824,8 @@ def main():
     QUERY_ID = "43"
 
     # Paths
-    HICODE_DIR = "/home/srangre1/results/trec-covid/hicode/query_43/topic_models"
-    SAMPLES_DIR = "/home/srangre1/results/trec-covid/hicode/query_43/samples"
+    HICODE_DIR = "results/trec-covid/hicode/query_43/topic_models"
+    SAMPLES_DIR = "results/trec-covid/hicode/query_43/samples"
     OUTPUT_DIR = "results"
 
     # Model configuration

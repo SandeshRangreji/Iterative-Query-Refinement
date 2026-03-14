@@ -9,7 +9,7 @@ Uses the same parameters as TREC-COVID keyword extraction:
 - mpnet embeddings
 - ngram range 1-2
 
-Saves to: /home/srangre1/cache/keywords/doctor_reviews_keybert.json
+Saves to: cache/keywords/doctor_reviews_keybert.json
 """
 
 import os
@@ -40,8 +40,8 @@ def main():
     print()
 
     # ===== Configuration (matching TREC-COVID parameters) =====
-    CORPUS_PATH = '/home/srangre1/datasets/doctor_reviews_family_med_filtered'
-    OUTPUT_PATH = '/home/srangre1/cache/keywords/doctor_reviews_keybert.json'
+    CORPUS_PATH = 'datasets/doctor_reviews_family_med_filtered'
+    OUTPUT_PATH = 'cache/keywords/doctor_reviews_keybert.json'
     DATASET_NAME = 'doctor-reviews'
 
     # Keyword extraction parameters (same as TREC-COVID)

@@ -20,7 +20,7 @@ from pathlib import Path
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (14, 10)
 
-def extract_intrinsic_metrics(results_dir="/home/srangre1/results/end_to_end_evaluation"):
+def extract_intrinsic_metrics(results_dir="results/end_to_end_evaluation"):
     """Extract intrinsic metrics from all queries"""
 
     queries = ["2", "9", "27", "43"]
@@ -75,7 +75,7 @@ def extract_intrinsic_metrics(results_dir="/home/srangre1/results/end_to_end_eva
 
     return pd.DataFrame(data)
 
-def create_intrinsic_visualizations(df, output_dir="/home/srangre1/results/end_to_end_evaluation/intrinsic_metrics"):
+def create_intrinsic_visualizations(df, output_dir="results/end_to_end_evaluation/intrinsic_metrics"):
     """Create visualizations for intrinsic metrics"""
 
     os.makedirs(output_dir, exist_ok=True)
@@ -347,7 +347,7 @@ def main():
 
     print("\n" + "="*80)
     print("✓ All visualizations saved to:")
-    print("  /home/srangre1/results/end_to_end_evaluation/intrinsic_metrics/")
+    print("  results/end_to_end_evaluation/intrinsic_metrics/")
     print("="*80)
 
 if __name__ == "__main__":

@@ -50,7 +50,7 @@ class PairwiseEvaluator:
         Initialize pairwise evaluator
 
         Args:
-            results_dir: Base results directory (e.g., "/home/srangre1/results/end_to_end_evaluation")
+            results_dir: Base results directory (e.g., "results/end_to_end_evaluation")
             query_id: Query ID to evaluate
             include_full_corpus: Whether to include full_corpus in comparisons (default: False)
             embedding_model: Sentence transformer model for embeddings
@@ -691,7 +691,7 @@ def main():
     # ===== CONFIGURATION PARAMETERS =====
     # Modify these parameters as needed
 
-    RESULTS_DIR = "/home/srangre1/results/end_to_end_evaluation"
+    RESULTS_DIR = "results/end_to_end_evaluation"
     QUERY_ID = "9"
     INCLUDE_FULL_CORPUS = False  # Set to True if you have full_corpus results
     EMBEDDING_MODEL = "all-mpnet-base-v2"

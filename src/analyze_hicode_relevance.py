@@ -275,8 +275,8 @@ def main():
 
     # ===== CONFIGURATION =====
     QUERY_ID = '43'
-    HICODE_DIR = '/home/srangre1/results/trec-covid/hicode/query_43/topic_models'
-    OUTPUT_DIR = '/home/srangre1/results/trec-covid/hicode/query_43/results/topics_summary'
+    HICODE_DIR = 'results/trec-covid/hicode/query_43/topic_models'
+    OUTPUT_DIR = 'results/trec-covid/hicode/query_43/results/topics_summary'
 
     METHODS = [
         'random_uniform',

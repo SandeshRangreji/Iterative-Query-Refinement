@@ -452,7 +452,7 @@ summary = {
     }
 }
 
-output_file = '/home/srangre1/Iterative-Query-Refinement/family_medicine_quality_analysis.json'
+output_file = 'family_medicine_quality_analysis.json'
 with open(output_file, 'w') as f:
     json.dump(summary, f, indent=2)
 

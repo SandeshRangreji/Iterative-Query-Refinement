@@ -163,11 +163,11 @@ print(f'  - vs 200K target: {(final_count/200000)*100:.0f}% ({final_count - 2000
 print()
 
 # Save exact count to file
-with open('/home/srangre1/Iterative-Query-Refinement/exact_filtered_count.txt', 'w') as f:
+with open('exact_filtered_count.txt', 'w') as f:
     f.write(f'EXACT FILTERED COUNT: {final_count:,} reviews\n')
     f.write(f'Doctors: {final_doctors:,}\n')
     f.write(f'Date: 2026-01-13\n')
 
-print('Count saved to: /home/srangre1/Iterative-Query-Refinement/exact_filtered_count.txt')
+print('Count saved to: exact_filtered_count.txt')
 print()
 print('='*80)

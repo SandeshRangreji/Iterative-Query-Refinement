@@ -1122,7 +1122,7 @@ class EndToEndEvaluator:
             keyword_cache_path = self.keyword_cache_path
             if keyword_cache_path is None:
                 # Default to TREC-COVID keywords for backward compatibility
-                keyword_cache_path = "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json"
+                keyword_cache_path = "cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json"
 
             if not os.path.exists(keyword_cache_path):
                 raise FileNotFoundError(f"Keyword cache not found: {keyword_cache_path}")
@@ -1403,7 +1403,7 @@ class EndToEndEvaluator:
         Returns:
             Number of topics found by BERTopic for this query/method, or 20 if not found
         """
-        bertopic_csv = f"/home/srangre1/results/trec-covid/bertopic/query_{self.query_id}/results/per_method_summary.csv"
+        bertopic_csv = f"results/trec-covid/bertopic/query_{self.query_id}/results/per_method_summary.csv"
 
         if os.path.exists(bertopic_csv):
             try:
@@ -5033,11 +5033,11 @@ def main():
     DATASET_CONFIGS = {
         "trec-covid": {
             "query_ids": ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"],
-            "keyword_cache_path": "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json",
+            "keyword_cache_path": "cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json",
         },
         "doctor-reviews": {
             "query_ids": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
-            "keyword_cache_path": "/home/srangre1/cache/keywords/doctor_reviews_keybert.json",
+            "keyword_cache_path": "cache/keywords/doctor_reviews_keybert.json",
         }
     }
 

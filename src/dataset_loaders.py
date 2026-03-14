@@ -77,7 +77,7 @@ def _load_doctor_reviews():
     """
     from datasets import load_from_disk, Dataset
 
-    CORPUS_PATH = '/home/srangre1/datasets/doctor_reviews_family_med_filtered'
+    CORPUS_PATH = 'datasets/doctor_reviews_family_med_filtered'
 
     logger.info("Loading Doctor Reviews dataset...")
 

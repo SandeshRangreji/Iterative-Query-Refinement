@@ -313,7 +313,7 @@ if text_col:
         'median_word_count': float(sample_reviews['word_count'].median())
     }
 
-output_file = '/home/srangre1/Iterative-Query-Refinement/family_medicine_20plus_analysis.json'
+output_file = 'family_medicine_20plus_analysis.json'
 with open(output_file, 'w') as f:
     json.dump(summary, f, indent=2)
 

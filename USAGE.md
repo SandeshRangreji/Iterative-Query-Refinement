@@ -4,7 +4,7 @@
 
 ### Local Execution
 ```bash
-cd /home/srangre1/Iterative-Query-Refinement
+cd <PROJECT_ROOT>
 conda activate coreset_proj
 python src/end_to_end_evaluation.py
 ```
@@ -160,7 +160,7 @@ FORCE_REGENERATE_EVALUATION = True # Generate LDA results
 
 The special value `"auto"` makes LDA match BERTopic's discovered topic counts:
 
-1. Reads: `/home/srangre1/results/trec-covid/bertopic/query_{id}/results/per_method_summary.csv`
+1. Reads: `results/trec-covid/bertopic/query_{id}/results/per_method_summary.csv`
 2. Extracts `n_topics` for each sampling method
 3. Uses those exact values for LDA training
 4. **Result**: Perfect apples-to-apples comparison!
@@ -653,7 +653,7 @@ pip install cuml-cu11     # GPU-accelerated clustering
 
 **Error:**
 ```
-FileNotFoundError: Keyword cache not found: /home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json
+FileNotFoundError: Keyword cache not found: cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json
 ```
 
 **Cause:** Query expansion method requires pre-extracted KeyBERT keywords

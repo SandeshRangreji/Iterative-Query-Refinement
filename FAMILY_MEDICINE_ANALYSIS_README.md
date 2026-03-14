@@ -7,7 +7,7 @@ This directory contains scripts to analyze the **Family Medicine ≥20 reviews**
 ### Run the Analysis
 
 ```bash
-cd /home/srangre1
+cd <PROJECT_ROOT>
 sbatch analyze_family_medicine.sh
 ```
 

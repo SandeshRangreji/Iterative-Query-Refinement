@@ -39,7 +39,7 @@ print()
 # ============================================================================
 METADATA_PATH = '/export/fs06/mzhong8/doctor_review_metadata'
 CORPUS_PATH = '/export/fs06/mzhong8/doctor_review_corpus'
-OUTPUT_PATH = '/home/srangre1/datasets/doctor_reviews_family_med_filtered'
+OUTPUT_PATH = 'datasets/doctor_reviews_family_med_filtered'
 
 # ============================================================================
 # Step 1: Load data

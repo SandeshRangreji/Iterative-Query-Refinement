@@ -392,7 +392,7 @@ queries = [
 QUERY_IDS = ["1", "2"]  # Just 2 queries for testing
 
 # Run
-sbatch /home/srangre1/run_search.sh
+sbatch run_search.sh
 ```
 
 ---

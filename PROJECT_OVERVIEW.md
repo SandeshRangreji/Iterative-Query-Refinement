@@ -236,7 +236,7 @@ Three-tier caching for efficient experimentation:
 ### Running the Evaluation
 
 ```bash
-cd /home/srangre1/Iterative-Query-Refinement
+cd <PROJECT_ROOT>
 conda activate coreset_proj
 python src/end_to_end_evaluation.py
 ```
