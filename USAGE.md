@@ -156,7 +156,7 @@ These are baked into the Python source as literal strings, not exposed via env v
 | `regenerate_diversity_plots.py` | `/home/srangre1/results/trec-covid/...` | Legacy utility, stale paths regardless — see GRID_WORKFLOW.md |
 | `grid/*.sh` | `CONFIGURATION` block at top of each script | See [GRID_WORKFLOW.md](GRID_WORKFLOW.md) |
 
-`OUTPUT_DIR = "results"` in `end_to_end_evaluation.py`'s `main()` is a *relative* path — where it resolves to depends on your working directory when you launch the script. The results referenced throughout this project's reports live under `/home/srangre1/results` (i.e. the script was launched from `/home/srangre1/`, not from inside the repo). If you run from inside the repo instead, you'll get a separate, disconnected `results/` tree inside it — don't assume the two are the same or in sync. This is exactly what happened here: see [TRANSITION_PLAN.md](TRANSITION_PLAN.md) for the validated evidence on which copy is real.
+`OUTPUT_DIR = "results"` in `end_to_end_evaluation.py`'s `main()` is a *relative* path — where it resolves to depends on your working directory when you launch the script. The results referenced throughout this project's reports live under `/home/srangre1/results` (i.e. the script was launched from `/home/srangre1/`, not from inside the repo). If you run from inside the repo instead, you'll get a separate, disconnected `results/` tree inside it — don't assume the two are the same or in sync.
 
 ---
 

@@ -1,0 +1,185 @@
+# Run Configuration Reference
+
+This is the verified record of what configuration has actually been used to produce the current results, and the checklist for standing up a new dataset against the same methodology.
+
+**This is not the same document as `USAGE.md`.** `USAGE.md` documents the knobs that exist and how to turn them. This document records the specific *values* that produced `/home/srangre1/results/`, verified against source code and cached output — and is explicit about the one place those two didn't match.
+
+## Read this first: why `config.json` is not the source of truth
+
+`main()` in `src/end_to_end_evaluation.py` has **one shared, hand-edited `TOPIC_MODEL_PARAMS` variable** that you repoint between BERTopic/LDA/TopicGPT sequentially (per `USAGE.md`'s documented workflow). Every saved `config.json` — regardless of which model that run actually used — dumps whatever this variable was set to *at save time*, not a model-specific record. Concretely, every `config.json` on disk right now, for every model type and both datasets, contains an identical `topic_model_params` blob including TopicGPT-only fields — because `TOPIC_MODEL_PARAMS` currently sits on TopicGPT's config in the source.
+
+This is harmless for BERTopic (its real tunables are internal `TopicModelWrapper` defaults, not something you pass via `main()` anyway) but it means **`config.json` cannot answer "what did the LDA run actually use."** The values below for LDA were recovered from the cached topic-model output and source defaults, not from `config.json` — and one inconsistency was found in the process (see Caveats).
+
+**Verification hierarchy used throughout this doc:** cached output (`per_method_summary.csv` `n_topics` values, actual file paths written) > source code defaults (`topic_models.py`, `search.py`) > `config.json` (least reliable — reflects `main()`'s state at last save, not at fit time).
+
+---
+
+## Fixed, verified settings (pipeline-wide, both datasets)
+
+| Setting | Value | Verified via |
+|---|---|---|
+| Sample size | 1000 docs/method | `config.json` (consistent across all configs checked) |
+| Random seed | 42 | `config.json`, `TopicModelWrapper` LDA default |
+| Pipeline embedding model (`EMBEDDING_MODEL`) | `all-mpnet-base-v2` | `config.json`, drives retrieval/BERTopic/KeyBERT |
+| Metrics embedding models | Both `all-mpnet-base-v2` and `BAAI/bge-base-en-v1.5` computed | 168 tagged result subdirectories on disk |
+| Cross-encoder model configured | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `config.json` |
+| Cross-encoder actually used in Stage 4 sampling | **Never** — see Caveats | `grep use_cross_encoder` → `False` at all 7 call sites in `end_to_end_evaluation.py` |
+| Force flags (observed) | `samples=False, topics=False, evaluation=True` | Consistent across every `config.json` checked — i.e. official runs typically re-evaluate against already-cached samples/topics, not full cold runs |
+
+---
+
+## Stage 1 — Indexing (verified defaults, not overridden by the main pipeline)
+
+`end_to_end_evaluation.py`'s `_initialize_search_indices()` calls `IndexManager.build_bm25_index()`/`.build_sbert_index()` passing only `dataset_name`, `model_name=self.embedding_model_name`, `batch_size=64`, and `force_reindex=False` — everything else falls through to `IndexManager`'s own signature defaults in `src/search.py`:
+
+| Parameter | Value | Source |
+|---|---|---|
+| BM25 `b_param` | 0.75 | `IndexManager.build_bm25_index` default |
+| BM25 `k1_param` | 1.5 | same |
+| BM25 `epsilon` | 0.25 | same |
+| BM25 `stemmer` | `porter` | same |
+| SBERT `batch_size` | 64 | explicit in `_initialize_search_indices` |
+| SBERT `max_seq_length` | model default (not set) | `build_sbert_index` default `None` |
+| SBERT `normalize_embeddings` | `True` | `build_sbert_index` default |
+| `force_reindex` | `False`, hardcoded — no config flag in the main pipeline to force a rebuild | `_initialize_search_indices` |
+
+**Note:** `build_sbert_index`'s own function-signature default for `model_name` is `sentence-transformers/msmarco-MiniLM-L6-cos-v5` — this is never actually used, since the main pipeline always passes `model_name=self.embedding_model_name` explicitly. Don't be misled by that default if reading the function signature directly.
+
+---
+
+## Stage 3 — Keyword generation (verified via cache filename + source)
+
+Identical parameters used by both `keyword_extraction.py main()` (TREC-COVID) and `generate_doctor_review_keywords.py` (doctor-reviews) — confirmed because the cache filename is a deterministic function of these exact values (`KeywordExtractor._generate_keywords_cache_path()`):
+
+| Parameter | Value |
+|---|---|
+| `num_keywords` | 10 |
+| `diversity` | 0.7 |
+| `top_k_docs` (retrieval pool for extraction) | 1000 |
+| `top_n_docs_for_extraction` | 10 |
+| `keyphrase_ngram_range` | (1, 2) |
+| Embedding model | `all-mpnet-base-v2` |
+| Retrieval method for candidate docs | Hybrid, Simple-Sum fusion |
+
+**Coverage:** TREC-COVID — all 50 possible query IDs cached (only 15 are used by `DATASET_CONFIGS`). Doctor-reviews — only queries `1`-`6` of 11 cached; queries `7`-`11` fall back to `direct_retrieval` at runtime (see `CACHING.md`). **If standing up a new dataset, generate keywords for every query ID you intend to use before running Stage 4** — this gap is the single most common way a new dataset silently ends up with a degenerate `query_expansion` method.
+
+---
+
+## Stage 4 — Per-sampling-method parameters (verified, file:line in `src/end_to_end_evaluation.py`)
+
+| Method | Verified parameters |
+|---|---|
+| `random_uniform` (`:1416`) | No parameters |
+| `keyword_search` (`:1550`) | BM25 only, `top_k=SAMPLE_SIZE` |
+| `sbert` (`:1580`) | SBERT only |
+| `direct_retrieval` (`:1447`) | Hybrid, `HybridStrategy.SIMPLE_SUM`, `use_mmr=False`, `use_cross_encoder=False` |
+| `direct_retrieval_mmr` (`:1610`) | Candidate pool = 5000 (hardcoded), `lambda_param=0.3` (hardcoded, 30% relevance / 70% diversity) |
+| `query_expansion` (`:1478`) | Weighted RRF: 0.7 baseline + 0.3 split across keywords (hardcoded); `HybridStrategy.SIMPLE_SUM` for baseline and each keyword search |
+| `retrieval_random` (`:1700`) | `pool_size=5000` (function default, never overridden — confirmed the one call site at `:3826` passes no argument) |
+
+None of these per-method internals are exposed as `main()`-level config — changing any of them means editing the method body directly.
+
+---
+
+## Stage 4 — Per-topic-model parameters (verified against `topic_models.py`, not `config.json`)
+
+### BERTopic
+
+Confirmed via `TopicModelWrapper._fit_bertopic()` — `main()`'s `TOPIC_MODEL_PARAMS` does not currently override any of these (commented out in source):
+
+| Parameter | Value |
+|---|---|
+| `min_cluster_size` (HDBSCAN) | 5 |
+| `metric` (HDBSCAN) | euclidean |
+| `cluster_selection_method` (HDBSCAN) | eom |
+| `prediction_data` | True |
+| Dimensionality reduction | BERTopic's library-default UMAP (not overridden anywhere in this codebase) |
+| Vectorizer | `CountVectorizer(stop_words='english', min_df=2, ngram_range=(1,2), max_features=10000)` |
+| `calculate_probabilities` | True |
+
+### LDA — ⚠️ see Caveats before trusting this for a new run
+
+`TopicModelWrapper._fit_lda()`'s own fallback defaults (used whenever a key isn't in `topic_model_params`):
+
+| Parameter | Fallback value |
+|---|---|
+| `n_topics` | 20 (or resolved via `_get_bertopic_n_topics()` **only if** `topic_model_params["n_topics"] == "auto"` is explicitly set at fit time) |
+| `alpha` | symmetric |
+| `eta` | 0.01 |
+| `passes` | 15 |
+| `iterations` | 100 |
+| `random_state` | 42 |
+| `workers` | 20 |
+
+**What actually happened for the current TREC-COVID LDA results (query 43, verified by comparing cached `n_topics` output, not `config.json`):** BERTopic's per-method topic counts are `46, 45, 42, 37, 33, 44, 38`. LDA's are `30, 30, 42, 30, 30, 30, 30` — only `sbert` (42=42) matches. The "auto" BERTopic-matching intent (currently commented out in `main()`) evidently resolved correctly at some earlier fit time for six methods (all landing on 30, suggesting BERTopic's own counts were different — likely lower and more uniform — when those LDA models were originally fit) and separately for `sbert` later, after BERTopic's numbers had already reached their current values. Because topic models are cached and not refit on every run, this mismatch is now baked into the cached LDA results and won't self-correct. **This has not been checked beyond query 43 or beyond TREC-COVID** — treat any claim resting on "LDA matches BERTopic's topic count" as unverified until checked further or the LDA models are refit with `n_topics: "auto"` explicitly active.
+
+### TopicGPT
+
+Currently the active block in `main()`'s `TOPIC_MODEL_PARAMS` (confirmed matching `config.json` for topicgpt runs):
+
+| Parameter | Value |
+|---|---|
+| `generation_model` | `gpt-4o-mini` |
+| `assignment_model` | `gpt-4o-mini` |
+| `generation_sample_size` | 500 |
+| `verbose` | True |
+
+### Vocabulary parameters shared across all three word/BoW-vocabulary-based models
+
+`min_df=2`, `ngram_range=(1,2)`, `max_features=10000` — confirmed identical in BERTopic's `CountVectorizer`, LDA's dictionary filtering, and TopicGPT's vocabulary step.
+
+### HiCode
+
+Not fit by this repo — evaluates an external run. Conversion settings (from its own `config.json`, which is a distinct, reliable schema — not the shared `TOPIC_MODEL_PARAMS` problem above): `multi_label_strategy: take_first_topic`, `stopword_filtering: lexical_metrics_only`.
+
+---
+
+## Statistical testing (verified defaults)
+
+| Parameter | Value | Source |
+|---|---|---|
+| BH-FDR alpha | 0.05 | Default across `benjamini_hochberg_correction`, `run_pairwise_statistical_tests`, `run_pairwise_coverage_statistical_tests` — not overridden anywhere |
+| Coverage significance thresholds | 0.5, 0.6, 0.7 | `run_pairwise_coverage_statistical_tests` |
+| Metrics tested in aggregate | 11 (see `METRICS_GUIDE.md`) | `run_aggregate_statistical_analysis`'s default `metrics_to_test` |
+
+---
+
+## Dataset-specific configuration
+
+| | TREC-COVID | Doctor-Reviews |
+|---|---|---|
+| Query IDs used | `2,9,10,13,18,21,23,24,26,27,34,43,45,47,48` (15) | `1`-`11` (11) |
+| Keyword cache path | `/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json` | `/home/srangre1/cache/keywords/doctor_reviews_keybert.json` (only covers queries 1-6) |
+| Corpus source | HuggingFace `BeIR/trec-covid`, loaded directly | Filtered via `create_filtered_doctor_corpus.py` from raw source at `/export/fs06/mzhong8/doctor_review_{metadata,corpus}` |
+| QRELs (relevance judgments) | Yes — `BeIR/trec-covid-qrels` | **No** — `end_to_end_evaluation.py:1377-1378` has explicit handling for `qrels_dataset is None`; `relevant_concentration` reads 0 for this dataset |
+
+---
+
+## New dataset checklist
+
+1. **Decide whether a corpus-prep step is needed.** If the raw data needs filtering/reshaping before use (like doctor-reviews), write an equivalent to `create_filtered_doctor_corpus.py`; if it's already in a loadable HF-style format (like TREC-COVID), skip this.
+2. **Add a loader function** to `dataset_loaders.py`'s `load_dataset()` if/else ladder.
+3. **Add an entry to `DATASET_CONFIGS`** in `end_to_end_evaluation.py`'s `main()`: `query_ids` (decide the full list up front) and `keyword_cache_path`.
+4. **Generate the keyword cache for every query ID in that list** (Stage 3) before running Stage 4 — not a subset. Verify by checking the cache JSON's key count matches `len(query_ids)`, not by assuming the script covered everything.
+5. **Determine QRELs availability.** If none exist, `relevant_concentration` will read 0 for every method — decide whether that's acceptable or whether a proxy relevance signal is needed.
+6. **Run BERTopic first**, for every method, before touching LDA — LDA's `n_topics="auto"` path depends on `per_method_summary.csv` already existing for BERTopic. Explicitly set `"n_topics": "auto"` in `TOPIC_MODEL_PARAMS` before running LDA (it is not currently the default active block), and **verify the resolved `n_topics` in LDA's own `per_method_summary.csv` matches BERTopic's, method by method, before trusting the comparison** — don't repeat the TREC-COVID gap documented above.
+7. **HiCode is a separate decision.** It requires an external HiCode run (owned by whoever has access to run it) before `evaluate_hicode.py` has anything to evaluate.
+8. **Everything in "Fixed, verified settings" above should stay unchanged** — sample size, embedding models, cross-encoder model (even though unused), vocabulary parameters, statistical test settings. Changing any of these breaks comparability with the existing TREC-COVID/doctor-reviews results.
+
+---
+
+## Caveats and open issues
+
+- **LDA topic-count matching is unverified/inconsistent for existing TREC-COVID results** — see the LDA section above. Worth resolving (refit with `n_topics: "auto"` explicitly active, or confirm current numbers are acceptable) before citing LDA-vs-BERTopic topic-count comparisons.
+- **Cross-encoder model is configured but never invoked** in Stage 4 sampling (`use_cross_encoder=False` at all 7 call sites). It's used in Stage 2's standalone `search.py` research tool, not in the pipeline that produced the current results.
+- **`config.json` is not a reliable per-run record** — see the top of this document. If this is a recurring pain point, consider having `save_config()` record the actually-*resolved* topic model parameters (post `"auto"` resolution) rather than the raw input dict, and write it once at fit time rather than on every re-evaluation-only run.
+- This document's LDA finding was checked for query 43, TREC-COVID only. It has not been checked across all 15 queries or against doctor-reviews' LDA results.
+
+---
+
+## Related documentation
+
+- [USAGE.md](USAGE.md) — what each config knob is and how to change it
+- [CACHING.md](CACHING.md) — cache tiers and invalidation behavior referenced throughout
+- [PIPELINE.md](PIPELINE.md) — architecture and stage dependencies
+- [METRICS_GUIDE.md](METRICS_GUIDE.md) — the 11 metrics covered by aggregate statistical testing

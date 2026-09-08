@@ -58,6 +58,7 @@ flowchart TD
         KE -.reused by.-> GDK[generate_doctor_review_keywords.py]
         GDK --> KW
     end
+    SE2 -->|shares Stage 3 keyword cache| KW
 
     subgraph Stage4["Stage 4: Main Pipeline (end_to_end_evaluation.py)"]
         BM25 --> EV[EndToEndEvaluator]
@@ -73,11 +74,50 @@ flowchart TD
     end
 
     subgraph Stage4b["Stage 4b: HiCode (parallel track)"]
-        EXT[/external HiCode run\n/export/fs06/.../assignment/] --> HC[evaluate_hicode.py]
+        EXT["external HiCode run (/export/fs06/.../assignment)"] --> HC[evaluate_hicode.py]
         SAMPLES -.provides doc text.-> HC
         HC -->|reuses EndToEndEvaluator metric methods| HRESULTS[(results/.../hicode/query_X/results/METRICS_TAG/)]
         HRESULTS --> HAGG[evaluate_hicode_all_queries.py: aggregate_cross_query_results]
     end
+```
+
+If Mermaid isn't rendering in your viewer (it needs an explicit renderer — GitHub/GitLab do this natively; VS Code needs a fairly recent version or the "Markdown Preview Mermaid Support" extension), here's the same flow in plain text:
+
+```
+Stage 0: Corpus Prep (doctor-reviews only)
+  create_filtered_doctor_corpus.py
+       |
+       v
+  dataset_loaders.py (load_dataset)
+       |
+       v
+Stage 1: Indexing — search.py: IndexManager
+  --> cache/indices/bm25/*.pkl
+  --> cache/indices/embeddings/*.pt
+       |
+       +-----------------------------+
+       |                             |
+       v                             v
+Stage 2: Search/Retrieval Eval    Stage 3: Keyword Generation
+  search.py main()                  keyword_extraction.py main()
+  query_expansion.py main()  <----> generate_doctor_review_keywords.py
+  (shares the keyword cache               |
+   with Stage 3 - see below!)             v
+       |                          cache/keywords/*.json
+       |                                   |
+       +-----------------+-----------------+
+                         |
+                         v
+Stage 4: Main Pipeline — end_to_end_evaluation.py: EndToEndEvaluator
+  sample_*() [7 methods] --> topic_models.py: TopicModelWrapper
+       --> metrics (evaluation.py + inline) --> results/.../results/{METRICS_TAG}/
+       --> aggregate_cross_query_results() --> Wilcoxon + BH-FDR + coverage tests
+
+Stage 4b: HiCode (parallel track)
+  external HiCode run (/export/fs06/.../assignment)
+       --> evaluate_hicode.py (reuses EndToEndEvaluator's metric methods)
+       --> results/.../hicode/query_X/results/{METRICS_TAG}/
+       --> evaluate_hicode_all_queries.py: aggregate_cross_query_results()
 ```
 
 ---
@@ -112,16 +152,18 @@ Both reuse `evaluation.py`'s `SearchEvaluationUtils` for Precision@K/Recall@K ag
 
 **Important:** `end_to_end_evaluation.py`'s `sample_query_expansion()` (Stage 4) does **not** use the full `QueryExpander` class from this stage — it has its own simpler, inline implementation (load cached KeyBERT keywords → weighted RRF fusion at a fixed 70/30 split). `query_expansion.py` is for *researching* which expansion strategy to use; the fixed strategy that won that research is what's hardcoded into Stage 4's sampling method.
 
+**Stage 2 and Stage 3 are not fully independent — they share a cache file.** `query_expansion.py main()` includes a "Method 8: Query Expansion (KeyBERT)" evaluation that calls `keyword_extraction.py`'s `KeywordExtractor` directly, using the *same default parameters* Stage 3 uses (`num_keywords=10, diversity=0.7, top_k_docs=1000, top_n_docs=10, model=mpnet`). Since the keyword cache filename is a deterministic function of those parameters (see Stage 3 below), running `query_expansion.py` with default settings reads and writes the **exact same file** as Stage 3's dedicated generation script — not a separate one. Don't assume running the Stage 2 research tool is inert with respect to the production keyword cache Stage 4 depends on.
+
 ---
 
 ## Stage 3 — Keyword generation
 
-Produces the JSON keyword cache that Stage 4's `query_expansion` sampling method depends on. Two scripts, same underlying class (`keyword_extraction.py`'s `KeywordExtractor`), different datasets:
+Produces the JSON keyword cache that Stage 4's `query_expansion` sampling method depends on. The cache path is a deterministic function of extraction parameters (see `KeywordExtractor._generate_keywords_cache_path()`), so any script calling `KeywordExtractor` with matching parameters reads/writes the same file — that includes Stage 2's `query_expansion.py` (see above), not just the scripts below:
 
-- **`src/keyword_extraction.py main()`** — generated the TREC-COVID cache (`cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json`): 10 keywords/query, diversity=0.7, extracted from the top-10 retrieved docs, MPNet embeddings, unigram+bigram.
+- **`src/keyword_extraction.py main()`** — TREC-COVID, default params match the production cache (`cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json`): 10 keywords/query, diversity=0.7, extracted from the top-10 retrieved docs, MPNet embeddings, unigram+bigram.
 - **`generate_doctor_review_keywords.py`** — same parameters, doctor-reviews dataset, hardcoded to 6 queries (`1`-`6`) and writes to `cache/keywords/doctor_reviews_keybert.json`. See [CACHING.md](CACHING.md) for what happens for queries `7`-`11`, which have no cached keywords (it's a graceful fallback, not a crash).
 
-Run once per dataset; re-run only if you change extraction parameters or add queries.
+Run once per dataset; re-run only if you change extraction parameters or add queries. If you need to regenerate this cache, be aware that `query_expansion.py` (Stage 2) will also overwrite it if run with default settings — don't run that script casually if you're relying on the existing cache staying put.
 
 ---
 
