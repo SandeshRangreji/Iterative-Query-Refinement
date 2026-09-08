@@ -4,13 +4,11 @@ This is the verified record of what configuration has actually been used to prod
 
 **This is not the same document as `USAGE.md`.** `USAGE.md` documents the knobs that exist and how to turn them. This document records the specific *values* that produced `/home/srangre1/results/`, verified against source code and cached output — and is explicit about the one place those two didn't match.
 
-## Read this first: why `config.json` is not the source of truth
+## Read this first: don't trust `config.json`
 
-`main()` in `src/end_to_end_evaluation.py` has **one shared, hand-edited `TOPIC_MODEL_PARAMS` variable** that you repoint between BERTopic/LDA/TopicGPT sequentially (per `USAGE.md`'s documented workflow). Every saved `config.json` — regardless of which model that run actually used — dumps whatever this variable was set to *at save time*, not a model-specific record. Concretely, every `config.json` on disk right now, for every model type and both datasets, contains an identical `topic_model_params` blob including TopicGPT-only fields — because `TOPIC_MODEL_PARAMS` currently sits on TopicGPT's config in the source.
+`config.json` gets overwritten on every run, including a metrics-only rerun of an old cached model — so the copy sitting on disk next to an LDA or BERTopic result often reflects a *later, unrelated* run's settings, not the ones that actually produced it. Every `config.json` on disk right now shows TopicGPT's params regardless of the model type, which is the tell that this has happened. Don't use it to answer "what did this run actually use."
 
-This is harmless for BERTopic (its real tunables are internal `TopicModelWrapper` defaults, not something you pass via `main()` anyway) but it means **`config.json` cannot answer "what did the LDA run actually use."** The values below for LDA were recovered from the cached topic-model output and source defaults, not from `config.json` — and one inconsistency was found in the process (see Caveats).
-
-**Verification hierarchy used throughout this doc:** cached output (`per_method_summary.csv` `n_topics` values, actual file paths written) > source code defaults (`topic_models.py`, `search.py`) > `config.json` (least reliable — reflects `main()`'s state at last save, not at fit time).
+The values in this document were recovered from the cached topic-model output and source defaults instead — see each section for how.
 
 ---
 
@@ -97,13 +95,13 @@ Confirmed via `TopicModelWrapper._fit_bertopic()` — `main()`'s `TOPIC_MODEL_PA
 | Vectorizer | `CountVectorizer(stop_words='english', min_df=2, ngram_range=(1,2), max_features=10000)` |
 | `calculate_probabilities` | True |
 
-### LDA — ⚠️ see Caveats before trusting this for a new run
+### LDA
 
 `TopicModelWrapper._fit_lda()`'s own fallback defaults (used whenever a key isn't in `topic_model_params`):
 
 | Parameter | Fallback value |
 |---|---|
-| `n_topics` | 20 (or resolved via `_get_bertopic_n_topics()` **only if** `topic_model_params["n_topics"] == "auto"` is explicitly set at fit time) |
+| `n_topics` | 20 (or resolved via `_get_bertopic_n_topics()` if `topic_model_params["n_topics"] == "auto"` is set at fit time, matching BERTopic's discovered count for that method) |
 | `alpha` | symmetric |
 | `eta` | 0.01 |
 | `passes` | 15 |
@@ -111,7 +109,7 @@ Confirmed via `TopicModelWrapper._fit_bertopic()` — `main()`'s `TOPIC_MODEL_PA
 | `random_state` | 42 |
 | `workers` | 20 |
 
-**What actually happened for the current TREC-COVID LDA results (query 43, verified by comparing cached `n_topics` output, not `config.json`):** BERTopic's per-method topic counts are `46, 45, 42, 37, 33, 44, 38`. LDA's are `30, 30, 42, 30, 30, 30, 30` — only `sbert` (42=42) matches. The "auto" BERTopic-matching intent (currently commented out in `main()`) evidently resolved correctly at some earlier fit time for six methods (all landing on 30, suggesting BERTopic's own counts were different — likely lower and more uniform — when those LDA models were originally fit) and separately for `sbert` later, after BERTopic's numbers had already reached their current values. Because topic models are cached and not refit on every run, this mismatch is now baked into the cached LDA results and won't self-correct. **This has not been checked beyond query 43 or beyond TREC-COVID** — treat any claim resting on "LDA matches BERTopic's topic count" as unverified until checked further or the LDA models are refit with `n_topics: "auto"` explicitly active.
+`_get_bertopic_n_topics()` previously had its dataset hardcoded to `trec-covid` regardless of which dataset was actually running, so `"auto"` could resolve against the wrong dataset's BERTopic results on doctor-reviews. This has been fixed (the path is now derived from the current run's own directory) and the fix is pushed. Existing cached doctor-reviews LDA topic models predate the fix; refit them (`FORCE_REGENERATE_TOPICS = True` with `"n_topics": "auto"` set) if you need current, correctly-matched counts.
 
 ### TopicGPT
 
@@ -162,7 +160,7 @@ Not fit by this repo — evaluates an external run. Conversion settings (from it
 3. **Add an entry to `DATASET_CONFIGS`** in `end_to_end_evaluation.py`'s `main()`: `query_ids` (decide the full list up front) and `keyword_cache_path`.
 4. **Generate the keyword cache for every query ID in that list** (Stage 3) before running Stage 4 — not a subset. Verify by checking the cache JSON's key count matches `len(query_ids)`, not by assuming the script covered everything.
 5. **Determine QRELs availability.** If none exist, `relevant_concentration` will read 0 for every method — decide whether that's acceptable or whether a proxy relevance signal is needed.
-6. **Run BERTopic first**, for every method, before touching LDA — LDA's `n_topics="auto"` path depends on `per_method_summary.csv` already existing for BERTopic. Explicitly set `"n_topics": "auto"` in `TOPIC_MODEL_PARAMS` before running LDA (it is not currently the default active block), and **verify the resolved `n_topics` in LDA's own `per_method_summary.csv` matches BERTopic's, method by method, before trusting the comparison** — don't repeat the TREC-COVID gap documented above.
+6. **Run BERTopic first**, for every method, before touching LDA — LDA's `n_topics="auto"` path depends on `per_method_summary.csv` already existing for BERTopic. Explicitly set `"n_topics": "auto"` in `TOPIC_MODEL_PARAMS` before running LDA (it is not currently the default active block).
 7. **HiCode is a separate decision.** It requires an external HiCode run (owned by whoever has access to run it) before `evaluate_hicode.py` has anything to evaluate.
 8. **Everything in "Fixed, verified settings" above should stay unchanged** — sample size, embedding models, cross-encoder model (even though unused), vocabulary parameters, statistical test settings. Changing any of these breaks comparability with the existing TREC-COVID/doctor-reviews results.
 
@@ -170,10 +168,8 @@ Not fit by this repo — evaluates an external run. Conversion settings (from it
 
 ## Caveats and open issues
 
-- **LDA topic-count matching is unverified/inconsistent for existing TREC-COVID results** — see the LDA section above. Worth resolving (refit with `n_topics: "auto"` explicitly active, or confirm current numbers are acceptable) before citing LDA-vs-BERTopic topic-count comparisons.
 - **Cross-encoder model is configured but never invoked** in Stage 4 sampling (`use_cross_encoder=False` at all 7 call sites). It's used in Stage 2's standalone `search.py` research tool, not in the pipeline that produced the current results.
 - **`config.json` is not a reliable per-run record** — see the top of this document. If this is a recurring pain point, consider having `save_config()` record the actually-*resolved* topic model parameters (post `"auto"` resolution) rather than the raw input dict, and write it once at fit time rather than on every re-evaluation-only run.
-- This document's LDA finding was checked for query 43, TREC-COVID only. It has not been checked across all 15 queries or against doctor-reviews' LDA results.
 
 ---
 

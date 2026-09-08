@@ -1,4 +1,6 @@
-# Minimal requirements.txt - dependencies auto-resolved
+# requirements.txt - verified against actual imports (grep) and the installed
+# coreset_proj conda env (`pip freeze`) on 2026-09. See RUN_CONFIGURATION.md /
+# USAGE.md for the full pipeline this supports.
 
 # Core packages directly used
 datasets==3.4.1
@@ -6,7 +8,6 @@ sentence-transformers==3.4.1
 bertopic==0.17.0
 matplotlib==3.10.1
 seaborn==0.13.2
-plotly==6.0.1
 
 # NLP packages directly used
 nltk==3.9.1
@@ -15,8 +16,32 @@ keybert==0.9.0
 
 # Topic modeling
 gensim==4.3.3
-scipy<=1.13.1  # Required for gensim 4.3.3 compatibility (triu issue with 1.14+)
-topicgpt_python>=0.1.0  # LLM-based topic modeling
+scipy==1.13.1  # Pinned <=1.13.1 for gensim 4.3.3 compatibility (triu issue with 1.14+)
+topicgpt_python>=0.1.0  # LLM-based topic modeling; needs OPENAI_API_KEY at runtime
 
-# GPU acceleration
-cupy-cuda11x>=11.0.0
+# Previously missing despite being imported directly (topic_models.py,
+# end_to_end_evaluation.py, dataset_loaders.py) - pulled in transitively until
+# now, so versions weren't guaranteed. Pinned at what's actually installed
+# and verified working:
+numpy==1.26.4
+pandas==2.3.2
+scikit-learn==1.7.2
+hdbscan==0.8.40
+tqdm==4.67.1
+
+# torch - pin matters most here: this project has a documented history of
+# CUDA/torch build mismatches on the CLSP grid (see GPU_COMPATIBILITY_ISSUE.md,
+# CLSP_GPU_SOLUTION.md). This exact build requires PyTorch's own CUDA index,
+# not plain PyPI:
+#   pip install torch==2.7.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+# A plain `pip install -r requirements.txt` will fail to resolve this line -
+# install torch separately first using the command above, then this file.
+torch==2.7.1+cu118
+
+# Optional GPU acceleration - NOT currently used by any code in this repo
+# (grep confirms zero imports of cupy/cuml anywhere). Installed in the current
+# env as groundwork for possible future cuML-accelerated HDBSCAN clustering
+# (see USAGE.md's GPU Acceleration section) but the pipeline runs CPU-only
+# today per PROJECT_OVERVIEW.md. Safe to skip unless pursuing that.
+# cupy-cuda11x==13.6.0
+# cuml-cu11
