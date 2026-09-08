@@ -687,6 +687,8 @@ def run_hicode_evaluation(
     evaluator.query_text = query_text
     evaluator.sample_size = sample_size
     evaluator.embedding_model_name = embedding_model
+    evaluator.metrics_embedding_model_name = embedding_model
+    evaluator._metrics_tag = evaluator.metrics_embedding_model_name.replace("/", "_").replace("-", "_")
     evaluator.device = device
     evaluator.dataset_name = dataset_name
     evaluator.topic_model_type = "hicode"
@@ -725,7 +727,7 @@ def run_hicode_evaluation(
 
     # Setup output directories
     evaluator.output_dir = os.path.join(output_dir, dataset_name, "hicode", f"query_{query_id}")
-    evaluator.results_dir = os.path.join(evaluator.output_dir, "results")
+    evaluator.results_dir = os.path.join(evaluator.output_dir, "results", evaluator._metrics_tag)
     evaluator.plots_dir = os.path.join(evaluator.results_dir, "plots")
     evaluator.topics_summary_dir = os.path.join(evaluator.results_dir, "topics_summary")
 

@@ -249,8 +249,13 @@ def main():
     OUTPUT_DIR = args.output_dir
 
     # Model configuration
+    # NOTE: evaluate_hicode.py sets both embedding_model_name and
+    # metrics_embedding_model_name to this same value (HiCode has no separate
+    # metrics-only embedding model yet), so the results-directory tag below
+    # must be derived from it the same way end_to_end_evaluation.py does.
     SAMPLE_SIZE = 1000
     EMBEDDING_MODEL = "all-mpnet-base-v2"
+    METRICS_MODEL_TAG = EMBEDDING_MODEL.replace("/", "_").replace("-", "_")
     DATASET_NAME = args.dataset_name
 
     # Device configuration - auto-detect if not specified
@@ -302,15 +307,16 @@ def main():
         logger.info("AGGREGATING RESULTS ACROSS ALL QUERIES")
         logger.info("=" * 80)
 
-        # Results are stored in: OUTPUT_DIR/DATASET_NAME/hicode/query_X/results/
+        # Results are stored in: OUTPUT_DIR/DATASET_NAME/hicode/query_X/results/{METRICS_MODEL_TAG}/
         results_base_dir = os.path.join(OUTPUT_DIR, DATASET_NAME, "hicode")
-        aggregate_output_dir = os.path.join(results_base_dir, "aggregate_results")
+        aggregate_output_dir = os.path.join(results_base_dir, "aggregate_results", METRICS_MODEL_TAG)
 
         try:
             aggregate_results = aggregate_cross_query_results(
                 results_base_dir=results_base_dir,
                 query_ids=successful_queries,
-                output_dir=aggregate_output_dir
+                output_dir=aggregate_output_dir,
+                metrics_model_tag=METRICS_MODEL_TAG
             )
 
             if aggregate_results:

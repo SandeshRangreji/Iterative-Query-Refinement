@@ -1,20 +1,40 @@
 # end_to_end_evaluation.py
 """
-End-to-end evaluation of topic modeling (BERTopic or LDA) using different sampling strategies.
+Stage 4 of the pipeline (see PIPELINE.md) - end-to-end evaluation of topic
+modeling using different document-sampling strategies. This is the main
+orchestrated pipeline; Stages 0-3 (corpus prep, indexing, search evaluation,
+keyword generation) are separate scripts whose output this one consumes -
+see PIPELINE.md for the full map. HiCode (Stage 4b) is evaluated by a
+separate entry point (evaluate_hicode.py) that reuses this module's
+EndToEndEvaluator class and metric-computation methods without going through
+its normal sampling/indexing path - see the note on EndToEndEvaluator.
 
-Supports multiple topic modeling methods:
-- BERTopic: Embedding-based with HDBSCAN clustering (auto-determines topic count)
-- LDA: Bag-of-words Latent Dirichlet Allocation (requires fixed topic count)
+Supports 4 topic modeling methods (dispatched via topic_models.py's
+TopicModelWrapper, selected by the MODEL env var or TOPIC_MODEL_TYPE in
+main()): BERTopic, LDA, TopicGPT. (HiCode is evaluated via a separate script,
+not selected here.)
 
-Compares 6 sampling methods:
+Compares 7 sampling methods - see the sample_*() methods on
+EndToEndEvaluator, and USAGE.md's Configuration Reference table for which
+parameters are exposed vs. hardcoded per method:
 1. Random Uniform Sampling
-2. Direct Retrieval (Hybrid BM25+SBERT)
-3. Direct Retrieval + MMR (High Diversity)
-4. Query Expansion + Retrieval
-5. Simple Keyword Search (BM25 only)
-6. Retrieval Pool + Random Sampling (Hybrid retrieval of 5000 docs, then random sample 1000)
+2. Keyword Search (BM25 only)
+3. SBERT (pure semantic retrieval only)
+4. Direct Retrieval (Hybrid BM25+SBERT)
+5. Direct Retrieval + MMR (High Diversity)
+6. Query Expansion + Retrieval
+7. Retrieval Pool + Random Sampling (Hybrid retrieval of 5000 docs, then random sample 1000)
 
-METRICS IMPLEMENTED:
+Every metric is computed under two independently-configurable embedding
+models - EMBEDDING_MODEL (retrieval/BERTopic/KeyBERT) and
+METRICS_EMBEDDING_MODEL (metric computation only) - to check sensitivity to
+embedding-geometry differences; see USAGE.md. Cross-query significance uses
+Wilcoxon signed-rank as the primary test (BH-FDR corrected), with the paired
+t-test kept as a secondary check - see run_pairwise_statistical_tests() and
+run_pairwise_coverage_statistical_tests() below.
+
+METRICS IMPLEMENTED (see METRICS_GUIDE.md for the authoritative, current list
+of all 40+ metrics and their interpretation - the summary below may lag):
 
 Intrinsic Quality Metrics (Per-Method):
 - NPMI Coherence: Semantic coherence of topic words based on co-occurrence
@@ -368,6 +388,33 @@ def paired_ttest(group1: np.ndarray, group2: np.ndarray) -> Tuple[float, float]:
     return (t_stat, p_value)
 
 
+def wilcoxon_test(group1: np.ndarray, group2: np.ndarray) -> Tuple[float, float]:
+    """
+    Perform Wilcoxon signed-rank test between two paired groups.
+
+    Returns:
+        Tuple of (W-statistic, p-value)
+    """
+    from scipy import stats
+
+    if len(group1) != len(group2):
+        raise ValueError("Groups must have same length for Wilcoxon test")
+
+    if len(group1) < 2:
+        return (np.nan, np.nan)
+
+    differences = group1 - group2
+    if np.all(differences == 0):
+        return (0.0, 1.0)
+
+    try:
+        w_stat, p_value = stats.wilcoxon(differences, zero_method='wilcox', alternative='two-sided')
+        return (float(w_stat), float(p_value))
+    except ValueError:
+        logger.debug("Wilcoxon test failed (edge case), returning NaN")
+        return (np.nan, np.nan)
+
+
 def benjamini_hochberg_correction(p_values: List[float], alpha: float = 0.05) -> Tuple[List[float], List[bool]]:
     """
     Apply Benjamini-Hochberg FDR correction for multiple comparisons.
@@ -455,7 +502,13 @@ def run_pairwise_statistical_tests(
             values_a = data_a.loc[common_queries].values
             values_b = data_b.loc[common_queries].values
 
-            if len(common_queries) < 2:
+            # Listwise NaN deletion
+            valid_mask = ~(np.isnan(values_a) | np.isnan(values_b))
+            values_a = values_a[valid_mask]
+            values_b = values_b[valid_mask]
+            n_valid = int(valid_mask.sum())
+
+            if n_valid < 2:
                 continue
 
             # Compute statistics
@@ -464,17 +517,20 @@ def run_pairwise_statistical_tests(
             diff = mean_a - mean_b
 
             t_stat, p_value = paired_ttest(values_a, values_b)
+            w_stat, p_value_wilcoxon = wilcoxon_test(values_a, values_b)
             d = compute_cohens_d(values_a, values_b)
 
             results.append({
                 'method_a': method_a,
                 'method_b': method_b,
-                'n_queries': len(common_queries),
+                'n_queries': n_valid,
                 'mean_a': round(mean_a, 4),
                 'mean_b': round(mean_b, 4),
                 'diff': round(diff, 4),
                 't_stat': round(t_stat, 4) if not np.isnan(t_stat) else np.nan,
                 'p_value': round(p_value, 6) if not np.isnan(p_value) else np.nan,
+                'w_stat': round(w_stat, 4) if not np.isnan(w_stat) else np.nan,
+                'p_value_wilcoxon': round(p_value_wilcoxon, 6) if not np.isnan(p_value_wilcoxon) else np.nan,
                 'cohens_d': round(d, 4),
                 'effect_size': interpret_cohens_d(d)
             })
@@ -484,12 +540,18 @@ def run_pairwise_statistical_tests(
 
     results_df = pd.DataFrame(results)
 
-    # Apply BH correction
+    # Apply BH correction for t-test
     p_values = results_df['p_value'].tolist()
     adjusted_p, significant = benjamini_hochberg_correction(p_values, alpha)
 
     results_df['p_adjusted'] = [round(p, 6) if not np.isnan(p) else np.nan for p in adjusted_p]
     results_df['significant'] = significant
+
+    # Apply BH correction for Wilcoxon
+    p_values_wilcoxon = results_df['p_value_wilcoxon'].tolist()
+    adj_p_w, sig_w = benjamini_hochberg_correction(p_values_wilcoxon, alpha)
+    results_df['p_adjusted_wilcoxon'] = [round(p, 6) if not np.isnan(p) else np.nan for p in adj_p_w]
+    results_df['significant_wilcoxon'] = sig_w
 
     return results_df
 
@@ -523,10 +585,16 @@ def plot_statistical_heatmaps(
     n_methods = len(methods)
     method_to_idx = {m: i for i, m in enumerate(methods)}
 
+    # Check if Wilcoxon results are available
+    has_wilcoxon = 'p_adjusted_wilcoxon' in stats_df.columns
+
     # Create matrices
     p_matrix = np.ones((n_methods, n_methods))  # Default p=1 (no difference)
     d_matrix = np.zeros((n_methods, n_methods))  # Default d=0 (no effect)
     sig_matrix = np.zeros((n_methods, n_methods), dtype=bool)
+    if has_wilcoxon:
+        w_p_matrix = np.ones((n_methods, n_methods))
+        w_sig_matrix = np.zeros((n_methods, n_methods), dtype=bool)
 
     for _, row in stats_df.iterrows():
         i = method_to_idx[row['method_a']]
@@ -544,9 +612,19 @@ def plot_statistical_heatmaps(
         sig_matrix[i, j] = sig
         sig_matrix[j, i] = sig
 
+        if has_wilcoxon:
+            w_p_val = row['p_adjusted_wilcoxon'] if not np.isnan(row['p_adjusted_wilcoxon']) else 1.0
+            w_sig = row['significant_wilcoxon']
+            w_p_matrix[i, j] = w_p_val
+            w_p_matrix[j, i] = w_p_val
+            w_sig_matrix[i, j] = w_sig
+            w_sig_matrix[j, i] = w_sig
+
     # Set diagonal to NaN for display
     np.fill_diagonal(p_matrix, np.nan)
     np.fill_diagonal(d_matrix, np.nan)
+    if has_wilcoxon:
+        np.fill_diagonal(w_p_matrix, np.nan)
 
     # ===== Plot 1: P-value Heatmap =====
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -591,7 +669,7 @@ def plot_statistical_heatmaps(
         annot_kws={'fontsize': FONT_SIZES['annotation']}
     )
 
-    ax.set_title(f'{metric_name}\nPairwise Significance (Paired t-test, BH-corrected)\n* p<0.05, ** p<0.01, *** p<0.001',
+    ax.set_title(f'{metric_name}\nPairwise Significance (Paired t-test, BH-corrected, secondary)\n* p<0.05, ** p<0.01, *** p<0.001',
                  fontsize=FONT_SIZES['figure_title'], fontweight='bold')
     ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
     ax.set_ylabel('Method', fontsize=FONT_SIZES['axis_label'])
@@ -601,6 +679,54 @@ def plot_statistical_heatmaps(
     plt.savefig(os.path.join(output_dir, f"{filename_prefix}_pvalues.png"), dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"✓ Saved {filename_prefix}_pvalues.png")
+
+    # ===== Plot 1b: Wilcoxon P-value Heatmap (PRIMARY) =====
+    if has_wilcoxon:
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        w_annot_matrix = np.empty((n_methods, n_methods), dtype=object)
+        for i in range(n_methods):
+            for j in range(n_methods):
+                if i == j:
+                    w_annot_matrix[i, j] = ""
+                elif np.isnan(w_p_matrix[i, j]):
+                    w_annot_matrix[i, j] = ""
+                else:
+                    p_val = w_p_matrix[i, j]
+                    if p_val < 0.001:
+                        w_annot_matrix[i, j] = f"{p_val:.0e}***"
+                    elif p_val < 0.01:
+                        w_annot_matrix[i, j] = f"{p_val:.3f}**"
+                    elif p_val < 0.05:
+                        w_annot_matrix[i, j] = f"{p_val:.3f}*"
+                    else:
+                        w_annot_matrix[i, j] = f"{p_val:.3f}"
+
+        sns.heatmap(
+            w_p_matrix,
+            annot=w_annot_matrix,
+            fmt="",
+            cmap="RdYlGn_r",
+            vmin=0,
+            vmax=0.1,
+            mask=mask,
+            xticklabels=display_names,
+            yticklabels=display_names,
+            ax=ax,
+            cbar_kws={'label': 'Adjusted p-value'},
+            annot_kws={'fontsize': FONT_SIZES['annotation']}
+        )
+
+        ax.set_title(f'{metric_name}\nPairwise Significance (Wilcoxon Signed-Rank, BH-corrected, PRIMARY)\n* p<0.05, ** p<0.01, *** p<0.001',
+                     fontsize=FONT_SIZES['figure_title'], fontweight='bold')
+        ax.set_xlabel('Method', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Method', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"{filename_prefix}_wilcoxon_pvalues.png"), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved {filename_prefix}_wilcoxon_pvalues.png")
 
     # ===== Plot 2: Cohen's d Heatmap =====
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -668,9 +794,17 @@ def run_aggregate_statistical_analysis(
     """
     if metrics_to_test is None:
         metrics_to_test = [
-            {'column': 'topic_query_similarity', 'name': 'Avg Topic-Query Similarity'},
-            {'column': 'diversity_semantic', 'name': 'Semantic Diversity'},
-            {'column': 'topic_specificity', 'name': 'Topic Specificity'}
+            {'column': 'topic_query_similarity',       'name': 'Avg Topic-Query Similarity'},
+            {'column': 'diversity_semantic',            'name': 'Semantic Diversity'},
+            {'column': 'topic_specificity',            'name': 'Topic Specificity'},
+            {'column': 'relevance_weighted_diversity', 'name': 'Relevance-Weighted Diversity'},
+            {'column': 'query_relevant_ratio',         'name': 'Query-Relevant Ratio'},
+            {'column': 'relevant_concentration',       'name': 'Relevant Concentration'},
+            {'column': 'top3_avg_similarity',          'name': 'Top-3 Avg Topic-Query Similarity'},
+            {'column': 'max_query_similarity',         'name': 'Max Topic-Query Similarity'},
+            {'column': 'relevant_topic_diversity',     'name': 'Relevant Topic Diversity'},
+            {'column': 'relevant_diversity_ratio',     'name': 'Relevant Diversity Ratio'},
+            {'column': 'topk_relevant_diversity',      'name': 'Top-K Relevant Diversity'},
         ]
 
     os.makedirs(output_dir, exist_ok=True)
@@ -700,6 +834,10 @@ def run_aggregate_statistical_analysis(
             logger.warning(f"  No results for {name}")
             continue
 
+        # Flag pairs where NaN deletion reduced the query count
+        n_total_queries = all_per_method['query_id'].nunique()
+        stats_df['bias_warning'] = stats_df['n_queries'] < n_total_queries
+
         # Save CSV
         csv_path = os.path.join(output_dir, f"statistical_tests_{column}.csv")
         stats_df.to_csv(csv_path, index=False)
@@ -717,12 +855,251 @@ def run_aggregate_statistical_analysis(
 
         # Log summary
         n_significant = stats_df['significant'].sum()
+        n_sig_w = stats_df['significant_wilcoxon'].sum() if 'significant_wilcoxon' in stats_df.columns else 0
         n_total = len(stats_df)
-        logger.info(f"  Summary: {n_significant}/{n_total} pairs significantly different")
+        logger.info(f"  Summary: t-test {n_significant}/{n_total}, Wilcoxon {n_sig_w}/{n_total} pairs significant")
 
     logger.info("✓ Aggregate statistical analysis complete")
 
     return all_results
+
+
+def _plot_coverage_significance_heatmap(
+    results_df: pd.DataFrame,
+    output_dir: str,
+    threshold: str = '@07'
+) -> None:
+    """
+    Create Wilcoxon significance heatmaps for coverage tests, one per target method.
+
+    Args:
+        results_df: DataFrame from run_pairwise_coverage_statistical_tests()
+        output_dir: Directory to save plots
+        threshold: Threshold tag used in filenames (e.g. '@07')
+    """
+    if results_df.empty:
+        return
+
+    targets = _sort_methods_canonical(list(results_df['target'].unique()))
+
+    for target in targets:
+        target_df = results_df[results_df['target'] == target]
+        if target_df.empty:
+            continue
+
+        sources = _sort_methods_canonical(
+            list(set(target_df['source_a'].tolist() + target_df['source_b'].tolist()))
+        )
+        display_names = [_get_display_name(s) for s in sources]
+        n_sources = len(sources)
+        source_to_idx = {s: i for i, s in enumerate(sources)}
+
+        p_matrix = np.ones((n_sources, n_sources))
+        annot_matrix = np.empty((n_sources, n_sources), dtype=object)
+        for i in range(n_sources):
+            for j in range(n_sources):
+                annot_matrix[i, j] = ""
+
+        for _, row in target_df.iterrows():
+            i = source_to_idx.get(row['source_a'])
+            j = source_to_idx.get(row['source_b'])
+            if i is None or j is None:
+                continue
+
+            raw = row['p_adjusted_wilcoxon']
+            p_val = raw if not pd.isna(raw) else 1.0
+            p_matrix[i, j] = p_val
+            p_matrix[j, i] = p_val
+
+            if p_val < 0.001:
+                ann = f"{p_val:.0e}***"
+            elif p_val < 0.01:
+                ann = f"{p_val:.3f}**"
+            elif p_val < 0.05:
+                ann = f"{p_val:.3f}*"
+            else:
+                ann = f"{p_val:.3f}"
+            annot_matrix[i, j] = ann
+            annot_matrix[j, i] = ann
+
+        np.fill_diagonal(p_matrix, np.nan)
+        mask = np.eye(n_sources, dtype=bool)
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        display_target = _get_display_name(target)
+
+        sns.heatmap(
+            p_matrix,
+            annot=annot_matrix,
+            fmt="",
+            cmap="RdYlGn_r",
+            vmin=0,
+            vmax=0.1,
+            mask=mask,
+            xticklabels=display_names,
+            yticklabels=display_names,
+            ax=ax,
+            cbar_kws={'label': 'Adjusted p-value'},
+            annot_kws={'fontsize': FONT_SIZES['annotation']}
+        )
+
+        ax.set_title(
+            f'Coverage of "{display_target}" Topics\n'
+            f'Source Method Comparison (Wilcoxon, BH-corrected) {threshold}\n'
+            f'* p<0.05, ** p<0.01, *** p<0.001',
+            fontsize=FONT_SIZES['figure_title'],
+            fontweight='bold'
+        )
+        ax.set_xlabel('Source Method', fontsize=FONT_SIZES['axis_label'])
+        ax.set_ylabel('Source Method', fontsize=FONT_SIZES['axis_label'])
+        ax.tick_params(axis='both', labelsize=FONT_SIZES['tick_label'])
+
+        plt.tight_layout()
+        safe_target = target.replace(' ', '_')
+        tag = threshold.replace('@', 'at')
+        fname = f"coverage_wilcoxon_significance_{tag}_{safe_target}.png"
+        plt.savefig(os.path.join(output_dir, fname), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"✓ Saved {fname}")
+
+
+def run_pairwise_coverage_statistical_tests(
+    all_pairwise: pd.DataFrame,
+    output_dir: str,
+    alpha: float = 0.05
+) -> Dict[str, pd.DataFrame]:
+    """
+    Run statistical tests comparing how well different source methods cover each target
+    method's relevant topics.
+
+    Args:
+        all_pairwise: DataFrame with pairwise metrics (query_id, method_a, method_b,
+                      relevant_coverage_a_to_b_@XX, relevant_coverage_b_to_a_@XX columns)
+        output_dir: Directory to save results
+        alpha: Significance threshold
+
+    Returns:
+        Dict mapping threshold key (e.g. 'coverage_at07') to results DataFrame
+    """
+    if all_pairwise is None or (hasattr(all_pairwise, 'empty') and all_pairwise.empty):
+        logger.warning("No pairwise data for coverage statistical tests")
+        return {}
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    thresholds = [('@05', '0.5'), ('@06', '0.6'), ('@07', '0.7')]
+    all_coverage_results = {}
+
+    for threshold_tag, _threshold_label in thresholds:
+        coverage_col = f'relevant_coverage_a_to_b_{threshold_tag}'
+
+        if coverage_col not in all_pairwise.columns:
+            logger.warning(f"Column '{coverage_col}' not found in pairwise data, skipping")
+            continue
+
+        logger.info(f"Running coverage statistical tests for {threshold_tag}...")
+
+        reverse_col = coverage_col.replace('a_to_b', 'b_to_a')
+
+        # Symmetrize: both (source→target) directions from each stored pair
+        rows_forward = all_pairwise[['query_id', 'method_a', 'method_b', coverage_col]].copy()
+        rows_forward.columns = ['query_id', 'source', 'target', 'coverage']
+
+        rows_reverse = all_pairwise[['query_id', 'method_b', 'method_a', reverse_col]].copy()
+        rows_reverse.columns = ['query_id', 'source', 'target', 'coverage']
+
+        long_df = pd.concat([rows_forward, rows_reverse], ignore_index=True)
+
+        all_targets = _sort_methods_canonical(list(long_df['target'].unique()))
+        results = []
+
+        for target in all_targets:
+            target_long = long_df[long_df['target'] == target]
+
+            pivot = target_long.pivot_table(
+                index='query_id', columns='source', values='coverage', aggfunc='first'
+            )
+
+            sources = _sort_methods_canonical([c for c in pivot.columns if c != target])
+
+            target_results = []
+
+            for si, source_a in enumerate(sources):
+                for source_b in sources[si + 1:]:
+                    if source_a not in pivot.columns or source_b not in pivot.columns:
+                        continue
+
+                    values_a = pivot[source_a].values.astype(float)
+                    values_b = pivot[source_b].values.astype(float)
+
+                    valid_mask = ~(np.isnan(values_a) | np.isnan(values_b))
+                    values_a = values_a[valid_mask]
+                    values_b = values_b[valid_mask]
+                    n_valid = int(valid_mask.sum())
+
+                    if n_valid < 2:
+                        continue
+
+                    mean_a = float(np.mean(values_a))
+                    mean_b = float(np.mean(values_b))
+                    diff = mean_a - mean_b
+
+                    t_stat, p_value = paired_ttest(values_a, values_b)
+                    w_stat, p_value_wilcoxon = wilcoxon_test(values_a, values_b)
+                    d = compute_cohens_d(values_a, values_b)
+
+                    target_results.append({
+                        'target': target,
+                        'source_a': source_a,
+                        'source_b': source_b,
+                        'n_queries': n_valid,
+                        'mean_a': round(mean_a, 4),
+                        'mean_b': round(mean_b, 4),
+                        'diff': round(diff, 4),
+                        't_stat': round(t_stat, 4) if not np.isnan(t_stat) else np.nan,
+                        'p_value': round(p_value, 6) if not np.isnan(p_value) else np.nan,
+                        'w_stat': round(w_stat, 4) if not np.isnan(w_stat) else np.nan,
+                        'p_value_wilcoxon': round(p_value_wilcoxon, 6) if not np.isnan(p_value_wilcoxon) else np.nan,
+                        'cohens_d': round(d, 4),
+                        'effect_size': interpret_cohens_d(d)
+                    })
+
+            if not target_results:
+                continue
+
+            # BH correction within this target group separately
+            target_df = pd.DataFrame(target_results)
+
+            p_vals_t = target_df['p_value'].tolist()
+            adj_t, sig_t = benjamini_hochberg_correction(p_vals_t, alpha)
+            target_df['p_adjusted'] = [round(p, 6) if not np.isnan(p) else np.nan for p in adj_t]
+            target_df['significant'] = sig_t
+
+            p_vals_w = target_df['p_value_wilcoxon'].tolist()
+            adj_w, sig_w = benjamini_hochberg_correction(p_vals_w, alpha)
+            target_df['p_adjusted_wilcoxon'] = [round(p, 6) if not np.isnan(p) else np.nan for p in adj_w]
+            target_df['significant_wilcoxon'] = sig_w
+
+            results.append(target_df)
+
+        if not results:
+            logger.warning(f"No coverage test results for {threshold_tag}")
+            continue
+
+        full_df = pd.concat(results, ignore_index=True)
+
+        tag = threshold_tag.replace('@', 'at')
+        csv_path = os.path.join(output_dir, f"coverage_statistical_tests_{tag}.csv")
+        full_df.to_csv(csv_path, index=False)
+        logger.info(f"✓ Saved {csv_path}")
+
+        all_coverage_results[f'coverage_{tag}'] = full_df
+
+        if threshold_tag == '@07':
+            _plot_coverage_significance_heatmap(full_df, output_dir, threshold='@07')
+
+    logger.info("✓ Coverage statistical tests complete")
+    return all_coverage_results
 
 
 class EndToEndEvaluator:
@@ -736,6 +1113,7 @@ class EndToEndEvaluator:
         query_id: str,
         sample_size: Optional[int] = None,
         embedding_model_name: str = "all-mpnet-base-v2",
+        metrics_embedding_model_name: str = "all-mpnet-base-v2",
         cross_encoder_model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         dataset_name: str = "trec-covid",
         topic_model_type: str = "bertopic",
@@ -759,7 +1137,8 @@ class EndToEndEvaluator:
             qrels_dataset: Relevance judgments dataset
             query_id: Query ID to evaluate
             sample_size: Sample size (if None, determined by qrels count)
-            embedding_model_name: Name of embedding model
+            embedding_model_name: Name of embedding model for retrieval, BERTopic, and KeyBERT
+            metrics_embedding_model_name: Name of embedding model for metric computation only
             cross_encoder_model_name: Name of cross-encoder model
             dataset_name: Dataset name for caching
             topic_model_type: Type of topic model ('bertopic', 'lda', 'topicgpt')
@@ -779,6 +1158,7 @@ class EndToEndEvaluator:
         self.qrels_dataset = qrels_dataset
         self.query_id = str(query_id)
         self.embedding_model_name = embedding_model_name
+        self.metrics_embedding_model_name = metrics_embedding_model_name
         self.cross_encoder_model_name = cross_encoder_model_name
         self.dataset_name = dataset_name
         self.topic_model_type = topic_model_type
@@ -811,9 +1191,10 @@ class EndToEndEvaluator:
             self.topic_model_type,
             f"query_{query_id}"
         )
+        self._metrics_tag = self.metrics_embedding_model_name.replace("/", "_").replace("-", "_")
         self.samples_dir = os.path.join(self.output_dir, "samples")
         self.topic_models_dir = os.path.join(self.output_dir, "topic_models")
-        self.results_dir = os.path.join(self.output_dir, "results")
+        self.results_dir = os.path.join(self.output_dir, "results", self._metrics_tag)
         self.plots_dir = os.path.join(self.results_dir, "plots")
         self.topics_summary_dir = os.path.join(self.results_dir, "topics_summary")
 
@@ -842,8 +1223,8 @@ class EndToEndEvaluator:
 
         # Initialize shared embedding model for metric computation (reused across all metrics)
         # This prevents loading the model multiple times and saves GPU memory
-        logger.info(f"Loading shared embedding model for metrics: {self.embedding_model_name}")
-        self.metrics_embedding_model = SentenceTransformer(self.embedding_model_name, device=self.device)
+        logger.info(f"Loading shared embedding model for metrics: {self.metrics_embedding_model_name}")
+        self.metrics_embedding_model = SentenceTransformer(self.metrics_embedding_model_name, device=self.device)
         logger.info("Shared embedding model loaded")
 
     def _get_query_text(self) -> str:
@@ -861,6 +1242,7 @@ class EndToEndEvaluator:
             "query_text": self.query_text if hasattr(self, 'query_text') else None,
             "sample_size": self.sample_size,
             "embedding_model": self.embedding_model_name,
+            "metrics_embedding_model": self.metrics_embedding_model_name,
             "cross_encoder_model": self.cross_encoder_model_name,
             "dataset_name": self.dataset_name,
             "topic_model_type": self.topic_model_type,
@@ -1403,7 +1785,12 @@ class EndToEndEvaluator:
         Returns:
             Number of topics found by BERTopic for this query/method, or 20 if not found
         """
-        bertopic_csv = f"/home/srangre1/results/trec-covid/bertopic/query_{self.query_id}/results/per_method_summary.csv"
+        dataset_level = os.path.dirname(os.path.dirname(self.output_dir))
+        bertopic_csv = os.path.join(
+            dataset_level, "bertopic",
+            f"query_{self.query_id}", "results",
+            self._metrics_tag, "per_method_summary.csv"
+        )
 
         if os.path.exists(bertopic_csv):
             try:
@@ -3800,7 +4187,8 @@ def create_cross_query_intrinsic_plots(
 def aggregate_cross_query_results(
     results_base_dir: str,
     query_ids: List[str],
-    output_dir: str = None
+    output_dir: str = None,
+    metrics_model_tag: str = None
 ) -> Dict[str, Any]:
     """
     Aggregate results across all queries to understand overall method performance.
@@ -3818,7 +4206,10 @@ def aggregate_cross_query_results(
     logger.info("="*80)
 
     if output_dir is None:
-        output_dir = os.path.join(results_base_dir, "aggregate_results")
+        if metrics_model_tag:
+            output_dir = os.path.join(results_base_dir, "aggregate_results", metrics_model_tag)
+        else:
+            output_dir = os.path.join(results_base_dir, "aggregate_results")
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, "plots"), exist_ok=True)
@@ -3830,7 +4221,10 @@ def aggregate_cross_query_results(
     logger.info(f"Loading results from {len(query_ids)} queries...")
 
     for query_id in query_ids:
-        query_dir = os.path.join(results_base_dir, f"query_{query_id}", "results")
+        if metrics_model_tag:
+            query_dir = os.path.join(results_base_dir, f"query_{query_id}", "results", metrics_model_tag)
+        else:
+            query_dir = os.path.join(results_base_dir, f"query_{query_id}", "results")
 
         # Load per-method summary
         per_method_csv = os.path.join(query_dir, "per_method_summary.csv")
@@ -4310,6 +4704,7 @@ def _generate_aggregate_visualizations(
     logger.info("\nRunning statistical significance tests...")
     stats_dir = os.path.join(output_dir, "statistical_tests")
     run_aggregate_statistical_analysis(all_per_method, stats_dir)
+    run_pairwise_coverage_statistical_tests(all_pairwise, stats_dir)
 
     # Return aggregated data
     return {
@@ -5058,6 +5453,7 @@ def main():
 
     # Model configuration
     EMBEDDING_MODEL = "all-mpnet-base-v2"
+    METRICS_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"  # Change to use a different model for metric computation only
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Topic modeling configuration (can be overridden via MODEL env var)
@@ -5279,6 +5675,7 @@ def main():
             query_id=query_id,
             sample_size=SAMPLE_SIZE,
             embedding_model_name=EMBEDDING_MODEL,
+            metrics_embedding_model_name=METRICS_EMBEDDING_MODEL,
             cross_encoder_model_name=CROSS_ENCODER_MODEL,
             dataset_name=DATASET_NAME,
             topic_model_type=TOPIC_MODEL_TYPE,
@@ -5331,9 +5728,11 @@ def main():
 
         timing.start("aggregation", n_queries=len(query_ids_to_run))
         results_base_dir = os.path.join(OUTPUT_DIR, DATASET_NAME, TOPIC_MODEL_TYPE)
+        metrics_tag = METRICS_EMBEDDING_MODEL.replace("/", "_").replace("-", "_")
         aggregate_results = aggregate_cross_query_results(
             results_base_dir=results_base_dir,
-            query_ids=query_ids_to_run
+            query_ids=query_ids_to_run,
+            metrics_model_tag=metrics_tag
         )
         timing.stop("aggregation")
 
@@ -5341,7 +5740,7 @@ def main():
             logger.info("\n" + "="*80)
             logger.info("AGGREGATION COMPLETE!")
             logger.info("="*80)
-            logger.info(f"Aggregate results saved to: {results_base_dir}/aggregate_results")
+            logger.info(f"Aggregate results saved to: {results_base_dir}/aggregate_results/{metrics_tag}")
             logger.info("="*80 + "\n")
     else:
         logger.info("\nSkipping cross-query aggregation (only 1 query processed)")
