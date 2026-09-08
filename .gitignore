@@ -190,6 +190,7 @@ results/*
 
 # HPC related files
 *.sh
+!grid/*.sh
 *.err
 *.out
 

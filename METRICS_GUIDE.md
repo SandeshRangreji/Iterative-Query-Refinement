@@ -1158,6 +1158,45 @@ For each metric pair:
 
 ---
 
+## Statistical Significance Testing
+
+Cross-query significance claims use the **Wilcoxon signed-rank test** (paired by query, BH-FDR corrected) as the **primary** test — not the paired t-test, which is kept alongside it only as a secondary/backup sanity check and labeled as such in plot titles. Both apply listwise NaN deletion per method-pair and flag `bias_warning=True` in the output CSV when that deletion shrinks the query count below the total — treat any significance result with that flag as suspect (see the MPNet/BGE caveat under "Relevant Topic Diversity" above: MPNet's hard 0.5 threshold excludes most `random_uniform` queries from RTD's paired test, which is exactly this failure mode).
+
+A parallel test, **pairwise coverage significance testing**, applies the same Wilcoxon+BH treatment to the "Relevant Coverage A→B" metrics (#30-32 above) rather than treating them as purely descriptive: every method is evaluated as both a coverage "source" and "target" (symmetrized), producing per-target heatmaps (`coverage_wilcoxon_significance_at07_{target}.png`) alongside the descriptive coverage numbers already discussed under those metrics.
+
+See [USAGE.md](USAGE.md#statistical-significance-testing) for the full mechanics (function names, which 11 metrics are tested by default) and [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) for why Wilcoxon over the t-test as the metric of record.
+
+---
+
+## Known Data Caveats
+
+**Doctor-reviews `query_expansion` is identical to `direct_retrieval` for queries 7-11.** The KeyBERT keyword cache for the doctor-reviews dataset only covers queries `1`-`6` of the 11 total. When a query has no cached keywords, `sample_query_expansion()` gracefully falls back to `sample_direct_retrieval()` (same documents, same topics, same every downstream metric) rather than failing. This is intentional, documented behavior (see [CACHING.md](CACHING.md)) — but it means any Query-Expansion-vs-Direct-Retrieval comparison metric (pairwise similarity, F1/precision/recall @ thresholds, coherence/diversity differences) is trivially perfect/zero for those 5 queries and should be excluded or flagged when computing doctor-reviews aggregate statistics involving `query_expansion`.
+
+---
+
+## Which Metrics Are Reported in the Paper
+
+Not every metric in this guide clears the bar for a paper claim. Applying the Wilcoxon+BH significance testing above to the dual-embedding-model (MPNet + BGE) rerun across all five completed configs (TC-BT, TC-LDA, DR-BT, DR-LDA, DR-GPT) sorts metrics into three reporting tiers. Full per-config numbers backing this tiering are in RESULTS_ANALYSIS.md and RESULTS_REPORT.md — this section is the short answer to "can I cite metric X."
+
+### Tier 1 — Primary, cite with full confidence
+- **Topic-Query Similarity (Avg)** (#10) — the paper's headline metric. Significant under both embedding models in every config (8/21 to 17/21 pairs). Has no hard similarity threshold, so it doesn't move between MPNet and BGE the way threshold-gated metrics do.
+
+### Tier 2 — Reportable, with a stated caveat
+- **Semantic Diversity** (#3) — significant and strong for TREC-COVID (retrieval reduces diversity vs. random, large consistent effect). Not significant for Doctor-Reviews — report that as a corpus-dependent finding (the DR corpus is topically homogeneous, so random sampling doesn't inflate diversity there), not as a contradiction of the trade-off narrative.
+- **Relevant Coverage A→B @ 0.7** (#30-32) — strong and consistent for TREC-COVID only (54-66/105 pairs significant across both embedding models — the strongest structural evidence of method differentiation in the study). Do **not** report Doctor-Reviews coverage numbers (MPNet significant-pair counts run more than double the BGE counts for the same comparisons — an embedding-geometry artifact, not a real effect) or TopicGPT coverage (0/105 under both embedding models in every config).
+
+### Tier 3 — Descriptive only, not for significance claims
+- **Relevant Topic Diversity** (#14) and its derivatives (Relevance-Weighted Diversity #15, Top-K Relevant Diversity #16, Relevant Diversity Ratio #18) — MPNet significance results are invalid (the 0.5 relevance threshold excludes most `random_uniform` queries, biasing the paired test to a cherry-picked subset — this is exactly the `bias_warning=True` failure mode described above). Only the BGE numbers for TC-BT and TC-LDA are clean enough to test; report mean values descriptively for the rest, and never cite DR-GPT's RTD significance (still ~20/21 pairs bias-flagged even under BGE).
+
+### Excluded from the paper entirely
+- Any Doctor-Reviews comparison of `query_expansion` vs. `direct_retrieval` for queries 7-11 (the two are byte-identical there — see the caveat above).
+- HiCODE aggregate statistics — not yet rerun under the dual-embedding-model/Wilcoxon pipeline described above; its output is still the older single-embedding, t-test-only run. Treat any HiCODE number as provisional until it's rerun.
+
+### Why the tiering breaks this way
+BGE inflates cosine similarity by roughly 0.25-0.3 absolute points relative to MPNet. Metrics with no hard threshold (Topic-Query Similarity, raw Semantic Diversity) are stable across embedding models. Metrics that gate on a fixed 0.5 similarity threshold (Relevant Topic Diversity, Relevant Coverage) are not — always check both embedding models, and the `bias_warning` column, before trusting a significance result from a threshold-gated metric.
+
+---
+
 ## Cross-Query Analysis
 
 ### Aggregation Statistics
@@ -1213,6 +1252,12 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for detailed plans on:
 - ✅ **Shared Relevant Topics @ Thresholds** - Now metrics #36-38 (count of relevant topics in both methods)
 - ✅ **Unique Relevant Ratio A/B @ Thresholds** - Now metrics #39-41 (fraction of relevant topics that are unique)
 - ✅ **New Visualizations** - Relevant coverage heatmaps, unique/shared distribution plots, coverage comparison scatter
+
+**Recently Implemented (2026-09):**
+- ✅ **Wilcoxon signed-rank as primary significance test** - paired t-test kept as secondary/backup, both BH-FDR corrected (see "Statistical Significance Testing" above)
+- ✅ **Pairwise coverage significance testing** - Wilcoxon+BH applied to Relevant Coverage A→B metrics (#30-32), symmetrized per target method, with dedicated heatmaps
+- ✅ **Dual embedding model for metrics** - every metric now computable under both `all-mpnet-base-v2` and `BAAI/bge-base-en-v1.5` independent of the retrieval/BERTopic embedding model, isolating embedding-geometry sensitivity (see USAGE.md)
+- ✅ **Aggregate statistical testing expanded from 3 to 11 metrics** - now includes the full relevant-topic-diversity family, not just topic-query similarity/semantic diversity/topic specificity
 
 ---
 

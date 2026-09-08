@@ -1,4 +1,22 @@
 # query_expansion.py
+"""
+Stage 2 (standalone search/retrieval evaluation) of the pipeline - see
+PIPELINE.md. NOT imported by end_to_end_evaluation.py.
+
+QueryExpander is a research tool for comparing query-expansion *strategies*
+(QueryExpansionMethod: KEYBERT/PMI/SOPMI/COMBINED, combined via
+QueryCombinationStrategy: WEIGHTED_RRF/CONCATENATED/CONCATENATED_RERANKED),
+using search_viz.py for comparison plots and evaluation.py's
+SearchEvaluationUtils for Precision/Recall-against-qrels scoring.
+
+end_to_end_evaluation.py's own query_expansion sampling method has a
+separate, simpler, hardcoded implementation (cached KeyBERT keywords + fixed
+70/30 weighted RRF) - this module is for exploring which strategy to use,
+not the one actually running in the main pipeline.
+
+Run standalone: `python src/query_expansion.py`. Outputs to
+results/query_expansion/.
+"""
 import os
 import logging
 import pickle

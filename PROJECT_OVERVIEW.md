@@ -30,6 +30,7 @@ We compare sampling methods across a **spectrum of relevance bias**:
 |--------|------------------|---------------------|
 | **Random Uniform** | None (unbiased control) | Pure random sampling from corpus |
 | **Keyword Search** | Low (lexical only) | BM25 lexical matching |
+| **SBERT** | Medium (semantic only) | Pure dense/semantic retrieval, no lexical signal |
 | **Direct Retrieval** | Medium (lexical + semantic) | Hybrid BM25+SBERT (Simple Sum fusion) |
 | **Direct Retrieval + MMR** | Medium + High Diversity | Hybrid retrieval (5000 candidates) → MMR reranking (λ=0.3) → Top 1000 |
 | **Query Expansion** | High (expanded semantic) | KeyBERT keywords + Weighted RRF fusion |
@@ -38,8 +39,10 @@ We compare sampling methods across a **spectrum of relevance bias**:
 **Independent Variable:** Retrieval method (controls degree of relevance bias and diversity)
 **Dependent Variables:** 50+ topic modeling metrics (includes IDF-based specificity, relevance concentration, document overlap)
 **Sample Size:** 1,000 documents per method (fixed)
-**Dataset:** TREC-COVID corpus (171K documents)
+**Dataset:** TREC-COVID corpus (171K documents); also replicated on a Doctor-Reviews corpus (see [PIPELINE.md](PIPELINE.md))
 **Queries:** 15 queries for cross-query generalization
+
+**Metric robustness check:** every metric is computed under two different embedding models (`all-mpnet-base-v2` and `BAAI/bge-base-en-v1.5`), independent of whichever embedding model the retrieval/BERTopic stage used — since the two models disagree enough on raw cosine similarity to shift threshold-based metrics (e.g. "query-relevant" @ 0.5 similarity). See [USAGE.md](USAGE.md#why-two-embedding-models) for details and [METRICS_GUIDE.md](METRICS_GUIDE.md) for which metrics are safe to cite under which embedding model. Cross-query significance claims use the **Wilcoxon signed-rank test** (primary, BH-FDR corrected) rather than the paired t-test — see METRICS_GUIDE.md's Cross-Query Analysis section.
 
 ### Future Ablations
 
@@ -62,21 +65,25 @@ Planned extensions include:
    - Lexical retrieval based on term matching
    - Low relevance control
 
-3. **Direct Retrieval (Hybrid BM25+SBERT)**
+3. **SBERT (Pure Semantic Retrieval)**
+   - Dense retrieval only, no lexical (BM25) signal
+   - Medium relevance control, isolates the semantic-only contribution
+
+4. **Direct Retrieval (Hybrid BM25+SBERT)**
    - Combines lexical and semantic retrieval
    - Medium relevance control
    - Simple Sum fusion strategy
 
-4. **Direct Retrieval + MMR**
+5. **Direct Retrieval + MMR**
    - Hybrid retrieval with diversity reranking
    - Medium relevance + enforced diversity
 
-5. **Query Expansion + Retrieval**
+6. **Query Expansion + Retrieval**
    - KeyBERT extracts semantically related keywords
    - Weighted RRF fusion (70% original query, 30% keywords)
    - High relevance control
 
-6. **Retrieval Random**
+7. **Retrieval Random**
    - Retrieves large pool (5000), randomly samples target size (1000)
    - Tests relevance filtering vs. ranking bias
 
@@ -243,18 +250,7 @@ python src/end_to_end_evaluation.py
 
 ### Configuration
 
-Edit parameters in `main()` function of `end_to_end_evaluation.py`:
-
-```python
-QUERY_ID = "43"                    # Query to evaluate
-SAMPLE_SIZE = 1000                 # Documents per sample
-EMBEDDING_MODEL = "all-mpnet-base-v2"
-DEVICE = "cpu"                     # or "cuda", "mps"
-SAVE_TOPIC_MODELS = False          # Set True to save 420MB models
-FORCE_REGENERATE_SAMPLES = False
-FORCE_REGENERATE_TOPICS = False
-FORCE_REGENERATE_EVALUATION = False
-```
+Dataset and topic model are selected via `DATASET`/`MODEL` environment variables (fall back to `trec-covid`/`bertopic`); everything else is edited directly in `main()` in `end_to_end_evaluation.py`. See [USAGE.md](USAGE.md) for the complete reference — including the separate metrics-only embedding model, per-sampling-method parameters, and which paths need changing per account.
 
 ### Expected Runtime
 
@@ -291,7 +287,11 @@ See [FUTURE_WORK.md](FUTURE_WORK.md) for:
 ## Key Files
 
 - [`src/end_to_end_evaluation.py`](src/end_to_end_evaluation.py) - Main evaluation pipeline
+- [`PIPELINE.md`](PIPELINE.md) - How every script in this repo fits together, stage by stage
+- [`USAGE.md`](USAGE.md) - Full configuration reference (flags, env vars, hardcoded paths)
+- [`CACHING.md`](CACHING.md) - Cache tiers and invalidation behavior
 - [`METRICS_GUIDE.md`](METRICS_GUIDE.md) - Comprehensive metrics documentation
+- [`GRID_WORKFLOW.md`](GRID_WORKFLOW.md) - Running on the CLSP SLURM grid
 - [`FUTURE_WORK.md`](FUTURE_WORK.md) - Planned experiments and metrics
-- [`README.md`](README.md) - Installation and component documentation
+- [`README.md`](README.md) - Project front door and full documentation index
 - [`requirements.txt`](requirements.txt) - Python dependencies

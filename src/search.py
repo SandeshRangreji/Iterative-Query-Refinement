@@ -1,4 +1,19 @@
 # search.py
+"""
+Stage 1 (indexing) and Stage 2 (standalone retrieval evaluation) of the
+pipeline - see PIPELINE.md.
+
+Provides IndexManager (builds/caches BM25 + SBERT indices, keyed by dataset
+name and index parameters - see CACHING.md) and SearchEngine (BM25 / SBERT /
+hybrid retrieval with Simple-Sum or RRF fusion, optional MMR diversity
+reranking, optional cross-encoder reranking). These are imported by
+end_to_end_evaluation.py, query_expansion.py, and keyword_extraction.py for
+Stage 1 indexing.
+
+Run standalone (`python src/search.py`) for Stage 2: compares BM25 vs SBERT
+vs Hybrid retrieval quality against TREC-COVID qrels (Precision@20,
+Recall@1000). This is a research tool, not invoked by the main pipeline.
+"""
 import os
 import pickle
 import re

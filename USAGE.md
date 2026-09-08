@@ -1,824 +1,264 @@
-# Usage Guide - End-to-End Evaluation
+# Usage Guide — Configuration Reference
+
+This is the detailed configuration reference for `src/end_to_end_evaluation.py` (the main pipeline — see [PIPELINE.md](PIPELINE.md) for how it relates to the other scripts in this repo, and [CACHING.md](CACHING.md) for cache behavior referenced throughout).
 
 ## Quick Start
 
-### Local Execution
+### Local execution
+
 ```bash
-cd /home/srangre1/Iterative-Query-Refinement
+cd /path/to/Iterative-Query-Refinement
 conda activate coreset_proj
 python src/end_to_end_evaluation.py
 ```
 
-### SLURM/HPC Execution
-```bash
-# Set environment variables (if needed)
-export OPENAI_API_KEY="sk-..."  # For TopicGPT
+### SLURM/HPC execution (CLSP grid)
 
-# Submit job to SLURM
-sbatch --export=ALL run_search.sh
+```bash
+# Default (trec-covid, bertopic):
+sbatch grid/run_search.sh
+
+# Override dataset/topic model:
+sbatch --export=ALL,DATASET=doctor-reviews,MODEL=lda grid/run_search.sh
+
+# For TopicGPT, also export an API key:
+sbatch --export=ALL,MODEL=topicgpt,OPENAI_API_KEY=sk-... grid/run_search.sh
 ```
 
-The SLURM script (`run_search.sh`) runs on CPU partition with 24 cores and 32GB memory. No GPU required.
+`grid/run_search.sh` requests the **GPU partition** (1 GPU, 8 CPUs, 16GB) — GPU accelerates SBERT embedding generation but nothing here strictly requires it; CPU-only execution works, just slower. See [GRID_WORKFLOW.md](GRID_WORKFLOW.md) for all grid scripts, what each maps to, and account-specific setup.
 
 ---
 
-## Configuration
+## Configuration Reference
 
-### Editing Parameters
+### Top-level parameters (edited in `main()`, or overridden via env var where noted)
 
-All configuration is in the `main()` function of `src/end_to_end_evaluation.py`:
+All of this is in `main()` in `src/end_to_end_evaluation.py`:
 
 ```python
 def main():
-    # Query configuration
-    QUERY_IDS = ["2", "9", "10", ..., "48"]  # List of 15 queries or single query
-    SAMPLE_SIZE = 1000                       # Documents per sample
+    # Dataset selection — override via DATASET env var
+    DATASET_NAME = os.environ.get("DATASET", "trec-covid")   # "trec-covid" | "doctor-reviews"
 
-    # Model configuration
-    EMBEDDING_MODEL = "all-mpnet-base-v2"
+    QUERY_IDS = dataset_config["query_ids"]   # all queries for the selected dataset by default
+    SAMPLE_SIZE = 1000                        # documents per sample, fixed across all methods
+
+    # Embedding models — TWO separate knobs, see "Why two embedding models?" below
+    EMBEDDING_MODEL = "all-mpnet-base-v2"                # retrieval, BERTopic, KeyBERT
+    METRICS_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"    # metric computation only
+
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    DATASET_NAME = "trec-covid"
 
-    # Topic modeling configuration
-    TOPIC_MODEL_TYPE = "bertopic"      # Options: "bertopic", "lda", "topicgpt"
-    TOPIC_MODEL_PARAMS = {}            # Model-specific parameters (see below)
+    # Topic model selection — override via MODEL env var
+    TOPIC_MODEL_TYPE = os.environ.get("MODEL", "bertopic")   # "bertopic" | "lda" | "topicgpt"
+    TOPIC_MODEL_PARAMS = { ... }   # model-specific, see "Topic Model Parameters" below
 
-    # Device configuration
-    DEVICE = "cpu"                     # or "cuda", "mps" for GPU
+    DEVICE = "cpu"   # "cpu" | "cuda" | "mps"
 
-    # Caching configuration
-    SAVE_TOPIC_MODELS = False          # Set True to save full models
-    FORCE_REGENERATE_SAMPLES = False   # Force re-run sampling
-    FORCE_REGENERATE_TOPICS = False    # Force re-run topic modeling
-    FORCE_REGENERATE_EVALUATION = False  # Force re-compute metrics
+    SAVE_TOPIC_MODELS = False            # True saves full ~420MB BERTopic models
+    FORCE_REGENERATE_SAMPLES = False
+    FORCE_REGENERATE_TOPICS = False
+    FORCE_REGENERATE_EVALUATION = False
 
-    # Directory configuration
-    OUTPUT_DIR = "results"
+    OUTPUT_DIR = "results"     # see "Hardcoded paths" below — several places don't respect this
     CACHE_DIR = "cache"
     RANDOM_SEED = 42
 ```
 
-### Configuration Parameters
+**HiCode is not selected via `TOPIC_MODEL_TYPE`.** It's a separate entry point (`src/evaluate_hicode_all_queries.py`) that evaluates an externally-produced HiCode run rather than fitting a topic model itself — see PIPELINE.md's Stage 4b.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `QUERY_IDS` | ["2", "9", ..., "48"] | List of query IDs or single query string |
-| `SAMPLE_SIZE` | 1000 | Number of documents to sample per method |
-| `TOPIC_MODEL_TYPE` | "bertopic" | Topic model type: "bertopic", "lda", "topicgpt" |
-| `TOPIC_MODEL_PARAMS` | {} | Model-specific parameters (see below) |
-| `EMBEDDING_MODEL` | "all-mpnet-base-v2" | SentenceTransformer model for embeddings |
-| `CROSS_ENCODER_MODEL` | "cross-encoder/ms-marco-MiniLM-L-6-v2" | Cross-encoder for reranking |
-| `DATASET_NAME` | "trec-covid" | Dataset name (used for caching) |
-| `DEVICE` | "cpu" | Device for embeddings ("cpu", "cuda", "mps") |
-| `SAVE_TOPIC_MODELS` | False | Whether to save full topic models |
-| `FORCE_REGENERATE_SAMPLES` | False | Force re-run document sampling |
-| `FORCE_REGENERATE_TOPICS` | False | Force re-run topic modeling |
-| `FORCE_REGENERATE_EVALUATION` | False | Force re-compute evaluation metrics |
-| `OUTPUT_DIR` | "results" | Output directory for results |
-| `CACHE_DIR` | "cache" | Cache directory for indices and models |
-| `RANDOM_SEED` | 42 | Random seed for reproducibility |
+### Why two embedding models?
 
----
+`EMBEDDING_MODEL` drives retrieval (BM25+SBERT hybrid search) and BERTopic's own clustering. `METRICS_EMBEDDING_MODEL` is used *only* when computing topic-query similarity, semantic diversity, and every other embedding-based metric — completely independent of what the topic model itself used internally.
 
-## Switching Between Topic Models
+This split exists because the two candidate models disagree substantially: BGE (`BAAI/bge-base-en-v1.5`) inflates raw cosine similarity by roughly 0.25-0.30 absolute points versus MPNet (`all-mpnet-base-v2`) on the same text pairs. Any metric with a hard similarity threshold (e.g. "query-relevant" = similarity ≥ 0.5) is sensitive to this — under MPNet, `random_uniform` samples almost never clear 0.5 similarity to the query, which biases paired significance tests toward a tiny, non-representative subset of queries. Running metrics under both embedding models and comparing is how that sensitivity gets caught rather than silently baked into a single number. Results from each model land in separate tagged subdirectories (`results/.../{metrics_tag}/` — see [CACHING.md](CACHING.md)) so neither overwrites the other.
 
-The evaluation framework supports multiple topic modeling methods. All metrics and visualizations work identically across models.
+### Sampling methods — what's configurable vs. hardcoded
 
-### Available Topic Models
+All 7 methods are always run; there's no flag to select a subset. Most of their internal parameters (MMR λ, RRF fusion weights, candidate pool sizes) are **hardcoded inside each method's function body**, not exposed as `main()` constants — to change them you edit the method directly:
 
-1. **BERTopic** - Embedding-based topic modeling with HDBSCAN clustering
-2. **LDA** - Latent Dirichlet Allocation (bag-of-words, probabilistic)
-3. **TopicGPT** - LLM-based topic modeling using OpenAI API
+| Method | Function (file:line) | Key parameters (hardcoded unless noted) |
+|---|---|---|
+| `random_uniform` | `sample_random_uniform` (`src/end_to_end_evaluation.py:1416`) | none |
+| `keyword_search` | `sample_keyword_search` (`:1550`) | BM25 only, `top_k=SAMPLE_SIZE` |
+| `sbert` | `sample_sbert` (`:1580`) | SBERT only |
+| `direct_retrieval` | `sample_direct_retrieval` (`:1447`) | Hybrid, `HybridStrategy.SIMPLE_SUM` |
+| `direct_retrieval_mmr` | `sample_direct_retrieval_mmr` (`:1610`) | candidate pool = 5000, MMR `lambda_param=0.3` |
+| `query_expansion` | `sample_query_expansion` (`:1478`) | RRF weights fixed 0.7 (baseline) / 0.3 split across keywords; reads keyword cache (path is a **constructor parameter**, `keyword_cache_path`, set per-dataset in `main()`'s `DATASET_CONFIGS`) |
+| `retrieval_random` | `sample_retrieval_random` (`:1680`) | pool size = 5000 (constructor default parameter) |
 
-### Using BERTopic (Default)
+BM25/SBERT/hybrid/MMR/cross-encoder parameters *are* exposed as named constants, but only in `src/search.py`'s own standalone `main()` (used for Stage 2 research, not by the main pipeline) — see PIPELINE.md. If you want to experiment with, say, a different MMR λ across the whole pipeline, you're editing `src/end_to_end_evaluation.py` directly.
+
+### Topic Model Parameters
+
+#### BERTopic (default)
 
 ```python
-# In main() of src/end_to_end_evaluation.py
-
 TOPIC_MODEL_TYPE = "bertopic"
-
-# BERTopic parameters
 TOPIC_MODEL_PARAMS = {
-    # Using defaults that match current behavior
-    # Optional overrides:
     # "min_cluster_size": 5,
     # "metric": "euclidean",
     # "cluster_selection_method": "eom",
-    # "min_df": 2,
-    # "ngram_range": (1, 2),
-    # "max_features": 10000
+    # "min_df": 2, "ngram_range": (1, 2), "max_features": 10000
 }
 ```
+Auto-determines topic count via HDBSCAN; some documents become outliers (topic = -1); variable document coverage; requires `EMBEDDING_MODEL`; ~5-8 min/query; ~420MB/saved model.
 
-**BERTopic Characteristics:**
-- **Auto-determines topic count** using HDBSCAN clustering
-- **Outliers**: Some documents marked as outliers (topic ID = -1)
-- **Document Coverage**: Variable (typically 80-95%)
-- **Requires**: Embeddings (uses `EMBEDDING_MODEL`)
-- **Runtime**: ~5-8 min per query (1000 docs)
-- **Model Size**: ~420 MB per saved model
-
----
-
-### Using LDA (Latent Dirichlet Allocation)
+#### LDA
 
 ```python
-# In main() of src/end_to_end_evaluation.py
-
 TOPIC_MODEL_TYPE = "lda"
-
-# LDA parameters (biomedical-optimized for TREC-COVID)
 TOPIC_MODEL_PARAMS = {
-    "n_topics": "auto",       # Match BERTopic results, or specify int (e.g., 20)
-    "alpha": "symmetric",     # Document-topic prior
-    "eta": 0.01,              # Topic-word prior (sparse for focused topics)
-    "passes": 15,             # Training passes
-    "iterations": 100,        # Iterations per pass
-    "random_state": 42,
-    "workers": 20,            # Multi-core training (adjust for your system)
-    # Vocabulary params (match BERTopic for fair comparison)
-    "min_df": 2,
-    "ngram_range": (1, 2),
-    "max_features": 10000
+    "n_topics": "auto",       # matches BERTopic's discovered count per method, or pass an int
+    "alpha": "symmetric", "eta": 0.01, "passes": 15, "iterations": 100,
+    "random_state": 42, "workers": 20,
+    "min_df": 2, "ngram_range": (1, 2), "max_features": 10000
 }
-
-# Force flags for LDA (samples are shared with BERTopic)
-FORCE_REGENERATE_SAMPLES = False   # Use existing samples
-FORCE_REGENERATE_TOPICS = True     # Generate LDA models
-FORCE_REGENERATE_EVALUATION = True # Generate LDA results
+FORCE_REGENERATE_TOPICS = True     # samples are shared with BERTopic; only topics need regenerating
+FORCE_REGENERATE_EVALUATION = True
 ```
+`"auto"` reads `n_topics` per method from `results/{dataset}/bertopic/query_{id}/results/{metrics_tag}/per_method_summary.csv` (falls back to 20 if not found) — this is what makes LDA-vs-BERTopic an apples-to-apples topic-count comparison. Bag-of-words (CPU-only, no embeddings); 100% document coverage (no outliers); ~2-5 min/query, faster than BERTopic.
 
-**LDA Characteristics:**
-- **Fixed topic count** (must specify or use "auto" to match BERTopic)
-- **No outliers**: All documents assigned to topics (100% coverage)
-- **Probabilistic**: Returns full topic distribution per document
-- **Bag-of-words**: Does NOT use embeddings (CPU-only)
-- **Runtime**: ~2-5 min per query (1000 docs) - **faster than BERTopic**
-- **Model Size**: ~10-50 MB per saved model
+| `eta` | Effect |
+|---|---|
+| `0.01` | Focused, domain-specific topics (recommended for biomedical/technical text) |
+| `None` | Moderate sparsity (general text) |
+| `1.0` | Broad, less focused topics |
 
-**LDA-Specific: "auto" n_topics**
-
-The special value `"auto"` makes LDA match BERTopic's discovered topic counts:
-
-1. Reads: `/home/srangre1/results/trec-covid/bertopic/query_{id}/results/per_method_summary.csv`
-2. Extracts `n_topics` for each sampling method
-3. Uses those exact values for LDA training
-4. **Result**: Perfect apples-to-apples comparison!
-
-Falls back to `n_topics=20` if BERTopic results not found.
-
-**LDA Hyperparameter Guide:**
-
-| Parameter | Recommended | Alternative | Effect |
-|-----------|-------------|-------------|--------|
-| `n_topics` | `"auto"` | `20` | Match BERTopic or fixed count |
-| `alpha` | `"symmetric"` | `0.01`, `1.0` | Document-topic sparsity |
-| `eta` | `0.01` | `None`, `0.05` | Topic-word sparsity (0.01 = focused topics) |
-| `passes` | `15` | `10`, `20` | More passes = better convergence |
-| `iterations` | `100` | `50`, `200` | More iterations = better quality |
-| `workers` | `20` | `4`, `os.cpu_count()-1` | Multi-core parallelization |
-
-**When to use each value:**
-- `eta=0.01`: **Biomedical/technical text** (focused, domain-specific topics)
-- `eta=None`: General text (moderate sparsity)
-- `eta=1.0`: Broad topics (less focused)
-- `alpha=0.01`: Few topics per document
-- `alpha=1.0`: Many topics per document
-
----
-
-### Installation Requirements
-
-**BERTopic** (included by default):
-```bash
-pip install bertopic==0.17.0
-pip install sentence-transformers==3.4.1
-```
-
-**LDA** (requires Gensim):
-```bash
-pip install gensim==4.3.2
-```
-
-**TopicGPT** (requires OpenAI API):
-```bash
-pip install topicgpt_python>=0.1.0
-export OPENAI_API_KEY="your-api-key"
-```
-
-Already added to `requirements.txt`.
-
----
-
-### Using TopicGPT (LLM-Based Topic Modeling)
-
-TopicGPT uses large language models to generate and assign topics. It provides more interpretable topic descriptions but requires an OpenAI API key and incurs API costs.
+#### TopicGPT
 
 ```python
-# In main() of src/end_to_end_evaluation.py
-
 TOPIC_MODEL_TYPE = "topicgpt"
-
-# TopicGPT parameters
 TOPIC_MODEL_PARAMS = {
-    # Model selection (use cheaper models for cost efficiency)
-    "generation_model": "gpt-4o-mini",    # Model for topic generation
-    "assignment_model": "gpt-4o-mini",    # Model for topic assignment
-
-    # Sampling parameters
-    "generation_sample_size": 500,        # Documents to sample for topic generation
-
-    # Vocabulary (match BERTopic/LDA)
-    "min_df": 2,
-    "ngram_range": (1, 2),
-    "max_features": 10000,
-
-    # Output
-    "verbose": True
+    "generation_model": "gpt-4o-mini", "assignment_model": "gpt-4o-mini",
+    "generation_sample_size": 500,
+    "min_df": 2, "ngram_range": (1, 2), "max_features": 10000, "verbose": True
 }
-
-# Force flags for TopicGPT
-FORCE_REGENERATE_SAMPLES = False   # Use existing samples
-FORCE_REGENERATE_TOPICS = True     # Generate TopicGPT models
-FORCE_REGENERATE_EVALUATION = True # Generate TopicGPT results
+FORCE_REGENERATE_TOPICS = True
+FORCE_REGENERATE_EVALUATION = True
 ```
+Requires `export OPENAI_API_KEY="sk-..."`. Two-stage: generation (500 docs) → assignment (all docs). CPU-only (sentence-transformers on CPU); 100% coverage; ~10-30 min/query depending on rate limits; **incurs real API costs** — `gpt-4o-mini`/`gpt-4o-mini` is ~$1.50/sample (~$135 for a full 15-query × 6-method-ish run). See git history / RESULTS_REPORT.md for cost-vs-quality notes if switching to `gpt-4o` or `gpt-4-turbo`.
 
-**Environment Setup:**
-```bash
-# Set API key (required)
-export OPENAI_API_KEY="sk-..."
+#### HiCode
 
-# Run evaluation
-python src/end_to_end_evaluation.py
-```
+Not configured here — see `src/evaluate_hicode_all_queries.py` and [GRID_WORKFLOW.md](GRID_WORKFLOW.md). It evaluates a pre-existing external HiCode run rather than fitting anything itself, so there's no `TOPIC_MODEL_PARAMS` equivalent — the tunable is whichever HiCode run's output directory you point it at.
 
-**TopicGPT Characteristics:**
-- **LLM-generated topics**: Natural language topic descriptions via OpenAI API
-- **Two-stage process**: Topic generation (500 docs) → Topic assignment (all docs)
-- **CPU-only execution**: Uses sentence-transformers on CPU (no GPU required)
-- **No outliers**: All documents assigned (100% coverage)
-- **Requires**: OpenAI API key (OPENAI_API_KEY environment variable)
-- **Runtime**: Varies by model and rate limits (~10-30 min per query)
-- **Cost**: ~$1-15 per sample depending on models used
+### Hardcoded paths — must change if you're not running as the original author
 
-**Model Selection Guide:**
+These are baked into the Python source as literal strings, not exposed via env var or `main()` config. If you're running under a different account (or a different grid), you need to edit these directly:
 
-| Model | Input/1M | Output/1M | Best For |
-|-------|----------|-----------|----------|
-| `gpt-4o-mini` | $0.15 | $0.60 | **Recommended default** |
-| `gpt-3.5-turbo` | $0.50 | $1.50 | Legacy cheap option |
-| `gpt-4o` | $5.00 | $15.00 | Higher quality |
-| `gpt-4-turbo` | $10.00 | $30.00 | Best quality |
+| File:line | Current value | What it is |
+|---|---|---|
+| `src/end_to_end_evaluation.py:5411`, `:5415` (inside `DATASET_CONFIGS`) | `/home/srangre1/cache/keywords/*.json` | Keyword cache paths per dataset (Stage 3 output) |
+| `generate_doctor_review_keywords.py` (`CORPUS_PATH`, `OUTPUT_PATH`) | `/home/srangre1/datasets/...`, `/home/srangre1/cache/keywords/...` | Doctor-reviews corpus input + keyword cache output |
+| `create_filtered_doctor_corpus.py` | corpus input/output paths | Check the script's top-level constants before running |
+| `src/evaluate_hicode_all_queries.py` (argparse defaults: `--hicode-dir`, `--samples-dir`, `--output-dir`) | `/export/fs06/mzhong8/...`, `/home/srangre1/results/...` | HiCode external input + output location — override with CLI flags, don't rely on defaults |
+| `regenerate_diversity_plots.py` | `/home/srangre1/results/trec-covid/...` | Legacy utility, stale paths regardless — see GRID_WORKFLOW.md |
+| `grid/*.sh` | `CONFIGURATION` block at top of each script | See [GRID_WORKFLOW.md](GRID_WORKFLOW.md) |
 
-**Cost Estimation (1000 docs per sample):**
-
-| Configuration | Cost/Sample | 90 Samples (Full Run) |
-|---------------|-------------|------------------------|
-| gpt-4o-mini / gpt-4o-mini | ~$1.50 | ~$135 |
-| gpt-4o / gpt-4o-mini | ~$8.00 | ~$720 |
-| gpt-4-turbo / gpt-4o-mini | ~$12.00 | ~$1,080 |
-
-**TopicGPT-Specific Outputs:**
-
-TopicGPT results include additional fields:
-- `topic_descriptions`: Natural language topic descriptions from LLM
-- `assignment_quotes`: Supporting quotes from documents
-
-These are saved in `topic_models/{method}_results.pkl` and can be accessed for qualitative analysis.
+`OUTPUT_DIR = "results"` in `end_to_end_evaluation.py`'s `main()` is a *relative* path — where it resolves to depends on your working directory when you launch the script. The results referenced throughout this project's reports live under `/home/srangre1/results` (i.e. the script was launched from `/home/srangre1/`, not from inside the repo). If you run from inside the repo instead, you'll get a separate, disconnected `results/` tree inside it — don't assume the two are the same or in sync. This is exactly what happened here: see [TRANSITION_PLAN.md](TRANSITION_PLAN.md) for the validated evidence on which copy is real.
 
 ---
 
-### Output Structure by Model Type
-
-Results are saved separately by model type:
+## Output Structure
 
 ```
-results/
-└── trec-covid/
-    ├── bertopic/              # BERTopic results
-    │   └── query_2/
-    │       ├── samples/
-    │       ├── topic_models/
-    │       └── results/
-    │
-    ├── lda/                   # LDA results
-    │   └── query_2/
-    │       ├── samples/       # Can share with BERTopic
-    │       ├── topic_models/
-    │       └── results/
-    │
-    └── topicgpt/              # TopicGPT results
-        └── query_2/
-            ├── samples/       # Can share with BERTopic/LDA
-            ├── topic_models/
-            └── results/
+results/{dataset}/{topic_model}/query_{id}/
+├── config.json
+├── samples/{method}.pkl                         # shared across topic models (see CACHING.md)
+├── topic_models/{method}_results.pkl            # always saved
+├── topic_models/{method}_model.pkl              # only if SAVE_TOPIC_MODELS=True
+└── results/{metrics_tag}/
+    ├── per_method_summary.csv
+    ├── pairwise_metrics.csv
+    ├── topics_summary/{method}_topics.{txt,json}
+    └── plots/                                   # ~20+ plots incl. Wilcoxon + coverage heatmaps
+
+results/{dataset}/{topic_model}/aggregate_results/{metrics_tag}/
+├── statistical_tests/                           # Wilcoxon + t-test CSVs, coverage-significance CSVs, heatmaps
+├── per_method_aggregates.json
+└── plots/
 ```
 
-**Sample Sharing:**
-- Document samples are **identical** across model types (determined by retrieval method)
-- Set `FORCE_REGENERATE_SAMPLES = False` to reuse existing samples
-- LDA will use BERTopic's samples if they exist
+`{metrics_tag}` = `METRICS_EMBEDDING_MODEL` with `/` and `-` replaced by `_` (e.g. `BAAI_bge_base_en_v1.5`). See [CACHING.md](CACHING.md) for the full cache-tier breakdown this structure sits on top of.
 
 ---
 
-### Comparing Topic Models
+## Statistical Significance Testing
 
-Run multiple models on the same queries, then compare results:
+Cross-query aggregate comparisons run two paired tests per method-pair, per metric:
 
-```bash
-# Step 1: Run BERTopic (if not already done)
-# Edit main(): TOPIC_MODEL_TYPE = "bertopic"
-python src/end_to_end_evaluation.py
+- **Wilcoxon signed-rank (primary)** — `wilcoxon_test()`, BH-FDR corrected. This is the number to lead with in any significance claim.
+- **Paired t-test (secondary/backup)** — kept for continuity with earlier analysis, also BH-FDR corrected, plotted with a "secondary" label.
 
-# Step 2: Run LDA
-# Edit main(): TOPIC_MODEL_TYPE = "lda"
-python src/end_to_end_evaluation.py
+Both use **listwise NaN deletion** per method-pair (queries where either method's metric is NaN are dropped from that specific test) and flag `bias_warning=True` in the output CSV when this reduces the query count below the total — check that flag before trusting a significance result computed on a shrunken query set (this is exactly the failure mode that makes MPNet-based Relevant-Topic-Diversity claims unreliable; see METRICS_GUIDE.md).
 
-# Step 3: Run TopicGPT
-# Edit main(): TOPIC_MODEL_TYPE = "topicgpt"
-# Set OPENAI_API_KEY environment variable
-python src/end_to_end_evaluation.py
+A separate test, `run_pairwise_coverage_statistical_tests()`, applies the same Wilcoxon+BH treatment specifically to the "Relevant Coverage A→B" pairwise metrics (METRICS_GUIDE.md #30-32), symmetrized so every method is evaluated as both a coverage "source" and "target," with its own per-target heatmaps (`coverage_wilcoxon_significance_at07_{target}.png`).
 
-# Step 4: Compare results
-# BERTopic: results/trec-covid/bertopic/query_2/results/per_method_summary.csv
-# LDA:      results/trec-covid/lda/query_2/results/per_method_summary.csv
-# TopicGPT: results/trec-covid/topicgpt/query_2/results/per_method_summary.csv
-```
-
-**Key Metrics to Compare:**
-
-| Metric | BERTopic | LDA | TopicGPT |
-|--------|----------|-----|----------|
-| **NPMI Coherence** | Variable | Variable | Variable |
-| **Embedding Coherence** | Usually highest (uses embeddings) | Lower (BoW) | Medium |
-| **Semantic Diversity** | Usually highest (HDBSCAN) | Medium | Depends on LLM |
-| **Document Coverage** | Variable (has outliers) | Always 1.0 | Always 1.0 |
-| **Interpretability** | Word lists | Word lists | Natural language |
-| **Cost** | Free (local) | Free (local) | API costs |
-| **Speed** | Medium | Fast | Slow (API calls) |
-
----
-
-### Switching Models Mid-Project
-
-**Scenario**: Already ran BERTopic, now want to run LDA.
-
-**Steps:**
-
-1. **Keep existing BERTopic results** (don't regenerate)
-
-2. **Configure LDA in `main()`:**
-```python
-TOPIC_MODEL_TYPE = "lda"
-TOPIC_MODEL_PARAMS = {"n_topics": "auto", ...}  # Matches BERTopic
-FORCE_REGENERATE_SAMPLES = False    # Reuse BERTopic samples
-FORCE_REGENERATE_TOPICS = True      # Generate new LDA models
-```
-
-3. **Run evaluation:**
-```bash
-python src/end_to_end_evaluation.py
-```
-
-4. **Results saved separately:**
-   - BERTopic: `results/trec-covid/bertopic/`
-   - LDA: `results/trec-covid/lda/`
-
-**No conflicts** - models are completely isolated.
+Aggregate testing covers 11 metrics by default (see `run_aggregate_statistical_analysis()`'s `metrics_to_test` list) — topic-query similarity, semantic diversity, topic specificity, plus the full relevant-topic-diversity family.
 
 ---
 
 ## Common Workflows
 
-### 1. Run Evaluation for Different Query
-
-Edit `QUERY_ID` in `main()`:
-
-```python
-QUERY_ID = "1"  # Change to desired query ID (1-50 available in TREC-COVID)
-```
-
-Then run:
-```bash
-python src/end_to_end_evaluation.py
-```
-
-Results saved to: `results/topic_evaluation/query_1/`
-
----
-
-### 2. Force Regenerate Everything (Clean Run)
-
-Set all force flags to `True`:
-
+### Force regenerate everything (clean run)
 ```python
 FORCE_REGENERATE_SAMPLES = True
 FORCE_REGENERATE_TOPICS = True
 FORCE_REGENERATE_EVALUATION = True
 ```
 
-Use case: Modified sampling logic or BERTopic configuration
-
----
-
-### 3. Iterative Metric Development
-
-When developing new metrics, avoid re-running expensive sampling/modeling:
-
+### Iterative metric development (don't re-run sampling/topic-modeling)
 ```python
-FORCE_REGENERATE_SAMPLES = False      # Keep cached samples
-FORCE_REGENERATE_TOPICS = False       # Keep cached topic models
-FORCE_REGENERATE_EVALUATION = True    # Re-compute metrics only
+FORCE_REGENERATE_SAMPLES = False
+FORCE_REGENERATE_TOPICS = False
+FORCE_REGENERATE_EVALUATION = True
 ```
 
-Workflow:
-1. Modify metric computation code in `end_to_end_evaluation.py`
-2. Set `FORCE_REGENERATE_EVALUATION = True`
-3. Re-run script
-4. Check updated results in `results/topic_evaluation/query_X/`
+### Switching topic models mid-project
+Samples are shared automatically (see CACHING.md's cross-model fallback) — set `FORCE_REGENERATE_SAMPLES = False`, `FORCE_REGENERATE_TOPICS = True` when moving from e.g. BERTopic to LDA. Results land in separate, non-conflicting directories per model type.
 
----
-
-### 4. Save BERTopic Models for Exploration
-
-By default, full BERTopic models are NOT saved (saves ~25 GB for 15 queries × 4 methods).
-
-To save models for interactive exploration:
-
-```python
-SAVE_TOPIC_MODELS = True
-```
-
-Models saved to: `results/topic_evaluation/query_X/topic_models/{method}_model.pkl`
-
-Load with:
-```python
-from bertopic import BERTopic
-model = BERTopic.load("path/to/model.pkl")
-```
-
----
-
-### 5. GPU Acceleration
-
-If you have CUDA-compatible GPU:
-
-```python
-DEVICE = "cuda"
-```
-
-For Apple Silicon (M1/M2/M3):
-```python
-DEVICE = "mps"
-```
-
-Speeds up:
-- SBERT embedding generation (~2-3x faster)
-- HDBSCAN clustering (if using cuML - optional)
-
----
-
-## Output Structure
-
-After running, results are organized as:
-
-```
-results/topic_evaluation/query_{query_id}/
-├── config.json                          # Run configuration
-│
-├── samples/                             # Cached document samples
-│   ├── random_uniform.pkl
-│   ├── keyword_search.pkl
-│   ├── direct_retrieval.pkl
-│   └── query_expansion.pkl
-│
-├── topic_models/                        # Cached BERTopic results
-│   ├── random_uniform_results.pkl       # Topic results (always saved)
-│   ├── random_uniform_model.pkl         # Full model (optional, 420 MB)
-│   ├── keyword_search_results.pkl
-│   ├── direct_retrieval_results.pkl
-│   └── query_expansion_results.pkl
-│
-└── results/                             # Evaluation outputs
-    ├── per_method_summary.csv           # All per-method metrics
-    ├── pairwise_metrics.csv             # All pairwise method comparisons
-    │
-    ├── topics_summary/                  # Human-readable topic lists
-    │   ├── random_uniform_topics.txt
-    │   ├── keyword_search_topics.txt
-    │   ├── direct_retrieval_topics.txt
-    │   └── query_expansion_topics.txt
-    │
-    └── plots/                           # Visualizations (17 plots)
-        ├── intrinsic_quality_metrics.png
-        ├── query_alignment_metrics.png
-        ├── diversity_scatter.png
-        ├── pairwise_topic_similarity.png
-        ├── pairwise_topic_overlap.png
-        ├── pairwise_f1_05.png
-        ├── pairwise_f1_06.png
-        ├── pairwise_f1_07.png
-        └── ... (14 pairwise heatmaps total)
-```
-
-### Key Output Files
-
-- **`per_method_summary.csv`**: Compare intrinsic quality and query alignment across methods
-- **`pairwise_metrics.csv`**: All pairwise method comparisons (topic matching, diversity differences, etc.)
-- **`topics_summary/*.txt`**: Human-readable topic lists for qualitative validation
-- **`plots/`**: All visualizations for pattern identification
-
----
-
-## Expected Runtime
-
-Runtime depends on caching state:
-
-### Query 43 (sample_size=1000)
-
-| Step | Cold Run (No Cache) | Cached |
-|------|---------------------|--------|
-| Index building (BM25 + SBERT) | ~10-15 min (one-time) | < 1 sec |
-| Sampling (4 methods) | ~2-3 min | < 1 sec |
-| Topic modeling (4 models) | ~5-8 min | < 1 sec |
-| Evaluation | ~2-3 min | ~2-3 min |
-| **Total** | **~20-30 min** | **~2-3 min** |
-
-### 15 Queries (Full Evaluation)
-
-| Configuration | Total Runtime |
-|---------------|---------------|
-| Cold run (no cache) | ~5-8 hours |
-| Cached samples + models | ~30-45 min |
-| Cached everything | ~30-45 min (evaluation not cached across queries) |
-
-*Times assume CPU. GPU reduces topic modeling time by ~30-50%.*
-
----
-
-## Caching Behavior
-
-### Three-Tier Caching
-
-1. **Search Indices** (shared across all queries)
-   - `cache/{dataset}/bm25_index.pkl` - BM25 index
-   - `cache/{dataset}/sbert_embeddings_{model}.npy` - SBERT embeddings
-   - Built once, reused for all queries
-
-2. **Document Samples** (per query, per method)
-   - `results/topic_evaluation/query_X/samples/{method}.pkl`
-   - Controlled by `FORCE_REGENERATE_SAMPLES`
-
-3. **Topic Models** (per query, per method)
-   - `results/topic_evaluation/query_X/topic_models/{method}_results.pkl` (always saved)
-   - `results/topic_evaluation/query_X/topic_models/{method}_model.pkl` (optional, 420 MB)
-   - Controlled by `FORCE_REGENERATE_TOPICS` and `SAVE_TOPIC_MODELS`
-
-4. **Evaluation Results** (per query)
-   - `results/topic_evaluation/query_X/results/`
-   - Controlled by `FORCE_REGENERATE_EVALUATION`
-
-### Cache Logic
-
-```python
-if cache_exists and not force_flag:
-    load_from_cache()
-else:
-    compute()
-    save_to_cache()
-```
-
-### Clearing Cache
-
-To force full recomputation:
-
-```bash
-# Clear all results for a query
-rm -rf results/topic_evaluation/query_43/
-
-# Clear all search indices (requires rebuild)
-rm -rf cache/trec-covid/
-
-# Clear all results (all queries)
-rm -rf results/topic_evaluation/
-```
+### Comparing across the two embedding models
+Run once with default `METRICS_EMBEDDING_MODEL`, then again after changing it — both land in separate `{metrics_tag}` subdirectories automatically, nothing to clean up between runs.
 
 ---
 
 ## Dependencies
 
-### Required Packages
-
-All dependencies in `requirements.txt`:
-
-```txt
-bertopic==0.17.0
-sentence-transformers==3.4.1
-datasets==3.4.1
-matplotlib==3.10.1
-seaborn==0.13.2
-scikit-learn>=1.0.0
-scipy>=1.7.0
-tqdm>=4.62.0
-pandas>=1.3.0
-numpy>=1.21.0
-rank-bm25>=0.2.2
-nltk>=3.6.0
-```
-
-### Installation
-
 ```bash
 conda create -n coreset_proj python=3.11
 conda activate coreset_proj
 pip install -r requirements.txt
-
-# Download NLTK data
 python -c "import nltk; nltk.download('stopwords'); nltk.download('punkt')"
 ```
 
-### Optional (GPU Acceleration)
-
-For CUDA support:
-```bash
-pip install cupy-cuda11x  # Replace 11x with your CUDA version
-pip install cuml-cu11     # GPU-accelerated clustering
-```
+See `requirements.txt` for pinned versions (BERTopic, sentence-transformers, gensim, topicgpt_python, rank-bm25, keybert, etc.). GPU acceleration (optional): `cupy-cuda11x` is already listed; add `cuml-cu11` for GPU-accelerated HDBSCAN clustering if desired.
 
 ---
 
 ## Troubleshooting
 
-### 1. Missing Keywords Cache
+**Missing keyword cache** (`FileNotFoundError: Keyword cache not found`) — the path itself is missing entirely (different from the graceful per-query fallback described in CACHING.md, which only triggers when the *file* exists but a specific query_id key doesn't). Check the path is correct for your account (see "Hardcoded paths" above) and that the corresponding Stage 3 generation script has been run.
 
-**Error:**
-```
-FileNotFoundError: Keyword cache not found: /home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json
-```
+**BERTopic: "HDBSCAN could not find any clusters"** — sample too small/homogeneous. Handled gracefully (method skipped, warning logged, evaluation continues) — usually not an error, just means that method has no result for that query.
 
-**Cause:** Query expansion method requires pre-extracted KeyBERT keywords
+**Low document overlap → ARI/NMI near 0 or NaN** — expected; retrieval-based and random samples are mostly disjoint by construction, so document-overlap clustering-agreement metrics are naturally weak. Not a bug.
 
-**Solution 1 (Quick):** Keywords should already exist at the path above. Check if file exists.
+**CUDA out of memory** — reduce SBERT `batch_size` (hardcoded in `search.py`'s index-building calls), set `DEVICE = "cpu"`, or reduce `SAMPLE_SIZE`.
 
-**Solution 2 (Regenerate):**
-```python
-from src.keyword_extraction import KeywordExtractor
-# Run keyword extraction (see keyword_extraction.py documentation)
-```
-
-**Solution 3 (Skip method):** Comment out query expansion method in `main()` if not needed
-
----
-
-### 2. BERTopic Clustering Fails
-
-**Error:**
-```
-HDBSCAN could not find any clusters
-```
-
-**Cause:** Sample too small or too homogeneous for HDBSCAN density-based clustering
-
-**Behavior:** Method is skipped gracefully, warning logged, evaluation continues
-
-**Solution:**
-- Increase `min_cluster_size` in BERTopic configuration (current: 5)
-- Increase `SAMPLE_SIZE` (current: 1000)
-- Normal behavior for some queries - method simply excluded from results
-
----
-
-### 3. Low Document Overlap Warning
-
-**Warning:**
-```
-Insufficient overlap (12 docs) for clustering metrics (ARI/NMI)
-```
-
-**Cause:** Different sampling methods naturally have little document overlap
-
-**Behavior:** ARI and NMI reported as 0.0 or N/A
-
-**Explanation:** Expected behavior - retrieval and random samples are mostly disjoint. Not an error.
-
----
-
-### 4. CUDA Out of Memory
-
-**Error:**
-```
-RuntimeError: CUDA out of memory
-```
-
-**Solutions:**
-- Reduce batch size in SBERT encoding (edit `batch_size` parameter)
-- Use `DEVICE = "cpu"` instead
-- Reduce `SAMPLE_SIZE` (e.g., 500 instead of 1000)
-- Clear GPU cache: `torch.cuda.empty_cache()`
-
----
-
-### 5. Slow Evaluation on CPU
-
-**Symptom:** Evaluation takes >30 min per query
-
-**Solutions:**
-- Enable GPU: `DEVICE = "cuda"` or `"mps"`
-- Reduce sample size: `SAMPLE_SIZE = 500`
-- Skip saving models: `SAVE_TOPIC_MODELS = False` (default)
-- Run on subset of queries initially
-
----
-
-### 6. Results Look Suspicious
-
-**Symptoms:**
-- All metrics are identical across methods
-- Query alignment is 0.0 for all methods
-- Topics are all generic
-
-**Debugging steps:**
-1. Check cached samples: `results/topic_evaluation/query_X/samples/*.pkl`
-2. Check topic summaries: `results/topic_evaluation/query_X/results/topics_summary/*.txt`
-3. Force regenerate: Set all force flags to `True`
-4. Check query text: Ensure `QUERY_ID` corresponds to valid query
-
----
-
-## Advanced Usage
-
-### Running Batch Evaluation (Multiple Queries)
-
-Create a wrapper script:
-
-```python
-# run_batch_evaluation.py
-import subprocess
-
-queries = ["1", "5", "10", "15", "20", "25", "30", "35", "40", "43", "45", "48", "50"]
-
-for query_id in queries:
-    print(f"\n{'='*50}")
-    print(f"Running evaluation for Query {query_id}")
-    print(f"{'='*50}\n")
-
-    # Edit main() to use query_id, or pass as argument
-    subprocess.run(["python", "src/end_to_end_evaluation.py", "--query", query_id])
-```
-
-**Note:** Currently requires editing `QUERY_ID` in `main()` for each query. Could be extended to accept command-line arguments.
-
----
-
-### Analyzing Results Across Queries
-
-After running multiple queries, aggregate results:
-
-```python
-import pandas as pd
-import glob
-
-# Load all per_method_summary.csv files
-all_summaries = []
-for csv_path in glob.glob("results/topic_evaluation/query_*/results/per_method_summary.csv"):
-    query_id = csv_path.split("query_")[1].split("/")[0]
-    df = pd.read_csv(csv_path)
-    df["query_id"] = query_id
-    all_summaries.append(df)
-
-# Combine and aggregate
-combined = pd.concat(all_summaries)
-aggregated = combined.groupby("method").agg(["mean", "std", "median", "min", "max"])
-print(aggregated)
-```
-
----
-
-## Tips for Efficient Experimentation
-
-1. **Start with one query** - Debug on Query 43, then scale to 15 queries
-2. **Use force flags strategically** - Only regenerate what changed
-3. **Save models sparingly** - 420 MB × 4 methods × 15 queries = 25 GB
-4. **Check topic summaries** - Qualitative validation catches issues metrics miss
-5. **Use GPU when available** - 2-3x speedup for embeddings
-6. **Monitor cache size** - SBERT embeddings are ~5-10 GB for full corpus
-7. **Version control configs** - Save `config.json` shows exact parameters used
+**Results look suspicious (all methods identical, alignment always 0)** — check `samples/*.pkl` and `topics_summary/*.txt` directly; force-regenerate everything; confirm `QUERY_IDS` are valid for the selected `DATASET_NAME`. Also check whether you're looking at a doctor-reviews `query_expansion` result for queries 7-11 — see the keyword-cache caveat in CACHING.md before assuming a bug.
 
 ---
 
 ## Related Documentation
 
-- **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)** - Research question, experimental design, conceptual framework
-- **[METRICS_GUIDE.md](METRICS_GUIDE.md)** - Detailed metric definitions and interpretations
-- **[FUTURE_WORK.md](FUTURE_WORK.md)** - Planned extensions and experiments
-- **[README.md](README.md)** - Installation and component documentation
-
----
-
-## Contact
-
-For questions or issues, see project README or create an issue in the repository.
+- [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) — research question, experimental design
+- [PIPELINE.md](PIPELINE.md) — how all the scripts fit together, which stage does what
+- [CACHING.md](CACHING.md) — full cache-tier reference and invalidation footguns
+- [GRID_WORKFLOW.md](GRID_WORKFLOW.md) — running on the CLSP SLURM grid
+- [METRICS_GUIDE.md](METRICS_GUIDE.md) — metric definitions and interpretation
+- [README.md](README.md) — project front door and full doc index
 
 ## Last Updated
 
-2025-11-13 - Added LDA topic modeling support and model switching guide
+2026-09 — Documented the dual-embedding-model split, Wilcoxon/coverage significance testing, HiCode, `sbert`/doctor-reviews, `DATASET`/`MODEL` env vars, and the hardcoded-path inventory. Superseded the 2025-11-13 revision, which predated all of the above.

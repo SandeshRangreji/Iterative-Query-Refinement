@@ -1,4 +1,14 @@
 # evaluation.py
+"""
+Shared qrels-based evaluation utilities (Precision@K, Recall@K, and related
+scoring against ground-truth relevance judgments), used across three
+otherwise-separate stages - see PIPELINE.md:
+  - src/search.py's standalone retrieval evaluation (Stage 2)
+  - src/query_expansion.py's standalone expansion-strategy evaluation (Stage 2)
+  - src/end_to_end_evaluation.py's relevant_concentration metric (Stage 4)
+
+Not a pipeline stage on its own - a shared utility module.
+"""
 import os
 import logging
 import json

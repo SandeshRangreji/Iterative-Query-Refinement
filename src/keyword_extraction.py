@@ -1,4 +1,17 @@
 # keyword_extraction.py
+"""
+Stage 3 (keyword generation) of the pipeline - see PIPELINE.md.
+
+KeywordExtractor uses KeyBERT over the top-N retrieved documents for a query
+to produce the cached keyword lists that end_to_end_evaluation.py's
+query_expansion sampling method reads at runtime (see CACHING.md for the
+cache file layout and the per-query-id fallback behavior when a query has no
+cached keywords).
+
+Run standalone (`python src/keyword_extraction.py`) to (re)generate the
+TREC-COVID keyword cache. generate_doctor_review_keywords.py (repo root)
+reuses this same KeywordExtractor class for the doctor-reviews dataset.
+"""
 import logging
 import os
 import json

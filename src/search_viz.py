@@ -1,4 +1,12 @@
-# visualization.py
+# search_viz.py
+"""
+Plotting utilities for Stage 2's standalone search/retrieval evaluation (see
+PIPELINE.md) - precision/recall bar charts, F1 comparisons, radar charts, and
+method-comparison heatmaps. Used by src/search.py and src/query_expansion.py.
+
+Not used by the main topic-modeling pipeline (end_to_end_evaluation.py has
+its own separate, inline plotting code for topic-modeling metrics).
+"""
 import os
 import logging
 import numpy as np
