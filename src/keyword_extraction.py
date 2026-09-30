@@ -31,6 +31,8 @@ from search import (
     RetrievalMethod,
     HybridStrategy
 )
+from dataset_loaders import load_dataset as load_project_dataset
+
 
 # Configure logging
 logging.basicConfig(
@@ -95,6 +97,7 @@ class KeywordExtractor:
     
     def _generate_keywords_cache_path(
         self, 
+        dataset: str = "trec-covid",
         method: str = "keybert",
         num_keywords: int = 5, 
         diversity: float = 0.7,
@@ -123,7 +126,7 @@ class KeywordExtractor:
         cache_dir = os.path.join("cache", "keywords")
         
         # Create filename with key parameters
-        filename = f"{method}_k{num_keywords}_div{diversity}_top{top_n_docs}docs_{clean_model_name}_k{top_k_docs}_ngram{keyphrase_ngram_range[0]}-{keyphrase_ngram_range[1]}.json"
+        filename = f"{dataset}_{method}_k{num_keywords}_div{diversity}_top{top_n_docs}docs_{clean_model_name}_k{top_k_docs}_ngram{keyphrase_ngram_range[0]}-{keyphrase_ngram_range[1]}.json"
         
         return os.path.join(cache_dir, filename)
     
@@ -231,6 +234,7 @@ class KeywordExtractor:
         """
         # Generate cache path based on parameters
         cache_path = self._generate_keywords_cache_path(
+            dataset=dataset_name,
             method="keybert",
             num_keywords=num_keywords,
             diversity=diversity,
@@ -351,7 +355,7 @@ def main():
     FORCE_REGENERATE_KEYWORDS = True   # For keyword extraction
     
     # ===== DATASET PARAMETERS =====
-    DATASET_NAME = 'trec-covid'
+    DATASET_NAME = os.environ.get("DATASET", "trec-covid")
     
     # ===== KEYWORD EXTRACTION PARAMETERS =====
     NUM_KEYWORDS = 10
@@ -381,8 +385,9 @@ def main():
     
     # Load dataset
     logger.info("Loading datasets...")
-    corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
-    queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
+    corpus_dataset, queries_dataset, qrels_dataset = load_project_dataset(DATASET_NAME)
+    # corpus_dataset = load_dataset("BeIR/trec-covid", "corpus")["corpus"]
+    # queries_dataset = load_dataset("BeIR/trec-covid", "queries")["queries"]
     logger.info(f"Loaded {len(corpus_dataset)} documents, {len(queries_dataset)} queries")
     
     # Initialize extractor

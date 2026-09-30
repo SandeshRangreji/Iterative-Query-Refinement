@@ -5422,17 +5422,22 @@ def main():
 
     # ===== DATASET SELECTION =====
     # Options: "trec-covid", "doctor-reviews" (can be overridden via DATASET env var)
-    DATASET_NAME = os.environ.get("DATASET", "trec-covid")
+    DATASET_NAME = os.environ.get("DATASET", "salescontest") #"trec-covid")
 
     # ===== DATASET-SPECIFIC CONFIGURATION =====
     DATASET_CONFIGS = {
         "trec-covid": {
             "query_ids": ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"],
-            "keyword_cache_path": "/home/srangre1/cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json",
+            "keyword_cache_path": "", #TODO: 
         },
         "doctor-reviews": {
-            "query_ids": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
-            "keyword_cache_path": "/home/srangre1/cache/keywords/doctor_reviews_keybert.json",
+            # "query_ids": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
+            "query_ids":[str(i) for i in range(1, 34)],
+            "keyword_cache_path": "", #TODO
+        },
+        "salescontest": {
+            "query_ids": [str(i) for i in range(1, 37)],  # Queries 1-36
+            "keyword_cache_path": "", #TODO
         }
     }
 
