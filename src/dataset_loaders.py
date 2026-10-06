@@ -79,7 +79,7 @@ def _load_doctor_reviews():
     """
     from datasets import load_from_disk, Dataset
 
-    CORPUS_PATH = "" #TODO: Add path to pre-filtered corpus
+    CORPUS_PATH = "./datasets/doctor_review_familymed_corpus" #TODO: Add path to pre-filtered corpus
 
     logger.info("Loading Doctor Reviews dataset...")
 
@@ -138,7 +138,7 @@ def _load_doctor_reviews():
 def _load_oida_salescontest():
     from datasets import load_from_disk, Dataset
     
-    CORPUS_PATH = "" #TODO: Add path to pre-filtered corpus
+    CORPUS_PATH = "./datasets/oida_salescontest_corpus/" #TODO: Add path to pre-filtered corpus
 
     logger.info("Loading OIDA Sales Contest dataset...")
 

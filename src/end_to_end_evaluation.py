@@ -4,15 +4,15 @@ Stage 4 of the pipeline (see PIPELINE.md) - end-to-end evaluation of topic
 modeling using different document-sampling strategies. This is the main
 orchestrated pipeline; Stages 0-3 (corpus prep, indexing, search evaluation,
 keyword generation) are separate scripts whose output this one consumes -
-see PIPELINE.md for the full map. HiCode (Stage 4b) is evaluated by a
-separate entry point (evaluate_hicode.py) that reuses this module's
-EndToEndEvaluator class and metric-computation methods without going through
-its normal sampling/indexing path - see the note on EndToEndEvaluator.
+see PIPELINE.md for the full map. Precomputed offline HiCode results (Stage
+4b) can still be evaluated by a separate entry point (evaluate_hicode.py)
+that reuses this module's EndToEndEvaluator class and metric-computation
+methods without going through its normal sampling/indexing path - see the
+note on EndToEndEvaluator.
 
 Supports 4 topic modeling methods (dispatched via topic_models.py's
 TopicModelWrapper, selected by the MODEL env var or TOPIC_MODEL_TYPE in
-main()): BERTopic, LDA, TopicGPT. (HiCode is evaluated via a separate script,
-not selected here.)
+main()): BERTopic, LDA, TopicGPT, HiCode (via the external/hicode submodule).
 
 Compares 7 sampling methods - see the sample_*() methods on
 EndToEndEvaluator, and USAGE.md's Configuration Reference table for which
@@ -1141,7 +1141,7 @@ class EndToEndEvaluator:
             metrics_embedding_model_name: Name of embedding model for metric computation only
             cross_encoder_model_name: Name of cross-encoder model
             dataset_name: Dataset name for caching
-            topic_model_type: Type of topic model ('bertopic', 'lda', 'topicgpt')
+            topic_model_type: Type of topic model ('bertopic', 'lda', 'topicgpt', 'hicode')
             topic_model_params: Model-specific parameters dict
             output_dir: Output directory for results
             cache_dir: Cache directory
@@ -1316,10 +1316,10 @@ class EndToEndEvaluator:
         """
         Load sample with cross-model sharing support.
 
-        Samples are identical across topic model types (BERTopic, LDA, TopicGPT),
+        Samples are identical across topic model types (BERTopic, LDA, TopicGPT, HiCode),
         so we check other model directories if the sample doesn't exist locally.
 
-        Priority order: current model dir -> bertopic -> lda -> topicgpt -> compute
+        Priority order: current model dir -> bertopic -> lda -> topicgpt -> hicode -> compute
         """
         cache_path = os.path.join(self.samples_dir, f"{sample_name}.pkl")
 
@@ -1331,7 +1331,7 @@ class EndToEndEvaluator:
 
         # Check other model type directories for shared samples
         if not force:
-            other_model_types = ["bertopic", "lda", "topicgpt"]
+            other_model_types = ["bertopic", "lda", "topicgpt", "hicode"]
             for other_type in other_model_types:
                 if other_type == self.topic_model_type:
                     continue
@@ -1825,6 +1825,13 @@ class EndToEndEvaluator:
                 if topic_model_params.get("n_topics") == "auto":
                     topic_model_params["n_topics"] = self._get_bertopic_n_topics(method)
                     logger.info(f"  LDA will use n_topics={topic_model_params['n_topics']} (matched to BERTopic)")
+
+            # HiCode codes documents against the query, and keeps resumable
+            # intermediate LLM outputs next to the cached results
+            if self.topic_model_type == "hicode":
+                topic_model_params.setdefault("query_text", self.query_text)
+                topic_model_params.setdefault("dataset_name", self.dataset_name)
+                topic_model_params.setdefault("work_dir", os.path.join(self.topic_models_dir, "hicode_work"))
 
             # Use wrapper to dispatch to appropriate topic model
             topic_model = TopicModelWrapper(
@@ -5428,16 +5435,16 @@ def main():
     DATASET_CONFIGS = {
         "trec-covid": {
             "query_ids": ["2", "9", "10", "13", "18", "21", "23", "24", "26", "27", "34", "43", "45", "47", "48"],
-            "keyword_cache_path": "", #TODO: 
+            "keyword_cache_path": "./cache/keywords/keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json", #TODO: 
         },
         "doctor-reviews": {
             # "query_ids": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
             "query_ids":[str(i) for i in range(1, 34)],
-            "keyword_cache_path": "", #TODO
+            "keyword_cache_path": "./cache/keywords/doctor_reviews_keybert.json", #TODO
         },
         "salescontest": {
             "query_ids": [str(i) for i in range(1, 37)],  # Queries 1-36
-            "keyword_cache_path": "", #TODO
+            "keyword_cache_path": "./cache/keywords/salescontest_keybert_k10_div0.7_top10docs_mpnet_k1000_ngram1-2.json", #TODO
         }
     }
 
@@ -5449,6 +5456,9 @@ def main():
     # Query configuration - use dataset-specific query IDs or override here
     QUERY_IDS = dataset_config["query_ids"]  # All queries for selected dataset
     # QUERY_IDS = [dataset_config["query_ids"][0]]  # Single test query
+    # Override via QUERIES env var, comma-separated (e.g. QUERIES=1 or QUERIES=1,5,12)
+    if os.environ.get("QUERIES"):
+        QUERY_IDS = [q.strip() for q in os.environ["QUERIES"].split(",") if q.strip()]
 
     # Keyword cache path for query expansion (dataset-specific)
     KEYWORD_CACHE_PATH = dataset_config["keyword_cache_path"]
@@ -5458,11 +5468,13 @@ def main():
 
     # Model configuration
     EMBEDDING_MODEL = "all-mpnet-base-v2"
-    METRICS_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"  # Change to use a different model for metric computation only
+    # Embedding model for metric computation only (can be overridden via EVAL_EMBEDDING_MODEL env var,
+    # e.g. EVAL_EMBEDDING_MODEL=BAAI/bge-base-en-v1.5); results go under results/<model tag>/
+    METRICS_EMBEDDING_MODEL = os.environ.get("EVAL_EMBEDDING_MODEL", "all-mpnet-base-v2")
     CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Topic modeling configuration (can be overridden via MODEL env var)
-    TOPIC_MODEL_TYPE = os.environ.get("MODEL", "bertopic")  # Options: "bertopic", "lda", "topicgpt"
+    TOPIC_MODEL_TYPE = os.environ.get("MODEL", "bertopic")  # Options: "bertopic", "lda", "topicgpt", "hicode"
 
     # TopicGPT parameters - ACTIVE CONFIGURATION
     # Requires OPENAI_API_KEY environment variable
@@ -5482,6 +5494,18 @@ def main():
         # Output
         "verbose": True
     }
+
+    # HiCode parameters - used whenever MODEL=hicode
+    # Requires OPENAI_API_KEY and the external/hicode submodule. query_text,
+    # dataset_name (selects the prompt background) and work_dir are filled in
+    # per query by EndToEndEvaluator.run_topic_modeling().
+    if TOPIC_MODEL_TYPE == "hicode":
+        TOPIC_MODEL_PARAMS = {
+            "model_name": "gpt-4o-mini",          # Label generation model
+            "cluster_model_name": "gpt-4o-mini",  # Label clustering model
+            "max_n_iter": 3,                      # Max hierarchical clustering iterations
+            "segment_delimiter": "\n\n",          # Documents are labeled segment by segment
+        }
 
     # LDA parameters (currently commented out)
     # TOPIC_MODEL_PARAMS = {

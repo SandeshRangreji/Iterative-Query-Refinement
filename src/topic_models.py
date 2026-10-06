@@ -12,6 +12,26 @@ from collections import Counter
 
 logger = logging.getLogger(__name__)
 
+# HiCode lives in a git submodule (external/hicode) as flat modules, not a package
+HICODE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "external", "hicode")
+
+# Dataset context prepended to HiCode's label-generation prompt.
+# Override per run with the "background" topic model param.
+HICODE_BACKGROUNDS = {
+    "trec-covid": """
+      """, #TODO
+    "doctor-reviews": """
+    The online physician review dataset contains millions of public patient reviews about physicians from different healthcare providers.
+    We focus on reviews related to Family Medicine physicians containing 171,216 reviews about 5,986 physicians.
+    Public health researchers are interested in understanding exploratory research questions about patient experiences, pathways to providers, relationship with physicians, and healthcare quality from these reviews.
+    """,
+
+    "salescontest": """
+    The sales contest dataset contains a collection of internal corporation email communications related to potentially different sales contests in a US pharmaceutical company. 
+    Public health researchers are interested in inductively understanding the key themes and topics for their research questions.
+    """,
+}
+
 
 class TopicModelWrapper:
     """
@@ -26,7 +46,7 @@ class TopicModelWrapper:
         Initialize topic model wrapper.
 
         Args:
-            model_type: Type of model ("bertopic", "lda", "topicgpt")
+            model_type: Type of model ("bertopic", "lda", "topicgpt", "hicode")
             **params: Model-specific parameters
         """
         self.model_type = model_type
@@ -76,6 +96,12 @@ class TopicModelWrapper:
 
         elif self.model_type == "topicgpt":
             return self._fit_topicgpt(
+                docs, doc_ids, method_name, embedding_model_name,
+                device, save_model, model_path
+            )
+
+        elif self.model_type == "hicode":
+            return self._fit_hicode(
                 docs, doc_ids, method_name, embedding_model_name,
                 device, save_model, model_path
             )
@@ -894,4 +920,245 @@ Your response:"""
             # TopicGPT-specific extras
             "topic_descriptions": refined_topics,  # Original LLM-generated descriptions
             "assignment_quotes": assignment_quotes  # Supporting quotes from documents
+        }
+
+    def _fit_hicode(
+        self,
+        docs: List[str],
+        doc_ids: List[str],
+        method_name: str,
+        embedding_model_name: str,
+        device: str,
+        save_model: bool,
+        model_path: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        HiCode implementation (hierarchical inductive coding with LLMs).
+        See https://github.com/mianzg/HICode, vendored as the external/hicode submodule.
+
+        Pipeline: split each document into segments -> LLM labels each segment
+        relevant to the query -> LLM iteratively clusters labels into themes ->
+        each document is assigned the themes of its labeled segments.
+
+        Returns the same format evaluate_hicode.py produces from offline HiCode
+        pickles (topic_model_type="hicode"), which the evaluator special-cases:
+        - topics: List[int], each doc's most frequent theme (-1 = no relevant segment)
+        - topic_words: Dict[int, List[str]] of generation labels in each theme
+        - _hicode_original_multi_label_topics: List[List[int]], all themes per doc
+
+        Required params (injected by EndToEndEvaluator.run_topic_modeling):
+            query_text: Query used as the coding goal
+            work_dir: Directory for HiCode's intermediate generation/clustering files
+            dataset_name: Selects the prompt background from HICODE_BACKGROUNDS
+                (or pass "background" directly)
+
+        Optional params:
+            model_name: Label generation model (default "gpt-4o-mini")
+            cluster_model_name: Label clustering model (default "gpt-4o-mini")
+            max_n_iter: Max clustering iterations (default 3)
+            segment_delimiter: Splits documents into segments (default "\\n\\n")
+
+        Requires OPENAI_API_KEY environment variable to be set.
+        """
+        import sys
+        import json
+        import shutil
+        import pickle
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        if HICODE_DIR not in sys.path:
+            sys.path.insert(0, HICODE_DIR)
+        try:
+            from label_generation import generate_labels, save_generation_output
+            from label_clustering import cluster_labels_gpt, make_clustering_prompt
+            from metrics import create_mapping
+        except ImportError as e:
+            raise ImportError(
+                f"HiCode not found at {HICODE_DIR}. Run: git submodule update --init external/hicode. "
+                f"Original error: {e}"
+            )
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise ValueError(
+                "OPENAI_API_KEY environment variable not set. "
+                "HiCode requires an OpenAI API key."
+            )
+
+        # ===== STEP 1: EXTRACT PARAMETERS =====
+
+        query_text = self.params.get("query_text")
+        work_dir = self.params.get("work_dir")
+        if not query_text or not work_dir:
+            raise ValueError("HiCode requires 'query_text' and 'work_dir' params")
+
+        background = self.params.get("background")
+        if background is None:
+            dataset_name = self.params.get("dataset_name")
+            if dataset_name not in HICODE_BACKGROUNDS:
+                raise ValueError(
+                    f"No HiCode background for dataset '{dataset_name}'. "
+                    f"Add one to HICODE_BACKGROUNDS or pass a 'background' param."
+                )
+            background = HICODE_BACKGROUNDS[dataset_name]
+
+        segment_delimiter = self.params.get("segment_delimiter", "\n\n")
+        config = {
+            "model_name": self.params.get("model_name", "gpt-4o-mini"),
+            "cluster_model_name": self.params.get("cluster_model_name", "gpt-4o-mini"),
+            "max_n_iter": self.params.get("max_n_iter", 3),
+            "cluster_output_dir": os.path.join(work_dir, "clustering"),
+        }
+        generation_dir = os.path.join(work_dir, "generation")
+
+        logger.info(f"Fitting HiCode on {len(docs)} documents...")
+        logger.info(f"  Generation model: {config['model_name']}")
+        logger.info(f"  Clustering model: {config['cluster_model_name']}")
+        logger.info(f"  Work directory: {work_dir}")
+
+        # ===== STEP 2: SPLIT DOCUMENTS INTO SEGMENTS =====
+
+        # HiCode keys segments as "<doc_id>_<segment_idx>" and recovers the doc id
+        # by stripping the last "_" part, so doc ids may themselves contain "_"
+        segments = {}
+        for doc_id, text in zip(doc_ids, docs):
+            for j, seg in enumerate(text.split(segment_delimiter)):
+                if len(seg.strip()) > 0:
+                    segments[f"{doc_id}_{j}"] = seg
+        logger.info(f"  Split into {len(segments)} segments")
+
+        # ===== STEP 3: LABEL GENERATION =====
+
+        coding_goal = "understand " + query_text
+        system_prompt = f"""
+    {background}
+
+    We are using the queries to this bot to conduct INDUCTIVE Coding. The labeling aims to {coding_goal}
+
+    Instruction:
+    - Label the input only when it is HIGHLY RELEVANT and USEFUL for {coding_goal}.
+    - Then, define the phrase of the label. The label description should be observational, concise and clear.
+    - ONLY output the label and DO NOT output any explanation.
+
+    Format:
+    - Define the label using the format \"LABEL: [The phrase of the label]\".
+    - If there are multiple labels, each label is a new line.
+    - If the input is irrelevant, use \"LABEL: [Irrelevant]\".
+    """
+
+        # Reuse saved generation output so a crashed run doesn't repeat the LLM calls
+        generation_file = os.path.join(generation_dir, f"generation_{method_name}.json")
+        if os.path.exists(generation_file):
+            with open(generation_file, "r") as f:
+                gen_result = json.load(f)
+            logger.info(f"  Loaded existing generation output from {generation_file}")
+        else:
+            logger.info("Stage 1: Generating labels...")
+            gen_result = generate_labels(segments, system_prompt, config)
+            save_generation_output(gen_result, generation_dir, output_id=method_name)
+        logger.info(f"  {len(gen_result)} documents have relevant segments")
+
+        # ===== STEP 4: HIERARCHICAL LABEL CLUSTERING =====
+
+        clustering_dir = os.path.join(config["cluster_output_dir"], f"clustering_{method_name}")
+        if not os.path.exists(clustering_dir):
+            logger.info("Stage 2: Clustering labels...")
+            try:
+                cluster_labels_gpt(
+                    gen_result, make_clustering_prompt(goal=coding_goal), config,
+                    gen_result_id=method_name
+                )
+            except BaseException:
+                # create_mapping reads every cluster_iter_*.json, so never leave a partial run behind
+                shutil.rmtree(clustering_dir, ignore_errors=True)
+                raise
+        else:
+            logger.info(f"  Loaded existing clustering output from {clustering_dir}")
+
+        # Maps lowercased generation label -> final theme
+        label_to_theme = create_mapping(clustering_dir)
+
+        # ===== STEP 5: ASSIGN THEMES TO DOCUMENTS =====
+
+        themes = sorted(set(label_to_theme.values()))
+        theme_to_id = {theme: i for i, theme in enumerate(themes)}
+        n_topics = len(themes)
+        logger.info(f"  Discovered {n_topics} themes")
+        if n_topics == 0:
+            logger.warning("HiCode produced no themes - all documents are outliers")
+
+        multi_label_topics = []
+        topic_assignments = []
+        for doc_id in doc_ids:
+            theme_counts = Counter()
+            for annotation in gen_result.get(str(doc_id), {}).get("LLM_Annotation", []):
+                seg_themes = {label_to_theme.get(label.lower()) for label in annotation["label"]}
+                theme_counts.update(theme_to_id[t] for t in seg_themes if t is not None)
+
+            if theme_counts:
+                # Primary topic = theme on the most segments, ties broken by lowest id
+                ranked = sorted(theme_counts, key=lambda t: (-theme_counts[t], t))
+                multi_label_topics.append(ranked)
+                topic_assignments.append(ranked[0])
+            else:
+                multi_label_topics.append([-1])
+                topic_assignments.append(-1)
+
+        n_outliers = topic_assignments.count(-1)
+        n_multi = sum(1 for t in multi_label_topics if len(t) > 1)
+        logger.info(f"  Outlier documents: {n_outliers}/{len(docs)}")
+        logger.info(f"  Multi-label documents: {n_multi}/{len(docs)} - using most frequent theme")
+
+        # ===== STEP 6: TOPIC WORDS =====
+
+        # Generation labels per theme are HiCode's topic "words"; the evaluator
+        # embeds the joined labels for semantic matching
+        topic_words = {i: [] for i in range(n_topics)}
+        for label, theme in label_to_theme.items():
+            topic_words[theme_to_id[theme]].append(label)
+
+        # Individual high TF-IDF words from each theme's labels (stored as fallback)
+        topic_words_processed = {}
+        for topic_id, labels in topic_words.items():
+            try:
+                vectorizer = TfidfVectorizer(stop_words="english")
+                tfidf = vectorizer.fit_transform(labels)
+                mean_tfidf = tfidf.mean(axis=0).A1
+                feature_names = vectorizer.get_feature_names_out()
+                top_indices = mean_tfidf.argsort()[-20:][::-1]
+                topic_words_processed[topic_id] = [feature_names[i] for i in top_indices]
+            except ValueError:
+                # Labels made only of stop words
+                topic_words_processed[topic_id] = []
+
+        topic_names = {i: theme for i, theme in enumerate(themes)}
+        topic_names[-1] = "irrelevant"
+
+        # ===== STEP 7: SAVE MODEL ARTIFACTS (OPTIONAL) =====
+
+        if save_model and model_path:
+            model_artifacts = {
+                "generation_result": gen_result,
+                "label_to_theme": label_to_theme,
+                "params": self.params,
+            }
+            with open(model_path, "wb") as f:
+                pickle.dump(model_artifacts, f)
+            logger.info(f"Saved HiCode model artifacts to {model_path}")
+        else:
+            logger.info(f"Skipping model save (save_topic_models=False)")
+
+        # ===== STEP 8: RETURN STANDARDIZED STRUCTURE =====
+
+        return {
+            "method": method_name,
+            "doc_ids": doc_ids,
+            "topics": topic_assignments,  # List[int], length = n_docs
+            "probabilities": None,  # HiCode doesn't provide probabilities
+            "topic_words": topic_words,  # Dict[int, List[str]] of generation labels
+            "topic_names": topic_names,  # Dict[int, str], natural language themes
+            "n_topics": n_topics,  # Excludes -1, matching BERTopic
+            "n_docs": len(docs),
+            "topic_model_type": "hicode",
+            # HiCode-specific extras
+            "_hicode_original_multi_label_topics": multi_label_topics,
+            "_topic_words_processed": topic_words_processed,
         }

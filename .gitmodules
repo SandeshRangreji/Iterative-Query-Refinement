@@ -1,0 +1,3 @@
+[submodule "external/hicode"]
+	path = external/hicode
+	url = https://github.com/mianzg/HICode
